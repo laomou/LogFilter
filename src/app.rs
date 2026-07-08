@@ -195,22 +195,42 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
-        let bytes = std::fs::read(path)?;
-        let text = decode_bytes(&bytes, self.encoding_choice());
+        // Validate access synchronously so the common errors (missing file, no
+        // permission) are still reported inline; the heavy read+decode+parse is
+        // moved off the UI thread below.
+        let _ = std::fs::File::open(path)?;
+
+        // Stop any adb session so its lines don't interleave with the file.
+        self.adb_stop();
+
+        // Reset the model synchronously (cheap) and let lines stream in.
         {
             let mut model = self.model.write().unwrap();
             model.clear();
             model.file_path = Some(path.to_path_buf());
-            for line in text.lines() {
-                let (entry, _fmt) = parse_line(line);
-                model.append(entry);
-            }
-            model.filtered = (0..model.entries.len() as u32).collect();
-            self.status = tr!("status_loaded", { path: &path.display().to_string(), n: model.entries.len() });
         }
         self.selected_row = None;
+        self.last_filtered_len = 0;
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
+
+        // Background reader: read + decode, then feed lines through the existing
+        // ingest channel so parsing/appending/repaint happen incrementally on
+        // the ingest thread — the UI stays responsive for large files.
+        let tx = self.line_tx.clone();
+        let choice = self.encoding_choice();
+        let path = path.to_path_buf();
+        thread::Builder::new()
+            .name("file-load".into())
+            .spawn(move || {
+                let Ok(bytes) = std::fs::read(&path) else { return; };
+                let text = decode_bytes(&bytes, choice);
+                for line in text.lines() {
+                    if tx.send(line.to_string()).is_err() {
+                        return; // receiver gone (app closing)
+                    }
+                }
+            })?;
         Ok(())
     }
 
