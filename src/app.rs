@@ -852,15 +852,20 @@ fn bump_global_text_sizes(ctx: &egui::Context) {
 }
 
 fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
-    match choice {
-        EncodingChoice::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+    // `Encoding::decode` BOM-sniffs first: a leading UTF-8 / UTF-16 LE / UTF-16
+    // BE BOM overrides `choice` and is stripped from the output. With no BOM it
+    // decodes as the chosen encoding. This strips the stray U+FEFF that a
+    // UTF-8+BOM file would otherwise leave on line 1, and transparently handles
+    // UTF-16 captures (e.g. old PowerShell `adb logcat > log.txt`).
+    let enc = match choice {
+        EncodingChoice::Utf8 => encoding_rs::UTF_8,
         EncodingChoice::Local => {
             let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
-            let enc = pick_local_encoding(&locale);
-            let (cow, _, _) = enc.decode(bytes);
-            cow.into_owned()
+            pick_local_encoding(&locale)
         }
-    }
+    };
+    let (cow, _, _) = enc.decode(bytes);
+    cow.into_owned()
 }
 
 fn pick_local_encoding(locale: &str) -> &'static Encoding {
