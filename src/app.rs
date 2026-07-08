@@ -1282,6 +1282,11 @@ impl App {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
+                // Fill all available vertical space instead of egui_extras'
+                // default 800px cap / content-shrink, so the table uses the whole
+                // window when maximized.
+                .auto_shrink([false, false])
+                .max_scroll_height(f32::INFINITY)
                 .sense(egui::Sense::click());
             for (i, (visible, _, w)) in cols_show.iter().enumerate() {
                 if !*visible { continue; }
