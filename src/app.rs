@@ -741,6 +741,43 @@ fn open_dir(path: &std::path::Path) {
     let _ = std::process::Command::new(opener).arg(path).spawn();
 }
 
+/// Middle-ellipsize `s` so its rendered Body-text width fits within `max_width`
+/// points, keeping the head and tail (extension stays visible) with `…` in the
+/// middle. Width is measured against the actual font, so it adapts to font size
+/// and DPI/resolution automatically. Splits only on `char` boundaries.
+fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = |t: &str| -> f32 {
+        ui.fonts(|f| f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+    };
+    if width(s) <= max_width {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let join = |keep: usize| -> String {
+        let head_len = (keep + 1) / 2;
+        let tail_len = keep - head_len;
+        let head: String = chars[..head_len].iter().collect();
+        let tail: String = chars[chars.len() - tail_len..].iter().collect();
+        format!("{head}…{tail}")
+    };
+    // Binary-search the largest `keep` (head+tail char count) that still fits.
+    let (mut lo, mut hi, mut best) = (0usize, chars.len().saturating_sub(1), String::from("…"));
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cand = join(mid);
+        if width(&cand) <= max_width {
+            best = cand;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
 fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
     let mut fonts = egui::FontDefinitions::default();
     let mut added: Vec<String> = Vec::new();
@@ -1233,8 +1270,27 @@ impl App {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             let model = self.model.read().unwrap();
             ui.horizontal(|ui| {
-                let path = model.file_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| tr!("no_file").into());
-                ui.label(&path);
+                match &model.file_path {
+                    Some(p) => {
+                        // Only the file name, middle-ellipsized to fit the bar;
+                        // full path on hover. Budget is in logical points, so it
+                        // scales with window size and DPI.
+                        let name = p
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| p.display().to_string());
+                        let budget = (ui.available_width() * 0.5).max(80.0);
+                        let full = p.display().to_string();
+                        ui.label(fit_middle(ui, &name, budget)).on_hover_ui(|ui| {
+                            // Single-line tooltip: don't wrap the full path.
+                            ui.add(egui::Label::new(full).wrap_mode(egui::TextWrapMode::Extend));
+                        });
+                    }
+                    None => {
+                        ui.label(tr!("no_file"));
+                    }
+                }
                 ui.separator();
                 ui.label(format!("{} {}", tr!("total"), model.entries.len()));
                 ui.separator();
@@ -1249,6 +1305,7 @@ impl App {
                     }
                 }
                 ui.label(self.ui.encoding.to_uppercase());
+                // Transient feedback (open error, save result, adb state).
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
