@@ -595,7 +595,9 @@ impl App {
 
                     ui.horizontal(|ui| {
                         ui.label("🔍");
-                        ui.add(egui::TextEdit::singleline(&mut search).desired_width(f32::INFINITY));
+                        ui.add(egui::TextEdit::singleline(&mut search)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY));
                     });
 
                     ui.horizontal(|ui| {
@@ -717,11 +719,12 @@ fn resolve_startup_lang(stored: &str) {
 /// Load user-supplied fonts from `~/.config/logfilter/fonts/`. No fonts are
 /// embedded and no system paths are probed.
 ///
-/// `primary` is the file stem of the font to make the active face for both the
-/// Proportional and Monospace family stacks (table and most UI text). Empty, or
-/// a stem that isn't among the loaded fonts, means no selection: egui's built-in
-/// default stays the active face and installed-but-unselected fonts are NOT
-/// added to the default stacks.
+/// `primary` is the file stem of the font to make the active face for the
+/// Monospace family — i.e. the log table (which renders via FontId::monospace).
+/// The menu, panels, and status bar keep egui's default proportional face, so
+/// changing the table font does not restyle the rest of the UI. Empty, or a
+/// stem that isn't among the loaded fonts, means no selection: egui's built-in
+/// monospace default stays active.
 ///
 /// Each loaded font is also exposed under its own `FontFamily::Name(stem)` so
 /// the Font menu can render each entry as a preview in that font.
@@ -816,16 +819,20 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
         }
     }
 
-    // Only the explicitly-selected font becomes the active proportional/mono
-    // face. With no valid selection — no fonts installed, or fonts installed
-    // but none chosen (`primary` empty or not among the loaded fonts) — egui's
-    // built-in default stays the active face. The other installed fonts remain
-    // available under their own `FontFamily::Name(stem)` (for previews and to
-    // be selected later); they are NOT forced into the default stacks.
+    // Only the explicitly-selected font becomes the active face, and only for
+    // the Monospace family — the log table renders with FontId::monospace, so
+    // the choice applies to the table alone and leaves the menu / panels /
+    // status bar in egui's default proportional face. With no valid selection
+    // (no fonts installed, or `primary` empty / not among the loaded fonts)
+    // egui's built-in monospace default stays active. Other installed fonts
+    // remain available under their own `FontFamily::Name(stem)` (for previews
+    // and to be selected later); they are NOT forced into any default stack.
     if !primary.is_empty() && added.iter().any(|n| n == primary) {
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().insert(0, primary.to_string());
-        }
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, primary.to_string());
     }
     ctx.set_fonts(fonts);
     added
@@ -1192,6 +1199,7 @@ impl App {
                 let w = (ui.available_width() - 8.0).max(200.0);
                 let r = ui.add(egui::TextEdit::singleline(&mut self.ui.find)
                     .id(egui::Id::new("filter_find_edit"))
+                    .font(egui::TextStyle::Monospace)
                     .desired_width(w));
                 dirty |= r.changed();
                 if self.focus_find { r.request_focus(); self.focus_find = false; }
@@ -1202,10 +1210,14 @@ impl App {
                 let avail = ui.available_width();
                 let text_w = (avail / 2.0 - 100.0).max(120.0);
                 dirty |= ui.checkbox(&mut self.ui.remove_on, tr!("remove")).changed();
-                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.remove).desired_width(text_w)).changed();
+                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.remove)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(text_w)).changed();
                 ui.separator();
                 dirty |= ui.checkbox(&mut self.ui.highlight_on, tr!("highlight")).changed();
-                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight).desired_width(text_w)).changed();
+                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(text_w)).changed();
             });
 
             // Row 3: adb toolbar + Goto + Auto-scroll
