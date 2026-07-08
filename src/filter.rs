@@ -79,8 +79,36 @@ impl FilterSpec {
 }
 
 fn any_contains(hay: &str, needles: &[String]) -> bool {
-    let hay_lower = hay.to_lowercase();
-    needles.iter().any(|n| hay_lower.contains(n))
+    needles.iter().any(|n| contains_ci(hay, n))
+}
+
+/// Case-insensitive substring search. `needle` is assumed already lowercased
+/// (see [`FilterSpec::tokens`]). For the common all-ASCII needle we fold ASCII
+/// letters of `hay` on the fly and scan byte-wise — no allocation. UTF-8
+/// continuation bytes (>= 0x80) fold to themselves and never equal an ASCII
+/// needle byte, so multibyte text is handled correctly. A needle containing
+/// non-ASCII falls back to Unicode-correct lowercasing.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if !needle.is_ascii() {
+        return hay.to_lowercase().contains(needle);
+    }
+    let hay = hay.as_bytes();
+    let nee = needle.as_bytes();
+    if nee.len() > hay.len() {
+        return false;
+    }
+    'outer: for start in 0..=hay.len() - nee.len() {
+        for (j, &nb) in nee.iter().enumerate() {
+            if hay[start + j].to_ascii_lowercase() != nb {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -127,6 +155,22 @@ mod tests {
         spec.remove = vec!["spam".into()];
         assert!(!spec.matches(&e("spam here", "T", LevelMask::I), &hs));
         assert!(spec.matches(&e("clean", "T", LevelMask::I), &hs));
+    }
+
+    #[test]
+    fn contains_ci_cases() {
+        // ASCII case-insensitive, no allocation path
+        assert!(contains_ci("Hello World", "hello"));
+        assert!(contains_ci("ERROR: boom", "error"));
+        assert!(contains_ci("abcABC", "cabc"));
+        assert!(!contains_ci("abc", "xyz"));
+        assert!(!contains_ci("ab", "abc")); // needle longer than hay
+        assert!(contains_ci("anything", "")); // empty needle matches
+        // Multibyte haystack must not corrupt the byte scan
+        assert!(contains_ci("日志Error信息", "error"));
+        assert!(!contains_ci("日志信息", "error"));
+        // Non-ASCII needle falls back to Unicode lowercasing
+        assert!(contains_ci("包含中文Log", "中文"));
     }
 
     #[test]

@@ -439,19 +439,31 @@ impl App {
 
                 let mut out: Vec<u32> = Vec::with_capacity(entries_len / 4);
                 let mut aborted = false;
-                for i in 0..entries_len {
-                    if i % 4096 == 0 && gen.load(Ordering::Acquire) != gen_start {
+                // Process in chunks holding the read lock once per chunk instead
+                // of once per row: amortizes lock cost ~CHUNK× while still
+                // yielding to writers (ingest/clear) and checking abort between
+                // chunks. Entries only grow by append, so indices below the
+                // start snapshot are stable; guard against concurrent clear.
+                const CHUNK: usize = 4096;
+                let mut i = 0usize;
+                while i < entries_len {
+                    if gen.load(Ordering::Acquire) != gen_start {
                         aborted = true;
                         break;
                     }
-                    let matched = {
-                        let m = model.read().unwrap();
-                        if i >= m.entries.len() { break; }
-                        spec.matches(&m.entries[i], &bookmarks)
-                    };
-                    if matched {
-                        out.push(i as u32);
+                    let end = (i + CHUNK).min(entries_len);
+                    let m = model.read().unwrap();
+                    let hi = end.min(m.entries.len());
+                    for j in i..hi {
+                        if spec.matches(&m.entries[j], &bookmarks) {
+                            out.push(j as u32);
+                        }
                     }
+                    drop(m);
+                    if hi < end {
+                        break; // entries shrank (cleared) — stop early
+                    }
+                    i = end;
                 }
 
                 if !aborted && gen.load(Ordering::Acquire) == gen_start {
