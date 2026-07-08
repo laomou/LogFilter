@@ -1,0 +1,154 @@
+use crate::model::{LevelMask, LogEntry};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone)]
+pub struct FilterSpec {
+    /// None = every level passes; Some(mask) = only levels in mask pass.
+    pub allowed_levels: Option<LevelMask>,
+    /// None = every value passes; Some(set) = only values in set pass.
+    pub allowed_pids: Option<HashSet<String>>,
+    pub allowed_tids: Option<HashSet<String>>,
+    pub allowed_tags: Option<HashSet<String>>,
+
+    pub find: Vec<String>,
+    pub remove: Vec<String>,
+    pub highlight: Vec<String>,
+
+    pub bookmarks_only: bool,
+    pub errors_only: bool,
+}
+
+impl Default for FilterSpec {
+    fn default() -> Self {
+        Self {
+            allowed_levels: None,
+            allowed_pids: None,
+            allowed_tids: None,
+            allowed_tags: None,
+            find: Vec::new(),
+            remove: Vec::new(),
+            highlight: Vec::new(),
+            bookmarks_only: false,
+            errors_only: false,
+        }
+    }
+}
+
+impl FilterSpec {
+    /// Split a raw text field on `|` into lowercased trimmed tokens.
+    pub fn tokens(raw: &str) -> Vec<String> {
+        raw.split('|')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    pub fn matches(&self, entry: &LogEntry, bookmarks: &HashSet<u32>) -> bool {
+        if let Some(mask) = self.allowed_levels {
+            if !mask.intersects(entry.level) {
+                return false;
+            }
+        }
+        if let Some(set) = &self.allowed_pids {
+            if !set.contains(&entry.pid) {
+                return false;
+            }
+        }
+        if let Some(set) = &self.allowed_tids {
+            if !set.contains(&entry.tid) {
+                return false;
+            }
+        }
+        if let Some(set) = &self.allowed_tags {
+            if !set.contains(&entry.tag) {
+                return false;
+            }
+        }
+        if self.bookmarks_only && !bookmarks.contains(&(entry.line_no - 1)) {
+            return false;
+        }
+        if self.errors_only && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F)) {
+            return false;
+        }
+        if !self.find.is_empty() && !any_contains(&entry.message, &self.find) {
+            return false;
+        }
+        if !self.remove.is_empty() && any_contains(&entry.message, &self.remove) {
+            return false;
+        }
+        true
+    }
+}
+
+fn any_contains(hay: &str, needles: &[String]) -> bool {
+    let hay_lower = hay.to_lowercase();
+    needles.iter().any(|n| hay_lower.contains(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LevelMask;
+
+    fn e(msg: &str, tag: &str, lv: LevelMask) -> LogEntry {
+        LogEntry {
+            line_no: 1,
+            date: String::new(),
+            time: String::new(),
+            level: lv,
+            pid: "1".into(),
+            tid: "1".into(),
+            tag: tag.into(),
+            message: msg.into(),
+        }
+    }
+
+    #[test]
+    fn tokens_split_and_lowercase() {
+        assert_eq!(FilterSpec::tokens("Foo | Bar"), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn level_mask_filters() {
+        let mut spec = FilterSpec::default();
+        spec.allowed_levels = Some(LevelMask::E);
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("x", "T", LevelMask::E), &hs));
+        assert!(!spec.matches(&e("x", "T", LevelMask::D), &hs));
+    }
+
+    #[test]
+    fn find_or_remove() {
+        let mut spec = FilterSpec::default();
+        spec.find = vec!["hello".into()];
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("Hello world", "T", LevelMask::I), &hs));
+        assert!(!spec.matches(&e("bye", "T", LevelMask::I), &hs));
+
+        let mut spec = FilterSpec::default();
+        spec.remove = vec!["spam".into()];
+        assert!(!spec.matches(&e("spam here", "T", LevelMask::I), &hs));
+        assert!(spec.matches(&e("clean", "T", LevelMask::I), &hs));
+    }
+
+    #[test]
+    fn allowed_pids_filters() {
+        let mut spec = FilterSpec::default();
+        let mut set = HashSet::new();
+        set.insert("1".to_string());
+        spec.allowed_pids = Some(set);
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("m", "T", LevelMask::I), &hs));
+        let other = LogEntry {
+            line_no: 2,
+            date: String::new(),
+            time: String::new(),
+            level: LevelMask::I,
+            pid: "99".into(),
+            tid: "1".into(),
+            tag: "T".into(),
+            message: "m".into(),
+        };
+        assert!(!spec.matches(&other, &hs));
+    }
+}
