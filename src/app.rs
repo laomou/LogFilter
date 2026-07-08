@@ -129,7 +129,6 @@ impl UiState {
             allowed_tags: self.allowed_tags.clone(),
             find: if self.find_on { FilterSpec::tokens(&self.find) } else { vec![] },
             remove: if self.remove_on { FilterSpec::tokens(&self.remove) } else { vec![] },
-            highlight: if self.highlight_on { FilterSpec::tokens(&self.highlight) } else { vec![] },
             bookmarks_only: false,
             errors_only: false,
         }
@@ -773,37 +772,6 @@ fn bump_global_text_sizes(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Swing-style titled border: a bordered group with the title label overlaid
-/// on the top-left. Renders `add_contents` inside.
-#[allow(dead_code)]
-fn titled_group<R>(
-    ui: &mut egui::Ui,
-    title: &str,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    egui::Frame::group(ui.style())
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
-        .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 14.0, bottom: 4.0 })
-        .show(ui, |ui| {
-            let rect = ui.max_rect();
-            let painter = ui.painter();
-            let label_pos = egui::pos2(rect.min.x + 6.0, rect.min.y - 7.0);
-            let galley = painter.layout_no_wrap(
-                title.to_string(),
-                egui::FontId::proportional(11.0),
-                ui.visuals().text_color(),
-            );
-            let bg_rect = egui::Rect::from_min_size(
-                egui::pos2(label_pos.x - 2.0, label_pos.y),
-                galley.size() + egui::vec2(4.0, 0.0),
-            );
-            painter.rect_filled(bg_rect, 0.0, ui.visuals().panel_fill);
-            painter.galley(label_pos, galley, ui.visuals().text_color());
-            add_contents(ui)
-        })
-        .inner
-}
-
 fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
     match choice {
         EncodingChoice::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
@@ -909,6 +877,31 @@ fn build_highlighted(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_menu_bar(ctx);
+        self.ui_options_panel(ctx);
+        self.ui_status_bar(ctx);
+        self.ui_indicator(ctx);
+        self.ui_table(ctx);
+        // Column picker popup (Excel-style)
+        self.render_picker(ctx);
+
+        // Drag-drop
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(first) = dropped.into_iter().find_map(|f| f.path) {
+            if let Err(e) = self.open_file(&first) {
+                self.status = tr!("status_failed_open_dropped", { e: &format!("{}", e) });
+            }
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.ui.write_back(&mut self.cfg);
+        let _ = config::save(&self.cfg);
+    }
+}
+
+impl App {
+    fn ui_menu_bar(&mut self, ctx: &egui::Context) {
         // Menu bar — File · Format · View · Encoding
         let mut recent_open: Option<PathBuf> = None;
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -1080,7 +1073,9 @@ impl eframe::App for App {
                 self.status = tr!("status_failed_open", { e: &format!("{}", e) });
             }
         }
+    }
 
+    fn ui_options_panel(&mut self, ctx: &egui::Context) {
         // Option panel — 3 rows:
         //   Row 1: 🔍 Find (fills width)
         //   Row 2: Remove (half) · Highlight (half)
@@ -1170,7 +1165,9 @@ impl eframe::App for App {
                 self.selected_row = Some(pos);
             }
         }
+    }
 
+    fn ui_status_bar(&mut self, ctx: &egui::Context) {
         // Status bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             let model = self.model.read().unwrap();
@@ -1197,7 +1194,9 @@ impl eframe::App for App {
                 }
             });
         });
+    }
 
+    fn ui_indicator(&mut self, ctx: &egui::Context) {
         // Indicator panel (mini-scrollbar)
         egui::SidePanel::right("indicator").exact_width(24.0).resizable(false).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -1247,7 +1246,9 @@ impl eframe::App for App {
                 }
             }
         });
+    }
 
+    fn ui_table(&mut self, ctx: &egui::Context) {
         // Log table
         egui::CentralPanel::default().show(ctx, |ui| {
             let font = FontId::monospace(self.cfg.view.font_size);
@@ -1537,22 +1538,7 @@ impl eframe::App for App {
                 self.ui.picker = Some(PickerState { col, search: String::new(), anchor });
             }
         });
-
-        // Column picker popup (Excel-style)
-        self.render_picker(ctx);
-
-        // Drag-drop
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(first) = dropped.into_iter().find_map(|f| f.path) {
-            if let Err(e) = self.open_file(&first) {
-                self.status = tr!("status_failed_open_dropped", { e: &format!("{}", e) });
-            }
-        }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.ui.write_back(&mut self.cfg);
-        let _ = config::save(&self.cfg);
-    }
 }
 

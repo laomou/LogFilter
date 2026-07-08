@@ -12,7 +12,6 @@ pub struct FilterSpec {
 
     pub find: Vec<String>,
     pub remove: Vec<String>,
-    pub highlight: Vec<String>,
 
     pub bookmarks_only: bool,
     pub errors_only: bool,
@@ -27,7 +26,6 @@ impl Default for FilterSpec {
             allowed_tags: None,
             find: Vec::new(),
             remove: Vec::new(),
-            highlight: Vec::new(),
             bookmarks_only: false,
             errors_only: false,
         }
