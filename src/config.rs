@@ -141,8 +141,7 @@ pub fn config_path() -> Option<PathBuf> {
 }
 
 /// User-supplied font drop-in directory. Any `.ttf` / `.otf` / `.ttc` file here
-/// is loaded at startup (and after `View → Font → Reload fonts`) and registered
-/// as a fallback for both the proportional and monospace families.
+/// is loaded at startup and registered as a selectable face.
 pub fn fonts_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("fonts"))
 }

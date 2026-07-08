@@ -717,10 +717,11 @@ fn resolve_startup_lang(stored: &str) {
 /// Load user-supplied fonts from `~/.config/logfilter/fonts/`. No fonts are
 /// embedded and no system paths are probed.
 ///
-/// `primary` is the file stem of the font to hoist to the front of both the
-/// Proportional and Monospace family stacks, making it the active face for the
-/// table and most UI text. Empty = no primary (egui built-ins stay primary,
-/// user fonts are fallbacks in filename order).
+/// `primary` is the file stem of the font to make the active face for both the
+/// Proportional and Monospace family stacks (table and most UI text). Empty, or
+/// a stem that isn't among the loaded fonts, means no selection: egui's built-in
+/// default stays the active face and installed-but-unselected fonts are NOT
+/// added to the default stacks.
 ///
 /// Each loaded font is also exposed under its own `FontFamily::Name(stem)` so
 /// the Font menu can render each entry as a preview in that font.
@@ -728,6 +729,18 @@ fn resolve_startup_lang(stored: &str) {
 /// Returns the list of registered font stems, so callers can track which
 /// `FontFamily::Name(..)` values are safe to use for previews (using an
 /// unregistered named family panics inside egui).
+/// Open `path` in the platform file manager. Best-effort: a missing opener or
+/// a spawn failure is silently ignored (there is no sensible UI recovery).
+fn open_dir(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(path).spawn();
+}
+
 fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
     let mut fonts = egui::FontDefinitions::default();
     let mut added: Vec<String> = Vec::new();
@@ -766,18 +779,15 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
         }
     }
 
-    // Hoist the selected primary to the front of the user-font list.
+    // Only the explicitly-selected font becomes the active proportional/mono
+    // face. With no valid selection — no fonts installed, or fonts installed
+    // but none chosen (`primary` empty or not among the loaded fonts) — egui's
+    // built-in default stays the active face. The other installed fonts remain
+    // available under their own `FontFamily::Name(stem)` (for previews and to
+    // be selected later); they are NOT forced into the default stacks.
     if !primary.is_empty() && added.iter().any(|n| n == primary) {
-        added.sort_by_key(|n| n != primary);
-    }
-
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let list = fonts.families.entry(family).or_default();
-        // Prepend user fonts (selected primary first) so the chosen face
-        // actually takes effect; egui's built-in faces stay as last-resort
-        // fallback for any glyph the selected font lacks.
-        for (i, name) in added.iter().enumerate() {
-            list.insert(i, name.clone());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().insert(0, primary.to_string());
         }
     }
     ctx.set_fonts(fonts);
@@ -977,6 +987,26 @@ impl App {
                     ui.menu_button(tr!("font"), |ui| {
                         ui.set_min_width(320.0);
                         if let Some(dir) = config::fonts_dir() {
+                            // Clearly-a-button shortcut to the fonts folder so the
+                            // user can drop .ttf files in without leaving the app.
+                            if ui.button(tr!("open_folder")).clicked() {
+                                let _ = std::fs::create_dir_all(&dir);
+                                open_dir(&dir);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+
+                            // Default (deselect) — fall back to egui's built-in
+                            // face, the same state as "no font selected".
+                            let is_default = self.cfg.view.font.is_empty();
+                            if ui.add(egui::SelectableLabel::new(is_default, tr!("default"))).clicked()
+                                && !is_default
+                            {
+                                self.cfg.view.font.clear();
+                                self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
+                                ui.close_menu();
+                            }
+
                             let loaded: Vec<(String, String)> = std::fs::read_dir(&dir)
                                 .map(|rd| {
                                     rd.flatten()
@@ -996,35 +1026,34 @@ impl App {
                                 })
                                 .unwrap_or_default();
 
-                            if loaded.is_empty() {
-                                ui.label(egui::RichText::new(dir.display().to_string()).small().weak());
-                            } else {
-                                egui::ScrollArea::vertical()
-                                    .max_height(220.0)
-                                    .show(ui, |ui| {
-                                        for (stem, name) in &loaded {
-                                            let sel = self.cfg.view.font == *stem;
-                                            let text = format!("{}  —  AaBb 中文 123", name);
-                                            // Only render the preview in the font's own
-                                            // face if it's actually registered; an
-                                            // unregistered FontFamily::Name panics in egui
-                                            // (e.g. a font dropped into the folder after
-                                            // startup that hasn't been loaded yet).
-                                            let label = if self.registered_fonts.iter().any(|f| f == stem) {
-                                                egui::RichText::new(text)
-                                                    .family(egui::FontFamily::Name(stem.clone().into()))
-                                            } else {
-                                                egui::RichText::new(text)
-                                            };
-                                            let resp = ui.add(egui::SelectableLabel::new(sel, label));
-                                            if resp.clicked() && !sel {
-                                                self.cfg.view.font = stem.clone();
-                                                self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
-                                                ui.close_menu();
-                                            }
+                            // No empty-state label: the Default item above is
+                            // always present, so an empty folder simply shows
+                            // Open-folder / Default with nothing listed below.
+                            egui::ScrollArea::vertical()
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for (stem, name) in &loaded {
+                                        let sel = self.cfg.view.font == *stem;
+                                        let text = format!("{}  —  AaBb 中文 123", name);
+                                        // Only render the preview in the font's own
+                                        // face if it's actually registered; an
+                                        // unregistered FontFamily::Name panics in egui
+                                        // (e.g. a font dropped into the folder after
+                                        // startup that hasn't been loaded yet).
+                                        let label = if self.registered_fonts.iter().any(|f| f == stem) {
+                                            egui::RichText::new(text)
+                                                .family(egui::FontFamily::Name(stem.clone().into()))
+                                        } else {
+                                            egui::RichText::new(text)
+                                        };
+                                        let resp = ui.add(egui::SelectableLabel::new(sel, label));
+                                        if resp.clicked() && !sel {
+                                            self.cfg.view.font = stem.clone();
+                                            self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
+                                            ui.close_menu();
                                         }
-                                    });
-                            }
+                                    }
+                                });
                         } else {
                             ui.label(tr!("config_unavailable"));
                         }
