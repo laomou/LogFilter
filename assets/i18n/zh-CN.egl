@@ -63,7 +63,6 @@ filter_tag = 过滤标签
 filter_lv = 过滤级别
 filter_this = 过滤此列...
 hide_this = 隐藏此列
-autosize = 自动调整列宽
 copy_tag = 复制标签
 add_show_tag = 加入显示标签过滤
 add_remove_tag = 加入排除标签过滤

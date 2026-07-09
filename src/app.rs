@@ -95,6 +95,11 @@ pub struct PickerState {
     pub col: PickerCol,
     pub search: String,
     pub anchor: egui::Pos2,
+    /// True on the frame the picker is first shown. The same click that opened
+    /// it (a header click or a context-menu item) lands outside the freshly
+    /// created panel, so without this guard the "click outside → close" check
+    /// would close it the instant it opens.
+    pub just_opened: bool,
 }
 
 impl UiState {
@@ -646,13 +651,17 @@ impl App {
                 });
             });
 
-        // Persist picker search text.
+        // Persist picker search text; clear the just-opened guard after the
+        // first frame so subsequent outside-clicks close the panel normally.
         if let Some(p) = self.ui.picker.as_mut() {
             p.search = search;
+            p.just_opened = false;
         }
 
-        // If user clicked outside the picker, close it.
-        let clicked_outside = ctx.input(|i| i.pointer.any_click())
+        // If user clicked outside the picker, close it — but not on the very
+        // frame it opened (the opening click itself lands outside the panel).
+        let clicked_outside = !picker.just_opened
+            && ctx.input(|i| i.pointer.any_click())
             && !area_resp.response.rect.contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO)));
         if clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             close = true;
@@ -1428,7 +1437,7 @@ impl App {
                 (self.ui.col_line,     &cl,    60.0),
                 (self.ui.col_date,     &cd,    60.0),
                 (self.ui.col_time,     &ct,   100.0),
-                (self.ui.col_loglv,    &clv,   24.0),
+                (self.ui.col_loglv,    &clv,   44.0),
                 (self.ui.col_pid,      &cpi,   60.0),
                 (self.ui.col_thread,   &cth,   60.0),
                 (self.ui.col_tag,      &cta,  140.0),
@@ -1509,15 +1518,13 @@ impl App {
                         if !*visible { continue; }
                         let kind = col_kinds[i];
                         let pk = picker_of(kind);
-                        let has_filter_active = match pk {
-                            Some(PickerCol::Level) => self.ui.allowed_levels.is_some(),
-                            Some(PickerCol::Pid) => self.ui.allowed_pids.is_some(),
-                            Some(PickerCol::Tid) => self.ui.allowed_tids.is_some(),
-                            Some(PickerCol::Tag) => self.ui.allowed_tags.is_some(),
-                            None => false,
-                        };
+                        // Dropdown marker: use ⏷ (U+23F7), which lives in
+                        // emoji-icon-font — part of the Monospace fallback chain.
+                        // ▾/▼ (U+25BE/25BC) exist only in Hack, which the
+                        // "table font follows the menu" mirror dropped from
+                        // Monospace, so they'd render as tofu boxes.
                         let label = if pk.is_some() {
-                            if has_filter_active { format!("{name} ▼") } else { format!("{name} ▾") }
+                            format!("{name} \u{23F7}")
                         } else {
                             name.to_string()
                         };
@@ -1547,9 +1554,6 @@ impl App {
                                 if ui.button(tr!("hide_this")).clicked() {
                                     hide_col_idx = Some(i);
                                     ui.close_menu();
-                                }
-                                if ui.button(tr!("autosize")).clicked() {
-                                    ui.close_menu(); // TableBuilder auto-sizes by default; no-op stub
                                 }
                             });
                         });
@@ -1701,7 +1705,7 @@ impl App {
             }
             // Open picker requested from column-header click or context menu.
             if let Some((col, anchor)) = open_picker {
-                self.ui.picker = Some(PickerState { col, search: String::new(), anchor });
+                self.ui.picker = Some(PickerState { col, search: String::new(), anchor, just_opened: true });
             }
         });
     }

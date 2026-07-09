@@ -63,7 +63,6 @@ filter_tag = Filter Tag
 filter_lv = Filter Lv
 filter_this = Filter this column...
 hide_this = Hide this column
-autosize = Auto-size this column
 copy_tag = Copy tag
 add_show_tag = Add to Show tag filter
 add_remove_tag = Add to Remove tag filter
