@@ -32,6 +32,10 @@ pub struct App {
     pub selected_row: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub focus_find: bool,
+    // Whether the log table's scroll was pinned to the bottom last frame.
+    // Used to swallow redundant downward wheel input while auto-following so
+    // streaming rows don't fight the wheel and jitter the viewport.
+    at_bottom: bool,
 
     // Font stems currently registered as FontFamily::Name(..); only these are
     // safe to use for per-font previews (unregistered names panic in egui).
@@ -187,6 +191,7 @@ impl App {
             selected_row: None,
             pending_scroll: None,
             focus_find: false,
+            at_bottom: true,
             registered_fonts,
             line_tx,
             adb_session: None,
@@ -230,6 +235,7 @@ impl App {
             model.file_path = Some(path.to_path_buf());
         }
         self.selected_row = None;
+        self.at_bottom = true;
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -347,6 +353,7 @@ impl App {
             model.clear();
         }
         self.selected_row = None;
+        self.at_bottom = true;
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -388,6 +395,7 @@ impl App {
             m.clear();
         }
         self.selected_row = None;
+        self.at_bottom = true;
         self.notify_filter();
     }
 
@@ -1524,6 +1532,26 @@ impl App {
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
 
+            // While following at the bottom, swallow *downward* wheel input over
+            // the table. Streaming appends grow the content within a frame, so a
+            // downward wheel makes egui think there's new room below the pin,
+            // briefly un-sticks the scroll, then re-sticks next frame once it
+            // catches the new bottom — an endless unstick/re-stick flicker. The
+            // wheel-down is redundant here (we're already pinned to the end), so
+            // dropping it keeps the viewport rock-steady. Upward wheel is left
+            // intact so the user can still scroll up to read history. Must run
+            // before TableBuilder::new borrows `ui`.
+            if self.auto_scroll && self.at_bottom && ui.rect_contains_pointer(ui.max_rect()) {
+                ui.ctx().input_mut(|i| {
+                    // The table's ScrollArea reads smooth_scroll_delta; zeroing
+                    // its downward component here is enough to drop the redundant
+                    // wheel-down before it reaches the scroll logic.
+                    if i.smooth_scroll_delta.y < 0.0 {
+                        i.smooth_scroll_delta.y = 0.0;
+                    }
+                });
+            }
+
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
@@ -1545,10 +1573,13 @@ impl App {
                     table = table.column(Column::initial(*w).at_least(*w * 0.5));
                 }
             }
-            // Auto-follow via egui's built-in stick_to_bottom: pins to the
-            // bottom as rows stream in, unsticks when the user scrolls up to
-            // read old logs, and re-sticks when dragged back to the bottom.
-            // Goto still drives an explicit centered scroll_to_row below.
+            // Auto-follow via egui's built-in stick_to_bottom: when true, the
+            // scroll area internally tracks scroll_stuck_to_end — it stays
+            // stuck at the bottom as new rows arrive, releases when the user
+            // scrolls up, and re-engages when the user scrolls back down.
+            // Stick on *every* frame so an in-frame race between the filtered
+            // count check and the table render doesn't skip a frame and leave
+            // new rows below the viewport.
             table = table.stick_to_bottom(self.auto_scroll);
             if let Some(scroll_to) = self.pending_scroll.take() {
                 table = table.scroll_to_row(scroll_to, Some(egui::Align::Center));
@@ -1592,7 +1623,7 @@ impl App {
             let row_h = (font_size * 1.35).ceil().max(16.0);
             let header_h = (font_size * 1.6).ceil().max(20.0);
 
-            table
+            let table_out = table
                 .header(header_h, |mut h| {
                     for (i, (visible, name, _)) in cols_show.iter().enumerate() {
                         if !*visible { continue; }
@@ -1754,6 +1785,12 @@ impl App {
                         }
                     });
                 });
+
+            // Remember whether the scroll ended the frame pinned to the bottom.
+            // A downward wheel is only swallowed (above) while this holds, so a
+            // user who has scrolled up stays free to wheel back down.
+            let max_off = (table_out.content_size.y - table_out.inner_rect.height()).max(0.0);
+            self.at_bottom = table_out.state.offset.y >= max_off - 1.0;
 
             drop(model);
             if let Some(r) = clicked_row { self.selected_row = Some(r); }
