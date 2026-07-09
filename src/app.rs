@@ -392,7 +392,6 @@ impl App {
         self.notify_filter();
     }
 
-    #[allow(dead_code)]
     fn copy_selected_row(&self) {
         let Some(r) = self.selected_row else { return; };
         let m = self.model.read().unwrap();
@@ -590,7 +589,84 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
+    fn toggle_selected_bookmark(&mut self) {
+        let Some(row) = self.selected_row else { return; };
+        let entry_idx = self.model.read().unwrap().filtered.get(row).copied();
+        if let Some(entry_idx) = entry_idx {
+            self.toggle_bookmark(entry_idx);
+        }
+    }
+
+    fn select_filtered_row(&mut self, row: usize) {
+        let len = self.model.read().unwrap().filtered.len();
+        if len == 0 { return; }
+        let row = row.min(len - 1);
+        self.selected_row = Some(row);
+        self.pending_scroll = Some(row);
+        self.at_bottom = row + 1 == len;
+    }
+
+    fn adjust_table_font_size(&mut self, delta: f32) {
+        self.cfg.view.font_size = (self.cfg.view.font_size + delta).clamp(8.0, 32.0);
+    }
+
+    fn reset_table_font_size(&mut self) {
+        self.cfg.view.font_size = Config::default().view.font_size;
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+
+        let cmd = Modifiers::COMMAND;
+        let shortcut = |key| KeyboardShortcut::new(cmd, key);
+
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::S))) {
+            self.save_filtered();
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::Equals))) {
+            self.adjust_table_font_size(1.0);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::Minus))) {
+            self.adjust_table_font_size(-1.0);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::Num0))) {
+            self.reset_table_font_size();
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
+            self.copy_selected_row();
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::F2))) {
+            self.toggle_selected_bookmark();
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2)) {
+            self.jump_bookmark(false);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3)) {
+            self.jump_bookmark(true);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Home)) {
+            self.select_filtered_row(0);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::End)) {
+            let len = self.model.read().unwrap().filtered.len();
+            self.select_filtered_row(len.saturating_sub(1));
+        }
+    }
+
     fn jump_bookmark(&mut self, forward: bool) {
         let m = self.model.read().unwrap();
         if m.filtered.is_empty() { return; }
@@ -1115,6 +1191,7 @@ fn build_highlighted(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_shortcuts(&ctx);
         self.ui_menu_bar(ui);
         self.ui_options_panel(ui);
         self.ui_status_bar(ui);
@@ -1339,6 +1416,14 @@ impl App {
                             ui.close();
                         }
                     }
+                });
+
+                ui.menu_button(tr!("m_help"), |ui| {
+                    ui.set_min_width(360.0);
+                    ui.strong(tr!("shortcuts"));
+                    ui.label(tr!("shortcuts_help"));
+                    ui.separator();
+                    ui.label(tr!("about_status"));
                 });
             });
         });

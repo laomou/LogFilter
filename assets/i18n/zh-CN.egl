@@ -69,7 +69,7 @@ add_remove_tag = 加入排除标签过滤
 copy_message = 复制消息
 copy_row = 复制整行
 about_status = LogFilter — Rust 移植版
-shortcuts_help = Ctrl+F 查找 · F2/F3 书签跳转 · Ctrl+F2 切换书签 · Ctrl+C 复制行 · Home/End
+shortcuts_help = F2/F3 书签跳转 · Ctrl/Cmd+F2 切换书签 · Ctrl/Cmd+C 复制行 · Ctrl/Cmd+S 保存 · Home/End · Ctrl/Cmd+加减调整字号
 
 # formatted status messages
 status_loaded = 已加载 {path} — {n} 行
