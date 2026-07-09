@@ -16,11 +16,16 @@ fn main() -> eframe::Result<()> {
 
     let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("LogFilter")
+        .with_inner_size([1400.0, 900.0])
+        .with_maximized(true);
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("LogFilter")
-            .with_inner_size([1400.0, 900.0])
-            .with_maximized(true),
+        viewport,
         ..Default::default()
     };
 
@@ -29,4 +34,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial_file.clone())))),
     )
+}
+
+/// Decode the bundled .ico into egui's RGBA `IconData` for the window/taskbar
+/// icon. Returns None if decoding fails so startup never aborts over an icon.
+fn load_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/icon.ico");
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData { rgba: image.into_raw(), width, height })
 }

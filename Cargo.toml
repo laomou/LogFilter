@@ -24,6 +24,10 @@ egui-i18n = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ttf-parser = "0.20"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 lto = "thin"
