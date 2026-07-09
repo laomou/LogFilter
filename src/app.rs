@@ -32,7 +32,6 @@ pub struct App {
     pub selected_row: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub focus_find: bool,
-    pub last_filtered_len: usize,
 
     // Font stems currently registered as FontFamily::Name(..); only these are
     // safe to use for per-font previews (unregistered names panic in egui).
@@ -188,7 +187,6 @@ impl App {
             selected_row: None,
             pending_scroll: None,
             focus_find: false,
-            last_filtered_len: 0,
             registered_fonts,
             line_tx,
             adb_session: None,
@@ -232,7 +230,6 @@ impl App {
             model.file_path = Some(path.to_path_buf());
         }
         self.selected_row = None;
-        self.last_filtered_len = 0;
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -350,7 +347,6 @@ impl App {
             model.clear();
         }
         self.selected_row = None;
-        self.last_filtered_len = 0;
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -1549,13 +1545,11 @@ impl App {
                     table = table.column(Column::initial(*w).at_least(*w * 0.5));
                 }
             }
-            {
-                let cur_len = self.model.read().unwrap().filtered.len();
-                if self.auto_scroll && cur_len > self.last_filtered_len && cur_len > 0 {
-                    self.pending_scroll.get_or_insert(cur_len - 1);
-                }
-                self.last_filtered_len = cur_len;
-            }
+            // Auto-follow via egui's built-in stick_to_bottom: pins to the
+            // bottom as rows stream in, unsticks when the user scrolls up to
+            // read old logs, and re-sticks when dragged back to the bottom.
+            // Goto still drives an explicit centered scroll_to_row below.
+            table = table.stick_to_bottom(self.auto_scroll);
             if let Some(scroll_to) = self.pending_scroll.take() {
                 table = table.scroll_to_row(scroll_to, Some(egui::Align::Center));
             }
