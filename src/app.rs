@@ -41,6 +41,10 @@ pub struct App {
     pub selected_device: String,
     pub selected_cmd: String,
     pub auto_scroll: bool,
+
+    // True until the first frame has been painted; used to reveal the window
+    // only once there's content, avoiding a black maximized flash on startup.
+    pub first_frame: bool,
 }
 
 pub struct UiState {
@@ -179,6 +183,7 @@ impl App {
             selected_device: String::new(),
             selected_cmd,
             auto_scroll: true,
+            first_frame: true,
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -985,11 +990,25 @@ impl eframe::App for App {
                 self.status = tr!("status_failed_open_dropped", { e: &format!("{}", e) });
             }
         }
+
+        // Reveal the window now that the first frame has real content, so the
+        // user never sees a black frame during GL/app init.
+        if self.first_frame {
+            self.first_frame = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.ui.write_back(&mut self.cfg);
         let _ = config::save(&self.cfg);
+    }
+
+    /// Clear to the panel background instead of eframe's default dark
+    /// (12,12,12) — otherwise the area newly exposed when maximizing/resizing
+    /// flashes near-black before egui repaints it.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 

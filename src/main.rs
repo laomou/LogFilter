@@ -18,8 +18,10 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LogFilter")
-        .with_inner_size([1400.0, 900.0])
-        .with_maximized(true);
+        .with_inner_size([1350.0, 720.0])
+        // Start hidden; App reveals the window after painting its first frame
+        // so startup shows content, not a black frame during GL/app init.
+        .with_visible(false);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }
