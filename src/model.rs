@@ -117,7 +117,7 @@ impl LogEntry {
         pid: &str, tid: &str, tag: &str, message: &str,
     ) -> Self {
         let mut raw = String::new();
-        let mut push = |raw: &mut String, s: &str| {
+        let push = |raw: &mut String, s: &str| {
             let start = raw.len() as u32;
             raw.push_str(s);
             (start, raw.len() as u32)
