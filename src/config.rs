@@ -58,7 +58,7 @@ pub struct ViewConfig {
 impl Default for ViewConfig {
     fn default() -> Self {
         Self {
-            font_size: 14.0,
+            font_size: 13.0,
             columns: [50.0, 50.0, 100.0, 20.0, 50.0, 50.0, 100.0, 0.0, 600.0],
             encoding: "utf-8".into(),
             font: String::new(),

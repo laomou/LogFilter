@@ -144,7 +144,7 @@ impl UiState {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
-        disable_hover_highlight(&cc.egui_ctx);
+        tune_table_visuals(&cc.egui_ctx);
         let cfg = config::load();
         init_i18n();
         // Apply the stored language (or auto-detect) at startup.
@@ -596,7 +596,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label("🔍");
                         ui.add(egui::TextEdit::singleline(&mut search)
-                            .font(egui::TextStyle::Monospace)
+                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                             .desired_width(f32::INFINITY));
                     });
 
@@ -680,18 +680,16 @@ impl App {
     }
 }
 
-fn disable_hover_highlight(ctx: &egui::Context) {
+/// Tune interaction visuals for the table:
+/// - Keep egui's default `hovered` background, so the row under the pointer is
+///   highlighted (the table's `Sense::click` drives this). This was previously
+///   flattened, which is why no row — including Message — reacted to the mouse.
+/// - Zero the hover `expansion` so rows don't jitter in size on mouse-over.
+/// - Disable label text-selection so read-only cells show no I-beam and never
+///   swallow the click that selects the row.
+fn tune_table_visuals(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    let v = &mut style.visuals.widgets;
-    // Copy inactive presentation onto hovered so pointer-over produces no
-    // visible change; keep `active` (mouse-down) as-is for click feedback.
-    v.hovered.bg_fill = v.inactive.bg_fill;
-    v.hovered.weak_bg_fill = v.inactive.weak_bg_fill;
-    v.hovered.bg_stroke = v.inactive.bg_stroke;
-    v.hovered.fg_stroke = v.inactive.fg_stroke;
-    v.hovered.expansion = 0.0;
-    // Labels should never enter text-selection mode; keeps I-beam cursor off
-    // read-only table cells.
+    style.visuals.widgets.hovered.expansion = 0.0;
     style.interaction.selectable_labels = false;
     ctx.set_style(style);
 }
@@ -819,14 +817,18 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
         }
     }
 
-    // Only the explicitly-selected font becomes the active face, and only for
-    // the Monospace family — the log table renders with FontId::monospace, so
-    // the choice applies to the table alone and leaves the menu / panels /
-    // status bar in egui's default proportional face. With no valid selection
-    // (no fonts installed, or `primary` empty / not among the loaded fonts)
-    // egui's built-in monospace default stays active. Other installed fonts
-    // remain available under their own `FontFamily::Name(stem)` (for previews
-    // and to be selected later); they are NOT forced into any default stack.
+    // The log table renders via FontId::monospace, but by default we want it to
+    // look like the chrome (the Proportional / Ubuntu-Light face), not Hack. So
+    // mirror the proportional face stack into the Monospace family: an unselected
+    // table then matches the menu. A selected font is inserted at the front below,
+    // still overriding the table only (the Proportional family — menu / panels /
+    // status bar — is left untouched). With no valid selection (no fonts
+    // installed, or `primary` empty / not among the loaded fonts) the table keeps
+    // the proportional default. Installed-but-unselected fonts remain available
+    // under their own `FontFamily::Name(stem)` for previews / later selection.
+    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
+        fonts.families.insert(egui::FontFamily::Monospace, prop);
+    }
     if !primary.is_empty() && added.iter().any(|n| n == primary) {
         fonts
             .families
@@ -845,8 +847,8 @@ fn bump_global_text_sizes(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     use egui::TextStyle;
     for (style_key, size) in [
-        (TextStyle::Body, 15.0),
-        (TextStyle::Button, 15.0),
+        (TextStyle::Body, 13.0),
+        (TextStyle::Button, 13.0),
         (TextStyle::Monospace, 14.0),
         (TextStyle::Small, 12.0),
         (TextStyle::Heading, 20.0),
@@ -1045,17 +1047,6 @@ impl App {
                             }
                             ui.separator();
 
-                            // Default (deselect) — fall back to egui's built-in
-                            // face, the same state as "no font selected".
-                            let is_default = self.cfg.view.font.is_empty();
-                            if ui.add(egui::SelectableLabel::new(is_default, tr!("default"))).clicked()
-                                && !is_default
-                            {
-                                self.cfg.view.font.clear();
-                                self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
-                                ui.close_menu();
-                            }
-
                             let loaded: Vec<(String, String)> = std::fs::read_dir(&dir)
                                 .map(|rd| {
                                     rd.flatten()
@@ -1075,9 +1066,9 @@ impl App {
                                 })
                                 .unwrap_or_default();
 
-                            // No empty-state label: the Default item above is
-                            // always present, so an empty folder simply shows
-                            // Open-folder / Default with nothing listed below.
+                            // No empty-state label: an empty folder simply shows
+                            // Open-folder above and Default below with nothing
+                            // listed between them.
                             egui::ScrollArea::vertical()
                                 .max_height(220.0)
                                 .show(ui, |ui| {
@@ -1103,6 +1094,19 @@ impl App {
                                         }
                                     }
                                 });
+
+                            ui.separator();
+                            // Default (bottom): no user font selected — the table
+                            // falls back to the built-in Ubuntu-Light face, the
+                            // same as the menu.
+                            let is_default = self.cfg.view.font.is_empty();
+                            if ui.add(egui::SelectableLabel::new(is_default, tr!("default"))).clicked()
+                                && !is_default
+                            {
+                                self.cfg.view.font.clear();
+                                self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
+                                ui.close_menu();
+                            }
                         } else {
                             ui.label(tr!("config_unavailable"));
                         }
@@ -1199,7 +1203,7 @@ impl App {
                 let w = (ui.available_width() - 8.0).max(200.0);
                 let r = ui.add(egui::TextEdit::singleline(&mut self.ui.find)
                     .id(egui::Id::new("filter_find_edit"))
-                    .font(egui::TextStyle::Monospace)
+                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(w));
                 dirty |= r.changed();
                 if self.focus_find { r.request_focus(); self.focus_find = false; }
@@ -1211,12 +1215,12 @@ impl App {
                 let text_w = (avail / 2.0 - 100.0).max(120.0);
                 dirty |= ui.checkbox(&mut self.ui.remove_on, tr!("remove")).changed();
                 dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.remove)
-                    .font(egui::TextStyle::Monospace)
+                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(text_w)).changed();
                 ui.separator();
                 dirty |= ui.checkbox(&mut self.ui.highlight_on, tr!("highlight")).changed();
                 dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight)
-                    .font(egui::TextStyle::Monospace)
+                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(text_w)).changed();
             });
 
@@ -1558,38 +1562,41 @@ impl App {
                         if self.ui.col_pid      { row.col(|ui| { render(ui, &e.pid); }); }
                         if self.ui.col_thread   { row.col(|ui| { render(ui, &e.tid); }); }
                         if self.ui.col_tag {
-                            row.col(|ui| {
+                            // Render a plain (non-interactive) label so the *cell*
+                            // keeps the pointer hover — an inner Sense::click label
+                            // would steal it and kill the row-hover highlight.
+                            let (_, resp) = row.col(|ui| {
                                 let job = build_highlighted(
                                     &e.tag, &highlight_tokens, &find_tokens,
                                     col, font.clone(), &highlight_palette,
                                 );
-                                let resp = ui.add(egui::Label::new(job).truncate().sense(egui::Sense::click()));
-                                if alt && resp.clicked() {
+                                ui.add(egui::Label::new(job).truncate());
+                            });
+                            if alt && resp.clicked() {
+                                alt_left_tag = Some(e.tag.clone());
+                            } else if resp.clicked() {
+                                // Plain click on the Tag cell selects the row.
+                                clicked_row = Some(row_idx);
+                            }
+                            if resp.double_clicked() {
+                                double_clicked_row = Some(row_idx);
+                            }
+                            if alt && resp.secondary_clicked() {
+                                alt_right_tag = Some(e.tag.clone());
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button(tr!("copy_tag")).clicked() {
+                                    copy_cell_text = Some(e.tag.clone());
+                                    ui.close_menu();
+                                }
+                                if ui.button(tr!("add_show_tag")).clicked() {
                                     alt_left_tag = Some(e.tag.clone());
-                                } else if resp.clicked() {
-                                    // Plain click on the Tag cell selects the row.
-                                    clicked_row = Some(row_idx);
+                                    ui.close_menu();
                                 }
-                                if resp.double_clicked() {
-                                    double_clicked_row = Some(row_idx);
-                                }
-                                if alt && resp.secondary_clicked() {
+                                if ui.button(tr!("add_remove_tag")).clicked() {
                                     alt_right_tag = Some(e.tag.clone());
+                                    ui.close_menu();
                                 }
-                                resp.context_menu(|ui| {
-                                    if ui.button(tr!("copy_tag")).clicked() {
-                                        copy_cell_text = Some(e.tag.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button(tr!("add_show_tag")).clicked() {
-                                        alt_left_tag = Some(e.tag.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button(tr!("add_remove_tag")).clicked() {
-                                        alt_right_tag = Some(e.tag.clone());
-                                        ui.close_menu();
-                                    }
-                                });
                             });
                         }
                         if self.ui.col_bookmark {
@@ -1604,34 +1611,34 @@ impl App {
                             });
                         }
                         if self.ui.col_message {
-                            row.col(|ui| {
+                            let (_, resp) = row.col(|ui| {
                                 let job = build_highlighted(
                                     &e.message, &highlight_tokens, &find_tokens,
                                     col, font.clone(), &highlight_palette,
                                 );
-                                let resp = ui.add(egui::Label::new(job).truncate().sense(egui::Sense::click()));
-                                // The label consumes clicks, so propagate a plain
-                                // left-click to row selection.
-                                if resp.clicked() {
-                                    clicked_row = Some(row_idx);
+                                ui.add(egui::Label::new(job).truncate());
+                            });
+                            // The cell senses clicks (table Sense::click); a plain
+                            // left-click selects the row.
+                            if resp.clicked() {
+                                clicked_row = Some(row_idx);
+                            }
+                            if resp.double_clicked() {
+                                double_clicked_row = Some(row_idx);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button(tr!("copy_message")).clicked() {
+                                    copy_cell_text = Some(e.message.clone());
+                                    ui.close_menu();
                                 }
-                                if resp.double_clicked() {
-                                    double_clicked_row = Some(row_idx);
+                                if ui.button(tr!("copy_row")).clicked() {
+                                    copy_cell_text = Some(format!(
+                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                        e.line_no, e.date, e.time, e.level.as_char(),
+                                        e.pid, e.tid, e.tag, e.message
+                                    ));
+                                    ui.close_menu();
                                 }
-                                resp.context_menu(|ui| {
-                                    if ui.button(tr!("copy_message")).clicked() {
-                                        copy_cell_text = Some(e.message.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button(tr!("copy_row")).clicked() {
-                                        copy_cell_text = Some(format!(
-                                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                            e.line_no, e.date, e.time, e.level.as_char(),
-                                            e.pid, e.tid, e.tag, e.message
-                                        ));
-                                        ui.close_menu();
-                                    }
-                                });
                             });
                         }
 
