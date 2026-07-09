@@ -130,7 +130,7 @@ pub struct RecentConfig {
 }
 
 /// Root config directory. Linux: `~/.config/logfilter/`, Windows:
-/// `%APPDATA%/logfilter/`, macOS: `~/Library/Application Support/logfilter/`.
+/// `%APPDATA%/logfilter/config/`, macOS: `~/Library/Application Support/logfilter/`.
 pub fn config_dir() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("", "", "logfilter")?;
     Some(dirs.config_dir().to_path_buf())
