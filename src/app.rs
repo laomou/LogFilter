@@ -599,15 +599,15 @@ impl App {
 
     fn select_filtered_row(&mut self, row: usize) {
         let len = self.model.read().unwrap().filtered.len();
-        if len == 0 { return; }
-        let row = row.min(len - 1);
-        self.selected_row = Some(row);
-        self.pending_scroll = Some(row);
-        self.at_bottom = row + 1 == len;
+        if let Some(row) = clamp_filtered_row(row, len) {
+            self.selected_row = Some(row);
+            self.pending_scroll = Some(row);
+            self.at_bottom = row + 1 == len;
+        }
     }
 
     fn adjust_table_font_size(&mut self, delta: f32) {
-        self.cfg.view.font_size = (self.cfg.view.font_size + delta).clamp(8.0, 32.0);
+        self.cfg.view.font_size = adjusted_table_font_size(self.cfg.view.font_size, delta);
     }
 
     fn reset_table_font_size(&mut self) {
@@ -662,8 +662,7 @@ impl App {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::End)) {
-            let len = self.model.read().unwrap().filtered.len();
-            self.select_filtered_row(len.saturating_sub(1));
+            self.select_filtered_row(usize::MAX);
         }
     }
 
@@ -1112,6 +1111,18 @@ fn level_color(lv: LevelMask, cfg: &Config) -> Color32 {
         else if lv.contains(LevelMask::D) { &cfg.colors.level_d }
         else { &cfg.colors.level_v };
     parse_color(s)
+}
+
+fn adjusted_table_font_size(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(8.0, 32.0)
+}
+
+fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        None
+    } else {
+        Some(row.min(len - 1))
+    }
 }
 
 /// Build a LayoutJob rendering `text` with highlight tokens as background spans
@@ -1970,7 +1981,6 @@ impl App {
 
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2005,5 +2015,25 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         assert_eq!(lines, vec!["first", "bad \u{fffd}", "last"]);
+    }
+
+    #[test]
+    fn adjusted_table_font_size_clamps_to_bounds() {
+        assert_eq!(adjusted_table_font_size(13.0, 1.0), 14.0);
+        assert_eq!(adjusted_table_font_size(7.0, 0.0), 8.0);
+        assert_eq!(adjusted_table_font_size(31.5, 2.0), 32.0);
+    }
+
+    #[test]
+    fn reset_table_font_size_uses_config_default() {
+        assert_eq!(Config::default().view.font_size, 13.0);
+    }
+
+    #[test]
+    fn clamp_filtered_row_handles_empty_and_bounds() {
+        assert_eq!(clamp_filtered_row(0, 0), None);
+        assert_eq!(clamp_filtered_row(0, 3), Some(0));
+        assert_eq!(clamp_filtered_row(2, 3), Some(2));
+        assert_eq!(clamp_filtered_row(usize::MAX, 3), Some(2));
     }
 }
