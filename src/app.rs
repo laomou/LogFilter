@@ -764,10 +764,10 @@ impl App {
 /// - Disable label text-selection so read-only cells show no I-beam and never
 ///   swallow the click that selects the row.
 fn tune_table_visuals(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals.widgets.hovered.expansion = 0.0;
-    style.interaction.selectable_labels = false;
-    ctx.set_style(style);
+    ctx.all_styles_mut(|style| {
+        style.visuals.widgets.hovered.expansion = 0.0;
+        style.interaction.selectable_labels = false;
+    });
 }
 
 fn init_i18n() {
@@ -825,7 +825,7 @@ fn open_dir(path: &std::path::Path) {
 fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let width = |t: &str| -> f32 {
-        ui.fonts(|f| f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+        ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x
     };
     if width(s) <= max_width {
         return s.to_string();
@@ -881,7 +881,7 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
                 if let Ok(bytes) = std::fs::read(&p) {
                     fonts
                         .font_data
-                        .insert(name.clone(), egui::FontData::from_owned(bytes));
+                        .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
                     // Named family so the picker can preview this font alone.
                     fonts.families.insert(
                         egui::FontFamily::Name(name.clone().into()),
@@ -920,20 +920,20 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
 /// modern high-DPI displays; bump them up ~1pt so menus/toolbars/status match the
 /// table density chosen via View → Font size (default 14).
 fn bump_global_text_sizes(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
     use egui::TextStyle;
-    for (style_key, size) in [
-        (TextStyle::Body, 13.0),
-        (TextStyle::Button, 13.0),
-        (TextStyle::Monospace, 14.0),
-        (TextStyle::Small, 12.0),
-        (TextStyle::Heading, 20.0),
-    ] {
-        if let Some(id) = style.text_styles.get_mut(&style_key) {
-            id.size = size;
+    ctx.all_styles_mut(|style| {
+        for (style_key, size) in [
+            (TextStyle::Body, 13.0),
+            (TextStyle::Button, 13.0),
+            (TextStyle::Monospace, 14.0),
+            (TextStyle::Small, 12.0),
+            (TextStyle::Heading, 20.0),
+        ] {
+            if let Some(id) = style.text_styles.get_mut(&style_key) {
+                id.size = size;
+            }
         }
-    }
-    ctx.set_style(style);
+    });
 }
 
 fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
@@ -1045,14 +1045,15 @@ fn build_highlighted(
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui_menu_bar(ctx);
-        self.ui_options_panel(ctx);
-        self.ui_status_bar(ctx);
-        self.ui_indicator(ctx);
-        self.ui_table(ctx);
-        // Column picker popup (Excel-style)
-        self.render_picker(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.ui_menu_bar(ui);
+        self.ui_options_panel(ui);
+        self.ui_status_bar(ui);
+        self.ui_indicator(ui);
+        self.ui_table(ui);
+        // Column picker popup (Excel-style) — an Area, shown on the context.
+        self.render_picker(&ctx);
 
         // Drag-drop
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1084,11 +1085,12 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn ui_menu_bar(&mut self, ctx: &egui::Context) {
+    fn ui_menu_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // Menu bar — File · Format · View · Encoding
         let mut recent_open: Option<PathBuf> = None;
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(tr!("m_file"), |ui| {
                     if ui.button(tr!("open")).clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -1096,7 +1098,7 @@ impl App {
                                 self.status = tr!("status_failed_open", { e: &format!("{}", e) });
                             }
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.menu_button(tr!("recent"), |ui| {
                         let recent = self.cfg.recent.files.clone();
@@ -1106,14 +1108,14 @@ impl App {
                         for p in recent {
                             if ui.button(p.display().to_string()).clicked() {
                                 recent_open = Some(p);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
                     ui.separator();
                     if ui.button(tr!("save_filtered")).clicked() {
                         self.save_filtered();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button(tr!("exit")).clicked() {
@@ -1133,7 +1135,7 @@ impl App {
                             if ui.button(tr!("open_folder")).clicked() {
                                 let _ = std::fs::create_dir_all(&dir);
                                 open_dir(&dir);
-                                ui.close_menu();
+                                ui.close();
                             }
                             ui.separator();
 
@@ -1176,11 +1178,11 @@ impl App {
                                         } else {
                                             egui::RichText::new(text)
                                         };
-                                        let resp = ui.add(egui::SelectableLabel::new(sel, label));
+                                        let resp = ui.selectable_label(sel, label);
                                         if resp.clicked() && !sel {
                                             self.cfg.view.font = stem.clone();
-                                            self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
-                                            ui.close_menu();
+                                            self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font);
+                                            ui.close();
                                         }
                                     }
                                 });
@@ -1190,12 +1192,12 @@ impl App {
                             // falls back to the built-in Ubuntu-Light face, the
                             // same as the menu.
                             let is_default = self.cfg.view.font.is_empty();
-                            if ui.add(egui::SelectableLabel::new(is_default, tr!("default"))).clicked()
+                            if ui.selectable_label(is_default, tr!("default")).clicked()
                                 && !is_default
                             {
                                 self.cfg.view.font.clear();
-                                self.registered_fonts = install_ui_font(ctx, &self.cfg.view.font);
-                                ui.close_menu();
+                                self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font);
+                                ui.close();
                             }
                         } else {
                             ui.label(tr!("config_unavailable"));
@@ -1208,9 +1210,9 @@ impl App {
                         let presets = [13.0, 14.0, 15.0, 16.0, 17.0, 18.0];
                         for &p in &presets {
                             let sel = (self.cfg.view.font_size - p).abs() < 0.01;
-                            if ui.add(egui::SelectableLabel::new(sel, format!("{:.0} pt", p))).clicked() {
+                            if ui.selectable_label(sel, format!("{:.0} pt", p)).clicked() {
                                 self.cfg.view.font_size = p;
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
@@ -1238,7 +1240,7 @@ impl App {
                             self.ui.col_thread = true;
                             self.ui.col_tag = true;
                             self.ui.col_message = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                     ui.menu_button(tr!("language"), |ui| {
@@ -1251,7 +1253,7 @@ impl App {
                         for (label, code) in &opts {
                             if ui.selectable_label(cur == *code, label.as_str()).clicked() {
                                 self.set_lang(code);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
@@ -1266,7 +1268,7 @@ impl App {
                         let selected = self.ui.encoding == value;
                         if ui.selectable_label(selected, label).clicked() {
                             self.ui.encoding = value.into();
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                 });
@@ -1279,14 +1281,14 @@ impl App {
         }
     }
 
-    fn ui_options_panel(&mut self, ctx: &egui::Context) {
+    fn ui_options_panel(&mut self, ui: &mut egui::Ui) {
         // Option panel — 3 rows:
         //   Row 1: 🔍 Find (fills width)
         //   Row 2: Remove (half) · Highlight (half)
         //   Row 3: adb toolbar · Goto · Auto-scroll
         let mut dirty = false;
         let mut goto_target: Option<usize> = None;
-        egui::TopBottomPanel::top("options").show(ctx, |ui| {
+        egui::Panel::top("options").show(ui, |ui| {
             // Row 1: Find
             ui.horizontal(|ui| {
                 dirty |= ui.checkbox(&mut self.ui.find_on, tr!("find")).changed();
@@ -1319,7 +1321,7 @@ impl App {
                 let running = self.adb_session.is_some();
                 let cmds = self.cfg.adb.commands.clone();
                 ui.label(tr!("cmd"));
-                egui::ComboBox::from_id_source("cmd")
+                egui::ComboBox::from_id_salt("cmd")
                     .selected_text(&self.selected_cmd)
                     .width(220.0)
                     .show_ui(ui, |ui| {
@@ -1329,7 +1331,7 @@ impl App {
                     });
                 ui.label(tr!("device"));
                 let devices = self.adb_devices.clone();
-                egui::ComboBox::from_id_source("device")
+                egui::ComboBox::from_id_salt("device")
                     .selected_text(if self.selected_device.is_empty() { tr!("device_any") } else { self.selected_device.clone() })
                     .width(160.0)
                     .show_ui(ui, |ui| {
@@ -1376,9 +1378,9 @@ impl App {
         }
     }
 
-    fn ui_status_bar(&mut self, ctx: &egui::Context) {
+    fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
             let model = self.model.read().unwrap();
             ui.horizontal(|ui| {
                 match &model.file_path {
@@ -1425,9 +1427,9 @@ impl App {
         });
     }
 
-    fn ui_indicator(&mut self, ctx: &egui::Context) {
+    fn ui_indicator(&mut self, ui: &mut egui::Ui) {
         // Indicator panel (mini-scrollbar)
-        egui::SidePanel::right("indicator").exact_width(24.0).resizable(false).show(ctx, |ui| {
+        egui::Panel::right("indicator").exact_size(24.0).resizable(false).show(ui, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
@@ -1477,9 +1479,10 @@ impl App {
         });
     }
 
-    fn ui_table(&mut self, ctx: &egui::Context) {
+    fn ui_table(&mut self, ui: &mut egui::Ui) {
         // Log table
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let ctx = ui.ctx().clone();
+        egui::CentralPanel::default().show(ui, |ui| {
             let font = FontId::monospace(self.cfg.view.font_size);
             let highlight_palette: Vec<Color32> =
                 self.cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
@@ -1610,12 +1613,12 @@ impl App {
                                     if let Some(p) = pk {
                                         open_picker = Some((p, resp.rect.left_bottom()));
                                     }
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 ui.separator();
                                 if ui.button(tr!("hide_this")).clicked() {
                                     hide_col_idx = Some(i);
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         });
@@ -1672,15 +1675,15 @@ impl App {
                             resp.context_menu(|ui| {
                                 if ui.button(tr!("copy_tag")).clicked() {
                                     copy_cell_text = Some(e.tag().to_string());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button(tr!("add_show_tag")).clicked() {
                                     alt_left_tag = Some(e.tag().to_string());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button(tr!("add_remove_tag")).clicked() {
                                     alt_right_tag = Some(e.tag().to_string());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -1714,7 +1717,7 @@ impl App {
                             resp.context_menu(|ui| {
                                 if ui.button(tr!("copy_message")).clicked() {
                                     copy_cell_text = Some(e.message().to_string());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button(tr!("copy_row")).clicked() {
                                     copy_cell_text = Some(format!(
@@ -1722,7 +1725,7 @@ impl App {
                                         e.line_no, e.date(), e.time(), e.level.as_char(),
                                         e.pid(), e.tid(), e.tag(), e.message()
                                     ));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
