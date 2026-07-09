@@ -341,6 +341,18 @@ impl App {
     fn adb_run(&mut self) {
         self.adb_stop();
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // A fresh run starts from an empty table — clear any entries left from a
+        // previous run/file (mirrors the file-load path). The epoch bump above
+        // already ensures stale queued lines are dropped by the ingest thread.
+        {
+            let mut model = self.model.write().unwrap();
+            model.clear();
+        }
+        self.selected_row = None;
+        self.last_filtered_len = 0;
+        self.notify_filter();
+
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
         match adb::Session::start(
             self.cfg.adb.adb_path.as_deref(),
