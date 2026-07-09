@@ -87,13 +87,16 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawn `adb [-s serial] <cmd_args...>` and stream stdout lines into `tx`.
-    /// Blank lines are preserved; the reader thread exits when stdout closes.
+    /// Spawn `adb [-s serial] <cmd_args...>` and stream stdout lines into `tx`,
+    /// each tagged with `epoch` so the ingest side can drop lines from a
+    /// superseded source. Blank lines are preserved; the reader thread exits
+    /// when stdout closes.
     pub fn start(
         adb_override: Option<&str>,
         device: Option<&str>,
         cmd: &str,
-        tx: Sender<String>,
+        tx: Sender<(u64, String)>,
+        epoch: u64,
     ) -> Result<Self> {
         let mut command = adb_command(adb_override);
         if let Some(d) = device {
@@ -112,7 +115,7 @@ impl Session {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(|r| r.ok()) {
                 if paused_thr.load(Ordering::Relaxed) { continue; }
-                if tx.send(line).is_err() { break; }
+                if tx.send((epoch, line)).is_err() { break; }
             }
         })?;
         Ok(Self {

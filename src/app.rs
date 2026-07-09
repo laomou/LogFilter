@@ -21,6 +21,10 @@ pub struct App {
     pub model: Arc<RwLock<Model>>,
     pub shared_filter: Arc<RwLock<FilterSpec>>,
     pub gen: Arc<AtomicU64>,
+    /// Monotonic id of the current line source (file load or adb session). Each
+    /// new load/adb-run bumps it; the ingest thread drops any queued line whose
+    /// epoch != this, so a superseded load can't interleave into the new one.
+    pub source_epoch: Arc<AtomicU64>,
     pub wake: Arc<(Mutex<bool>, Condvar)>,
     pub status: String,
     pub ui: UiState,
@@ -35,7 +39,7 @@ pub struct App {
     pub registered_fonts: Vec<String>,
 
     // adb
-    pub line_tx: Sender<String>,
+    pub line_tx: Sender<(u64, String)>,
     pub adb_session: Option<adb::Session>,
     pub adb_devices: Vec<String>,
     pub selected_device: String,
@@ -167,13 +171,14 @@ impl App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let ui = UiState::from_config(&cfg);
         let shared_filter = Arc::new(RwLock::new(ui.to_filter_spec()));
-        let (line_tx, line_rx) = unbounded::<String>();
+        let (line_tx, line_rx) = unbounded::<(u64, String)>();
         let selected_cmd = cfg.adb.commands.first().cloned().unwrap_or_else(|| "logcat -v threadtime".into());
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
             shared_filter,
             gen: Arc::new(AtomicU64::new(0)),
+            source_epoch: Arc::new(AtomicU64::new(0)),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             status: String::new(),
             ui,
@@ -213,6 +218,10 @@ impl App {
         // Stop any adb session so its lines don't interleave with the file.
         self.adb_stop();
 
+        // Claim a fresh source epoch *before* clearing so any lines still queued
+        // from a previous load/adb are dropped by the ingest thread.
+        let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
         // Reset the model synchronously (cheap) and let lines stream in.
         {
             let mut model = self.model.write().unwrap();
@@ -226,8 +235,10 @@ impl App {
 
         // Background reader: read + decode, then feed lines through the existing
         // ingest channel so parsing/appending/repaint happen incrementally on
-        // the ingest thread — the UI stays responsive for large files.
+        // the ingest thread — the UI stays responsive for large files. The
+        // reader bails out early if a newer load supersedes this epoch.
         let tx = self.line_tx.clone();
+        let source_epoch = self.source_epoch.clone();
         let choice = self.encoding_choice();
         let path = path.to_path_buf();
         thread::Builder::new()
@@ -236,7 +247,10 @@ impl App {
                 let Ok(bytes) = std::fs::read(&path) else { return; };
                 let text = decode_bytes(&bytes, choice);
                 for line in text.lines() {
-                    if tx.send(line.to_string()).is_err() {
+                    if source_epoch.load(Ordering::Acquire) != epoch {
+                        return; // superseded by a newer load
+                    }
+                    if tx.send((epoch, line.to_string())).is_err() {
                         return; // receiver gone (app closing)
                     }
                 }
@@ -274,12 +288,12 @@ impl App {
         egui_i18n::set_language(code);
     }
 
-    fn spawn_ingest_thread(&self, ctx: egui::Context, rx: Receiver<String>) {
+    fn spawn_ingest_thread(&self, ctx: egui::Context, rx: Receiver<(u64, String)>) {
         let model = self.model.clone();
-        let gen = self.gen.clone();
         let wake = self.wake.clone();
+        let source_epoch = self.source_epoch.clone();
         thread::Builder::new().name("ingest".into()).spawn(move || {
-            let mut batch: Vec<String> = Vec::with_capacity(256);
+            let mut batch: Vec<(u64, String)> = Vec::with_capacity(256);
             loop {
                 // block for first line
                 let Ok(first) = rx.recv() else { return; };
@@ -295,30 +309,42 @@ impl App {
                         Err(_) => break,
                     }
                 }
+                // Drop lines from a superseded source (an older file load / adb
+                // session) so they never interleave into the current one.
+                let cur = source_epoch.load(Ordering::Acquire);
+                let mut appended = false;
                 {
                     let mut m = model.write().unwrap();
-                    for line in batch.drain(..) {
+                    for (ep, line) in batch.drain(..) {
+                        if ep != cur { continue; }
                         let (entry, _) = parse_line(&line);
                         m.append(entry);
+                        appended = true;
                     }
                 }
-                gen.fetch_add(1, Ordering::AcqRel);
-                let (lock, cvar) = &*wake;
-                *lock.lock().unwrap() = true;
-                cvar.notify_one();
-                ctx.request_repaint();
+                if appended {
+                    // Wake the filter thread for an append-only pass. Deliberately
+                    // do NOT bump `gen` — that's reserved for filter-spec changes,
+                    // which force a full recompute (see spawn_filter_thread).
+                    let (lock, cvar) = &*wake;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_one();
+                    ctx.request_repaint();
+                }
             }
         }).expect("spawn ingest thread");
     }
 
     fn adb_run(&mut self) {
         self.adb_stop();
+        let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
         match adb::Session::start(
             self.cfg.adb.adb_path.as_deref(),
             device,
             &self.selected_cmd,
             self.line_tx.clone(),
+            epoch,
         ) {
             Ok(s) => {
                 self.adb_session = Some(s);
@@ -453,6 +479,15 @@ impl App {
         let wake = self.wake.clone();
         thread::Builder::new().name("filter".into()).spawn(move || {
             let (lock, cvar) = &*wake;
+            // Incremental state carried across wakes:
+            //  * `last_spec_gen` — the `gen` the current `filtered` was built for.
+            //  * `processed_len` — how many entries are already reflected in it.
+            // A wake does a full recompute only when the spec changed or the log
+            // shrank (clear/reload); otherwise it just filters the appended tail
+            // and extends `filtered`, so streaming stays O(N) overall instead of
+            // O(N²) (which is what re-scanning from 0 every batch would cost).
+            let mut last_spec_gen: u64 = u64::MAX;
+            let mut processed_len: usize = 0;
             loop {
                 let mut pending = lock.lock().unwrap();
                 while !*pending {
@@ -462,22 +497,25 @@ impl App {
                 *pending = false;
                 drop(pending);
 
-                let gen_start = gen.load(Ordering::Acquire);
+                let spec_gen = gen.load(Ordering::Acquire);
                 let spec = spec_lock.read().unwrap().clone();
-                let bookmarks = { model.read().unwrap().bookmarks.clone() };
                 let entries_len = model.read().unwrap().entries.len();
 
-                let mut out: Vec<u32> = Vec::with_capacity(entries_len / 4);
+                let full = spec_gen != last_spec_gen || entries_len < processed_len;
+                let start = if full { 0 } else { processed_len };
+
+                let cap = if full { entries_len / 4 } else { (entries_len - start) / 2 + 1 };
+                let mut out: Vec<u32> = Vec::with_capacity(cap);
                 let mut aborted = false;
                 // Process in chunks holding the read lock once per chunk instead
-                // of once per row: amortizes lock cost ~CHUNK× while still
-                // yielding to writers (ingest/clear) and checking abort between
-                // chunks. Entries only grow by append, so indices below the
-                // start snapshot are stable; guard against concurrent clear.
+                // of once per row: amortizes lock cost while still yielding to
+                // writers (ingest/clear) and checking abort between chunks.
                 const CHUNK: usize = 4096;
-                let mut i = 0usize;
+                let mut i = start;
                 while i < entries_len {
-                    if gen.load(Ordering::Acquire) != gen_start {
+                    // Abort only on a *spec* change; data growth is picked up by
+                    // the next wake continuing from `processed_len`.
+                    if gen.load(Ordering::Acquire) != spec_gen {
                         aborted = true;
                         break;
                     }
@@ -485,23 +523,44 @@ impl App {
                     let m = model.read().unwrap();
                     let hi = end.min(m.entries.len());
                     for j in i..hi {
-                        if spec.matches(&m.entries[j], &bookmarks) {
+                        if spec.matches(&m.entries[j], &m.bookmarks) {
                             out.push(j as u32);
                         }
                     }
                     drop(m);
                     if hi < end {
-                        break; // entries shrank (cleared) — stop early
+                        aborted = true; // entries shrank (cleared) — stop early
+                        break;
                     }
                     i = end;
                 }
 
-                if !aborted && gen.load(Ordering::Acquire) == gen_start {
-                    let mut m = model.write().unwrap();
-                    m.filtered = out;
-                    drop(m);
-                    ctx.request_repaint();
+                if aborted {
+                    // Discard the partial result and force a full redo next wake.
+                    processed_len = 0;
+                    last_spec_gen = u64::MAX;
+                    continue;
                 }
+
+                // Commit under the write lock, re-validating against a clear that
+                // could have landed since we snapshotted `entries_len` — otherwise
+                // `filtered` could hold indices past the end of a shrunk log.
+                let mut m = model.write().unwrap();
+                if gen.load(Ordering::Acquire) != spec_gen || m.entries.len() < entries_len {
+                    drop(m);
+                    processed_len = 0;
+                    last_spec_gen = u64::MAX;
+                    continue;
+                }
+                if full {
+                    m.filtered = out;
+                } else {
+                    m.filtered.extend(out);
+                }
+                drop(m);
+                processed_len = entries_len;
+                last_spec_gen = spec_gen;
+                ctx.request_repaint();
             }
         }).expect("spawn filter thread");
     }
