@@ -19,6 +19,10 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LogFilter")
         .with_inner_size([1350.0, 720.0])
+        // Start maximized so the table fills the screen by default; pairs with
+        // ui_table's fill-all-space sizing (max_scroll_height = INFINITY) so the
+        // log view uses the whole window instead of a centered 1350×720 box.
+        .with_maximized(true)
         // Start hidden; App reveals the window after painting its first frame
         // so startup shows content, not a black frame during GL/app init.
         .with_visible(false);
