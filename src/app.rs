@@ -5,7 +5,7 @@ use crate::model::{EncodingChoice, LevelMask, Model};
 use crate::parser::parse_line;
 use egui_i18n::tr;
 use anyhow::Result;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 use egui_extras::{Column, TableBuilder};
@@ -171,7 +171,10 @@ impl App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let ui = UiState::from_config(&cfg);
         let shared_filter = Arc::new(RwLock::new(ui.to_filter_spec()));
-        let (line_tx, line_rx) = unbounded::<(u64, String)>();
+        // Bounded so a fast file reader can't buffer the whole file as queued
+        // Strings ahead of the (slower) parse/append step — it blocks instead,
+        // capping peak memory. 8192 ≈ a few ingest batches of headroom.
+        let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
         let selected_cmd = cfg.adb.commands.first().cloned().unwrap_or_else(|| "logcat -v threadtime".into());
         let mut app = Self {
             cfg,
@@ -317,7 +320,7 @@ impl App {
                     let mut m = model.write().unwrap();
                     for (ep, line) in batch.drain(..) {
                         if ep != cur { continue; }
-                        let (entry, _) = parse_line(&line);
+                        let (entry, _) = parse_line(line);
                         m.append(entry);
                         appended = true;
                     }
@@ -388,7 +391,7 @@ impl App {
         let e = &m.entries[ei as usize];
         let text = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            e.line_no, e.date, e.time, e.level.as_char(), e.pid, e.tid, e.tag, e.message
+            e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
         );
         let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text));
     }
@@ -412,8 +415,8 @@ impl App {
                 writeln!(
                     w,
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    e.line_no, e.date, e.time, e.level.as_char(),
-                    e.pid, e.tid, e.tag, e.message,
+                    e.line_no, e.date(), e.time(), e.level.as_char(),
+                    e.pid(), e.tid(), e.tag(), e.message(),
                 )?;
             }
             w.flush()?;
@@ -1638,24 +1641,24 @@ impl App {
                         };
 
                         if self.ui.col_line     { row.col(|ui| { render(ui, &e.line_no.to_string()); }); }
-                        if self.ui.col_date     { row.col(|ui| { render(ui, &e.date); }); }
-                        if self.ui.col_time     { row.col(|ui| { render(ui, &e.time); }); }
+                        if self.ui.col_date     { row.col(|ui| { render(ui, e.date()); }); }
+                        if self.ui.col_time     { row.col(|ui| { render(ui, e.time()); }); }
                         if self.ui.col_loglv    { row.col(|ui| { render(ui, &e.level.as_char().to_string()); }); }
-                        if self.ui.col_pid      { row.col(|ui| { render(ui, &e.pid); }); }
-                        if self.ui.col_thread   { row.col(|ui| { render(ui, &e.tid); }); }
+                        if self.ui.col_pid      { row.col(|ui| { render(ui, e.pid()); }); }
+                        if self.ui.col_thread   { row.col(|ui| { render(ui, e.tid()); }); }
                         if self.ui.col_tag {
                             // Render a plain (non-interactive) label so the *cell*
                             // keeps the pointer hover — an inner Sense::click label
                             // would steal it and kill the row-hover highlight.
                             let (_, resp) = row.col(|ui| {
                                 let job = build_highlighted(
-                                    &e.tag, &highlight_tokens, &find_tokens,
+                                    e.tag(), &highlight_tokens, &find_tokens,
                                     col, font.clone(), &highlight_palette,
                                 );
                                 ui.add(egui::Label::new(job).truncate());
                             });
                             if alt && resp.clicked() {
-                                alt_left_tag = Some(e.tag.clone());
+                                alt_left_tag = Some(e.tag().to_string());
                             } else if resp.clicked() {
                                 // Plain click on the Tag cell selects the row.
                                 clicked_row = Some(row_idx);
@@ -1664,19 +1667,19 @@ impl App {
                                 double_clicked_row = Some(row_idx);
                             }
                             if alt && resp.secondary_clicked() {
-                                alt_right_tag = Some(e.tag.clone());
+                                alt_right_tag = Some(e.tag().to_string());
                             }
                             resp.context_menu(|ui| {
                                 if ui.button(tr!("copy_tag")).clicked() {
-                                    copy_cell_text = Some(e.tag.clone());
+                                    copy_cell_text = Some(e.tag().to_string());
                                     ui.close_menu();
                                 }
                                 if ui.button(tr!("add_show_tag")).clicked() {
-                                    alt_left_tag = Some(e.tag.clone());
+                                    alt_left_tag = Some(e.tag().to_string());
                                     ui.close_menu();
                                 }
                                 if ui.button(tr!("add_remove_tag")).clicked() {
-                                    alt_right_tag = Some(e.tag.clone());
+                                    alt_right_tag = Some(e.tag().to_string());
                                     ui.close_menu();
                                 }
                             });
@@ -1695,7 +1698,7 @@ impl App {
                         if self.ui.col_message {
                             let (_, resp) = row.col(|ui| {
                                 let job = build_highlighted(
-                                    &e.message, &highlight_tokens, &find_tokens,
+                                    e.message(), &highlight_tokens, &find_tokens,
                                     col, font.clone(), &highlight_palette,
                                 );
                                 ui.add(egui::Label::new(job).truncate());
@@ -1710,14 +1713,14 @@ impl App {
                             }
                             resp.context_menu(|ui| {
                                 if ui.button(tr!("copy_message")).clicked() {
-                                    copy_cell_text = Some(e.message.clone());
+                                    copy_cell_text = Some(e.message().to_string());
                                     ui.close_menu();
                                 }
                                 if ui.button(tr!("copy_row")).clicked() {
                                     copy_cell_text = Some(format!(
                                         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                        e.line_no, e.date, e.time, e.level.as_char(),
-                                        e.pid, e.tid, e.tag, e.message
+                                        e.line_no, e.date(), e.time(), e.level.as_char(),
+                                        e.pid(), e.tid(), e.tag(), e.message()
                                     ));
                                     ui.close_menu();
                                 }

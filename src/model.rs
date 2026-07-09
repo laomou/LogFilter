@@ -61,16 +61,75 @@ pub enum LogFormat {
     Unknown,
 }
 
+/// Byte range `[start, end)` into a [`LogEntry::raw`] line.
+type Span = (u32, u32);
+
+/// One parsed log line. To keep memory low on large files, the whole original
+/// line is stored once as a single `Box<str>` and each field is a byte range
+/// into it (accessed via the methods below) — one allocation per entry instead
+/// of six separate `String`s.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    raw: Box<str>,
     pub line_no: u32,
-    pub date: String,
-    pub time: String,
     pub level: LevelMask,
-    pub pid: String,
-    pub tid: String,
-    pub tag: String,
-    pub message: String,
+    date: Span,
+    time: Span,
+    pid: Span,
+    tid: Span,
+    tag: Span,
+    message: Span,
+}
+
+impl LogEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        raw: Box<str>,
+        level: LevelMask,
+        date: Span,
+        time: Span,
+        pid: Span,
+        tid: Span,
+        tag: Span,
+        message: Span,
+    ) -> Self {
+        Self { raw, line_no: 0, level, date, time, pid, tid, tag, message }
+    }
+
+    #[inline]
+    fn slice(&self, s: Span) -> &str {
+        &self.raw[s.0 as usize..s.1 as usize]
+    }
+
+    #[inline] pub fn date(&self) -> &str { self.slice(self.date) }
+    #[inline] pub fn time(&self) -> &str { self.slice(self.time) }
+    #[inline] pub fn pid(&self) -> &str { self.slice(self.pid) }
+    #[inline] pub fn tid(&self) -> &str { self.slice(self.tid) }
+    #[inline] pub fn tag(&self) -> &str { self.slice(self.tag) }
+    #[inline] pub fn message(&self) -> &str { self.slice(self.message) }
+
+    /// Build an entry from separate field strings (tests / synthetic data):
+    /// concatenates the fields into one backing buffer and records their spans.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fields(
+        date: &str, time: &str, level: LevelMask,
+        pid: &str, tid: &str, tag: &str, message: &str,
+    ) -> Self {
+        let mut raw = String::new();
+        let mut push = |raw: &mut String, s: &str| {
+            let start = raw.len() as u32;
+            raw.push_str(s);
+            (start, raw.len() as u32)
+        };
+        let d = push(&mut raw, date);
+        let t = push(&mut raw, time);
+        let p = push(&mut raw, pid);
+        let i = push(&mut raw, tid);
+        let g = push(&mut raw, tag);
+        let m = push(&mut raw, message);
+        Self { raw: raw.into_boxed_str(), line_no: 1, level, date: d, time: t, pid: p, tid: i, tag: g, message: m }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,19 +172,27 @@ impl Model {
         if entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F) {
             self.error_lines.push(entry.line_no - 1);
         }
-        if !entry.pid.is_empty() {
-            *self.pid_counts.entry(entry.pid.clone()).or_insert(0) += 1;
-        }
-        if !entry.tid.is_empty() {
-            *self.tid_counts.entry(entry.tid.clone()).or_insert(0) += 1;
-        }
-        if !entry.tag.is_empty() {
-            *self.tag_counts.entry(entry.tag.clone()).or_insert(0) += 1;
-        }
+        // Bump per-value counts. Clone the key only when it's a new distinct
+        // value (cardinality is tiny), not once per line.
+        bump_count(&mut self.pid_counts, entry.pid());
+        bump_count(&mut self.tid_counts, entry.tid());
+        bump_count(&mut self.tag_counts, entry.tag());
         if let Some(idx) = level_index(entry.level) {
             self.level_counts[idx] += 1;
         }
         self.entries.push(entry);
+    }
+}
+
+/// Increment `map[key]`, allocating the key string only on first insert.
+fn bump_count(map: &mut HashMap<String, usize>, key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    if let Some(v) = map.get_mut(key) {
+        *v += 1;
+    } else {
+        map.insert(key.to_string(), 1);
     }
 }
 

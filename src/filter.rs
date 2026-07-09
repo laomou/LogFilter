@@ -48,17 +48,17 @@ impl FilterSpec {
             }
         }
         if let Some(set) = &self.allowed_pids {
-            if !set.contains(&entry.pid) {
+            if !set.contains(entry.pid()) {
                 return false;
             }
         }
         if let Some(set) = &self.allowed_tids {
-            if !set.contains(&entry.tid) {
+            if !set.contains(entry.tid()) {
                 return false;
             }
         }
         if let Some(set) = &self.allowed_tags {
-            if !set.contains(&entry.tag) {
+            if !set.contains(entry.tag()) {
                 return false;
             }
         }
@@ -68,10 +68,10 @@ impl FilterSpec {
         if self.errors_only && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F)) {
             return false;
         }
-        if !self.find.is_empty() && !any_contains(&entry.message, &self.find) {
+        if !self.find.is_empty() && !any_contains(entry.message(), &self.find) {
             return false;
         }
-        if !self.remove.is_empty() && any_contains(&entry.message, &self.remove) {
+        if !self.remove.is_empty() && any_contains(entry.message(), &self.remove) {
             return false;
         }
         true
@@ -117,16 +117,7 @@ mod tests {
     use crate::model::LevelMask;
 
     fn e(msg: &str, tag: &str, lv: LevelMask) -> LogEntry {
-        LogEntry {
-            line_no: 1,
-            date: String::new(),
-            time: String::new(),
-            level: lv,
-            pid: "1".into(),
-            tid: "1".into(),
-            tag: tag.into(),
-            message: msg.into(),
-        }
+        LogEntry::from_fields("", "", lv, "1", "1", tag, msg)
     }
 
     #[test]
@@ -181,16 +172,7 @@ mod tests {
         spec.allowed_pids = Some(set);
         let hs = HashSet::new();
         assert!(spec.matches(&e("m", "T", LevelMask::I), &hs));
-        let other = LogEntry {
-            line_no: 2,
-            date: String::new(),
-            time: String::new(),
-            level: LevelMask::I,
-            pid: "99".into(),
-            tid: "1".into(),
-            tag: "T".into(),
-            message: "m".into(),
-        };
+        let other = LogEntry::from_fields("", "", LevelMask::I, "99", "1", "T", "m");
         assert!(!spec.matches(&other, &hs));
     }
 }
