@@ -80,6 +80,7 @@ sh_save = Save filtered log to file
 sh_font_size = Increase / decrease font size
 sh_reset_font = Reset font size
 sh_home_end = Jump to first / last row
+shortcuts_help = F2/F3 bookmarks · Ctrl/Cmd+F2 toggle bookmark · Ctrl/Cmd+C copy row · Ctrl/Cmd+S save · Home/End · Ctrl/Cmd+Plus/Minus font size
 sh_double_click_lbl = Double-click
 sh_double_click = Toggle bookmark
 sh_alt_click_lbl = Alt+click
