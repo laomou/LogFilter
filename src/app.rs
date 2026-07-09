@@ -3,13 +3,14 @@ use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::model::{EncodingChoice, LevelMask, Model};
 use crate::parser::parse_line;
-use egui_i18n::tr;
 use anyhow::Result;
+use egui_i18n::tr;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 use egui_extras::{Column, TableBuilder};
 use encoding_rs::Encoding;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -249,17 +250,9 @@ impl App {
         let path = path.to_path_buf();
         thread::Builder::new()
             .name("file-load".into())
-            .spawn(move || {
-                let Ok(bytes) = std::fs::read(&path) else { return; };
-                let text = decode_bytes(&bytes, choice);
-                for line in text.lines() {
-                    if source_epoch.load(Ordering::Acquire) != epoch {
-                        return; // superseded by a newer load
-                    }
-                    if tx.send((epoch, line.to_string())).is_err() {
-                        return; // receiver gone (app closing)
-                    }
-                }
+            .spawn(move || match choice {
+                EncodingChoice::Utf8 => send_utf8_lines(&path, tx, epoch, source_epoch),
+                EncodingChoice::Local => send_decoded_lines(&path, tx, epoch, source_epoch, choice),
             })?;
         Ok(())
     }
@@ -956,6 +949,60 @@ fn bump_global_text_sizes(ctx: &egui::Context) {
     });
 }
 
+fn send_utf8_lines(
+    path: &Path,
+    tx: Sender<(u64, String)>,
+    epoch: u64,
+    source_epoch: Arc<AtomicU64>,
+) {
+    let Ok(file) = std::fs::File::open(path) else { return; };
+    let mut reader = BufReader::new(file);
+    let bom = match reader.fill_buf() {
+        Ok(buf) => buf,
+        Err(_) => return,
+    };
+    if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
+        drop(reader);
+        send_decoded_lines(path, tx, epoch, source_epoch, EncodingChoice::Utf8);
+        return;
+    }
+
+    let mut buf = Vec::new();
+    let mut first = true;
+    loop {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else { return; };
+        if n == 0 { return; }
+        if source_epoch.load(Ordering::Acquire) != epoch { return; }
+        let mut line = String::from_utf8_lossy(&buf).into_owned();
+        if first {
+            first = false;
+            if line.starts_with('\u{feff}') {
+                line.remove(0);
+            }
+        }
+        while line.ends_with(['\n', '\r']) {
+            line.pop();
+        }
+        if tx.send((epoch, line)).is_err() { return; }
+    }
+}
+
+fn send_decoded_lines(
+    path: &Path,
+    tx: Sender<(u64, String)>,
+    epoch: u64,
+    source_epoch: Arc<AtomicU64>,
+    choice: EncodingChoice,
+) {
+    let Ok(bytes) = std::fs::read(path) else { return; };
+    let text = decode_bytes(&bytes, choice);
+    for line in text.lines() {
+        if source_epoch.load(Ordering::Acquire) != epoch { return; }
+        if tx.send((epoch, line.to_string())).is_err() { return; }
+    }
+}
+
 fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
     // `Encoding::decode` BOM-sniffs first: a leading UTF-8 / UTF-16 LE / UTF-16
     // BE BOM overrides `choice` and is stripped from the output. With no BOM it
@@ -1466,27 +1513,27 @@ impl App {
                     egui::pos2(rect.min.x + rect.width() * 0.5, rect.min.y),
                     rect.max,
                 );
-                // Bookmarks (left, blue)
-                for (fi, &ei) in model.filtered.iter().enumerate() {
-                    if model.bookmarks.contains(&ei) {
-                        let y = left_col.min.y + h * (fi as f32) / (total as f32);
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(egui::pos2(left_col.min.x, y), egui::vec2(left_col.width(), 2.0)),
-                            0.0,
-                            Color32::from_rgb(80, 140, 255),
-                        );
+                let paint_mark = |fi: usize, col: egui::Rect, color: Color32| {
+                    let y = col.min.y + h * (fi as f32) / (total as f32);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(col.min.x, y),
+                            egui::vec2(col.width(), 2.0),
+                        ),
+                        0.0,
+                        color,
+                    );
+                };
+                for &ei in &model.bookmarks {
+                    // `filtered` is built by scanning entries in ascending order.
+                    if let Ok(fi) = model.filtered.binary_search(&ei) {
+                        paint_mark(fi, left_col, Color32::from_rgb(80, 140, 255));
                     }
                 }
-                // Errors (right, red)
-                for (fi, &ei) in model.filtered.iter().enumerate() {
-                    let e = &model.entries[ei as usize];
-                    if e.level.contains(LevelMask::E) || e.level.contains(LevelMask::F) {
-                        let y = right_col.min.y + h * (fi as f32) / (total as f32);
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(egui::pos2(right_col.min.x, y), egui::vec2(right_col.width(), 2.0)),
-                            0.0,
-                            Color32::from_rgb(255, 80, 80),
-                        );
+                for &ei in &model.error_lines {
+                    // `filtered` is built by scanning entries in ascending order.
+                    if let Ok(fi) = model.filtered.binary_search(&ei) {
+                        paint_mark(fi, right_col, Color32::from_rgb(255, 80, 80));
                     }
                 }
                 // Handle click to jump
@@ -1590,6 +1637,7 @@ impl App {
             let entries = &model.entries;
             let filtered = &model.filtered;
             let bookmarks = &model.bookmarks;
+            let use_highlight = !highlight_tokens.is_empty() || !find_tokens.is_empty();
 
             let mut clicked_row: Option<usize> = None;
             let mut double_clicked_row: Option<usize> = None;
@@ -1700,11 +1748,15 @@ impl App {
                             // keeps the pointer hover — an inner Sense::click label
                             // would steal it and kill the row-hover highlight.
                             let (_, resp) = row.col(|ui| {
-                                let job = build_highlighted(
-                                    e.tag(), &highlight_tokens, &find_tokens,
-                                    col, font.clone(), &highlight_palette,
-                                );
-                                ui.add(egui::Label::new(job).truncate());
+                                if use_highlight {
+                                    let job = build_highlighted(
+                                        e.tag(), &highlight_tokens, &find_tokens,
+                                        col, font.clone(), &highlight_palette,
+                                    );
+                                    ui.add(egui::Label::new(job).truncate());
+                                } else {
+                                    render(ui, e.tag());
+                                }
                             });
                             if alt && resp.clicked() {
                                 alt_left_tag = Some(e.tag().to_string());
@@ -1746,11 +1798,15 @@ impl App {
                         }
                         if self.ui.col_message {
                             let (_, resp) = row.col(|ui| {
-                                let job = build_highlighted(
-                                    e.message(), &highlight_tokens, &find_tokens,
-                                    col, font.clone(), &highlight_palette,
-                                );
-                                ui.add(egui::Label::new(job).truncate());
+                                if use_highlight {
+                                    let job = build_highlighted(
+                                        e.message(), &highlight_tokens, &find_tokens,
+                                        col, font.clone(), &highlight_palette,
+                                    );
+                                    ui.add(egui::Label::new(job).truncate());
+                                } else {
+                                    render(ui, e.message());
+                                }
                             });
                             // The cell senses clicks (table Sense::click); a plain
                             // left-click selects the row.
@@ -1829,3 +1885,40 @@ impl App {
 
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn send_utf8_lines_replaces_invalid_bytes_and_continues() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "logfilter-invalid-utf8-{}-{unique}.log",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            [
+                &[0xEF, 0xBB, 0xBF, b'f', b'i', b'r', b's', b't', b'\r', b'\n'][..],
+                &[b'b', b'a', b'd', b' ', 0xFF, b'\r', b'\n'][..],
+                &[b'l', b'a', b's', b't'][..],
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let (tx, rx) = bounded(8);
+        let source_epoch = Arc::new(AtomicU64::new(42));
+        send_utf8_lines(&path, tx, 42, source_epoch);
+        let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(lines, vec!["first", "bad \u{fffd}", "last"]);
+    }
+}
