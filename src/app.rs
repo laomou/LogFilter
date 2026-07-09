@@ -402,8 +402,12 @@ impl App {
             self.status = "Nothing to save".into();
             return;
         }
+        let default_name = format!(
+            "logfilter_{}.txt",
+            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+        );
         let path = rfd::FileDialog::new()
-            .set_file_name("logfilter.tsv")
+            .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
         let res = (|| -> Result<(), std::io::Error> {
@@ -972,7 +976,7 @@ fn level_color(lv: LevelMask, cfg: &Config) -> Color32 {
 }
 
 /// Build a LayoutJob rendering `text` with highlight tokens as background spans
-/// and find tokens as underlined spans. All tokens are matched case-insensitively.
+/// and find tokens as thin-underlined spans. All tokens are matched case-insensitively.
 fn build_highlighted(
     text: &str,
     highlights: &[String],
@@ -1031,8 +1035,9 @@ fn build_highlighted(
                 fmt.background = highlight_palette[hi % highlight_palette.len()];
                 fmt.color = Color32::BLACK;
             }
+            // Find matches get a thin underline to mark the matched substring.
             _ => {
-                fmt.underline = egui::Stroke::new(1.5, fg);
+                fmt.underline = egui::Stroke::new(0.5, fg);
             }
         }
         job.append(&text[s..e], 0.0, fmt);
@@ -1519,6 +1524,10 @@ impl App {
                 // window when maximized.
                 .auto_shrink([false, false])
                 .max_scroll_height(f32::INFINITY)
+                // Always show the vertical scrollbar: keeps a stable gutter (no
+                // remainder-column reflow when it would otherwise toggle) and is
+                // the preferred look here.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .sense(egui::Sense::click());
             for (i, (visible, _, w)) in cols_show.iter().enumerate() {
                 if !*visible { continue; }
