@@ -16,22 +16,19 @@ fn main() -> eframe::Result<()> {
 
     let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("LogFilter")
-        .with_inner_size([1350.0, 720.0])
-        // Start maximized so the table fills the screen by default; pairs with
-        // ui_table's fill-all-space sizing (max_scroll_height = INFINITY) so the
-        // log view uses the whole window instead of a centered 1350×720 box.
-        .with_maximized(true)
-        // Start hidden; App reveals the window after painting its first frame
-        // so startup shows content, not a black frame during GL/app init.
-        .with_visible(false);
-    if let Some(icon) = load_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-
     let native_options = eframe::NativeOptions {
-        viewport,
+        viewport: {
+            let mut viewport = egui::ViewportBuilder::default()
+                .with_title("LogFilter")
+                // Start maximized so the table fills the screen by default.
+                .with_maximized(true)
+                // This is the restored size after unmaximize.
+                .with_inner_size([1350.0, 720.0]);
+            if let Some(icon) = load_icon() {
+                viewport = viewport.with_icon(icon);
+            }
+            viewport
+        },
         ..Default::default()
     };
 
