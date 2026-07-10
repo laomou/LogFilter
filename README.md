@@ -1,5 +1,7 @@
 # LogFilter
 
+[中文](README_zh.md)
+
 LogFilter is a desktop Android logcat viewer and filter written in Rust with egui. It is a Rust port of the original Java Swing LogFilter, focused on opening large log files, streaming adb output, and quickly narrowing logs by level, process, thread, tag, and message text.
 
 ## Features
