@@ -32,6 +32,7 @@ pub struct App {
 
     pub selected_row: Option<usize>,
     pub pending_scroll: Option<usize>,
+    pub visible_table_rows: usize,
     pub focus_find: bool,
 
     // Font stems currently registered as FontFamily::Name(..); only these are
@@ -184,6 +185,7 @@ impl App {
             ui,
             selected_row: None,
             pending_scroll: None,
+            visible_table_rows: 1,
             focus_find: false,
             registered_fonts,
             line_tx,
@@ -585,12 +587,19 @@ impl App {
         }
     }
 
-    fn select_filtered_row(&mut self, row: usize) {
-        let len = self.model.read().unwrap().filtered.len();
+    fn select_filtered_row_with_len(&mut self, row: usize, len: usize) {
         if let Some(row) = clamp_filtered_row(row, len) {
             self.selected_row = Some(row);
             self.pending_scroll = Some(row);
         }
+    }
+
+    fn page_selected_row(&mut self, forward: bool) {
+        let len = self.model.read().unwrap().filtered.len();
+        let Some(row) = page_row(self.selected_row, len, self.visible_table_rows, forward) else {
+            return;
+        };
+        self.select_filtered_row_with_len(row, len);
     }
 
     fn adjust_table_font_size(&mut self, delta: f32) {
@@ -644,12 +653,12 @@ impl App {
             self.jump_bookmark(true);
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Home)) {
-            self.select_filtered_row(0);
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp)) {
+            self.page_selected_row(false);
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::End)) {
-            self.select_filtered_row(usize::MAX);
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown)) {
+            self.page_selected_row(true);
         }
     }
 
@@ -1110,6 +1119,19 @@ fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
     } else {
         Some(row.min(len - 1))
     }
+}
+
+fn page_row(selected: Option<usize>, len: usize, visible_rows: usize, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let current = selected.unwrap_or(0).min(len - 1);
+    let page = visible_rows.max(1);
+    Some(if forward {
+        current.saturating_add(page).min(len - 1)
+    } else {
+        current.saturating_sub(page)
+    })
 }
 
 /// Build a LayoutJob rendering `text` with highlight tokens as background spans
@@ -1647,6 +1669,7 @@ impl App {
                 (self.ui.col_message,  &cms,  300.0),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
+            let table_available_height = ui.available_height();
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
@@ -1710,6 +1733,8 @@ impl App {
             let font_size = self.cfg.view.font_size;
             let row_h = (font_size * 1.35).ceil().max(16.0);
             let header_h = (font_size * 1.6).ceil().max(20.0);
+            let available_rows = ((table_available_height - header_h) / row_h).floor() as usize;
+            self.visible_table_rows = available_rows.max(1);
 
             table
                 .header(header_h, |mut h| {
@@ -1973,5 +1998,15 @@ mod tests {
         assert_eq!(clamp_filtered_row(0, 3), Some(0));
         assert_eq!(clamp_filtered_row(2, 3), Some(2));
         assert_eq!(clamp_filtered_row(usize::MAX, 3), Some(2));
+    }
+
+    #[test]
+    fn page_row_moves_by_visible_rows_and_clamps() {
+        assert_eq!(page_row(None, 0, 10, true), None);
+        assert_eq!(page_row(None, 100, 10, true), Some(10));
+        assert_eq!(page_row(Some(50), 100, 10, false), Some(40));
+        assert_eq!(page_row(Some(95), 100, 10, true), Some(99));
+        assert_eq!(page_row(Some(5), 100, 10, false), Some(0));
+        assert_eq!(page_row(Some(5), 100, 0, true), Some(6));
     }
 }
