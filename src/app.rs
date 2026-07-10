@@ -33,10 +33,6 @@ pub struct App {
     pub selected_row: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub focus_find: bool,
-    // Whether the log table's scroll was pinned to the bottom last frame.
-    // Used to swallow redundant downward wheel input while auto-following so
-    // streaming rows don't fight the wheel and jitter the viewport.
-    at_bottom: bool,
 
     // Font stems currently registered as FontFamily::Name(..); only these are
     // safe to use for per-font previews (unregistered names panic in egui).
@@ -189,7 +185,6 @@ impl App {
             selected_row: None,
             pending_scroll: None,
             focus_find: false,
-            at_bottom: true,
             registered_fonts,
             line_tx,
             adb_session: None,
@@ -232,7 +227,6 @@ impl App {
             model.file_path = Some(path.to_path_buf());
         }
         self.selected_row = None;
-        self.at_bottom = true;
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -342,7 +336,6 @@ impl App {
             model.clear();
         }
         self.selected_row = None;
-        self.at_bottom = true;
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -384,7 +377,6 @@ impl App {
             m.clear();
         }
         self.selected_row = None;
-        self.at_bottom = true;
         self.notify_filter();
     }
 
@@ -598,7 +590,6 @@ impl App {
         if let Some(row) = clamp_filtered_row(row, len) {
             self.selected_row = Some(row);
             self.pending_scroll = Some(row);
-            self.at_bottom = row + 1 == len;
         }
     }
 
@@ -678,7 +669,6 @@ impl App {
         if let Some(n) = next {
             self.selected_row = Some(n);
             self.pending_scroll = Some(n);
-            self.at_bottom = n + 1 == m.filtered.len();
         }
     }
 
@@ -1512,17 +1502,7 @@ impl App {
                         if n > 0 { goto_target = Some(n - 1); }
                     }
                 }
-                if ui.checkbox(&mut self.auto_scroll, tr!("auto_scroll")).changed() && self.auto_scroll {
-                    // Re-enabling auto-scroll means "follow the live tail now".
-                    // `at_bottom` may be false because the user previously
-                    // scrolled up, so latch follow mode and request a bottom
-                    // scroll on the next table render.
-                    let len = self.model.read().unwrap().filtered.len();
-                    self.at_bottom = true;
-                    if len > 0 {
-                        self.pending_scroll = Some(len - 1);
-                    }
-                }
+                ui.checkbox(&mut self.auto_scroll, tr!("auto_scroll"));
             });
         });
         if dirty { self.notify_filter(); }
@@ -1531,7 +1511,6 @@ impl App {
             if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
                 self.pending_scroll = Some(pos);
                 self.selected_row = Some(pos);
-                self.at_bottom = pos + 1 == m.filtered.len();
             }
         }
     }
@@ -1632,7 +1611,6 @@ impl App {
                     let target = (frac * total as f32) as usize;
                     self.pending_scroll = Some(target.min(total.saturating_sub(1)));
                     self.selected_row = self.pending_scroll;
-                    self.at_bottom = self.pending_scroll.is_some_and(|row| row + 1 == total);
                 }
             }
         });
@@ -1669,43 +1647,6 @@ impl App {
                 (self.ui.col_message,  &cms,  300.0),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
-
-            // While following at the bottom, swallow *downward* wheel input over
-            // the table. Streaming appends grow the content within a frame, so a
-            // downward wheel makes egui think there's new room below the pin,
-            // briefly un-sticks the scroll, then re-sticks next frame once it
-            // catches the new bottom — an endless unstick/re-stick flicker. The
-            // wheel-down is redundant here (we're already pinned to the end), so
-            // dropping it keeps the viewport rock-steady. Upward wheel is left
-            // intact so the user can still scroll up to read history. Must run
-            // before TableBuilder::new borrows `ui`.
-            let mut detached_follow_this_frame = false;
-            if self.auto_scroll && self.at_bottom && ui.rect_contains_pointer(ui.max_rect()) {
-                ui.ctx().input_mut(|i| {
-                    // The table's vertical-only ScrollArea may read either just
-                    // y, or x+y when `always_scroll_the_only_direction` is set.
-                    // Clear the whole gesture if its effective vertical delta
-                    // would scroll down, otherwise a diagonal/touchpad wheel can
-                    // still un-stick the table.
-                    let effective_delta = if ui.style().always_scroll_the_only_direction {
-                        i.smooth_scroll_delta.x + i.smooth_scroll_delta.y
-                    } else {
-                        i.smooth_scroll_delta.y
-                    };
-                    if effective_delta < 0.0 {
-                        i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    } else if effective_delta > 0.0 {
-                        // An upward wheel is an explicit request to read older
-                        // logs. Drop follow mode before building the table so
-                        // we don't immediately force-scroll back to the tail.
-                        detached_follow_this_frame = true;
-                    }
-                });
-                if detached_follow_this_frame {
-                    self.at_bottom = false;
-                }
-            }
-
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
@@ -1727,40 +1668,15 @@ impl App {
                     table = table.column(Column::initial(*w).at_least(*w * 0.5));
                 }
             }
+            if let Some(scroll_to) = self.pending_scroll.take() {
+                table = table.scroll_to_row(scroll_to, Some(egui::Align::Center));
+            }
             let selected = self.selected_row;
 
             let model = self.model.read().unwrap();
             let entries = &model.entries;
             let filtered = &model.filtered;
             let bookmarks = &model.bookmarks;
-
-            let pending_scroll = self.pending_scroll.take().filter(|&row| row < filtered.len());
-            let pending_scroll_is_bottom =
-                pending_scroll.is_some_and(|row| row + 1 == filtered.len());
-            let follow_tail = self.auto_scroll
-                && self.at_bottom
-                && !filtered.is_empty()
-                && (pending_scroll.is_none() || pending_scroll_is_bottom);
-
-            // Auto-follow by explicitly scrolling to the last row while follow
-            // mode is active, instead of relying on ScrollArea's sticky state.
-            // This avoids a race where streaming appends grow the content in
-            // the same frame as wheel input and egui briefly unsticks/resticks,
-            // producing visible jitter. A user upward wheel or any non-bottom
-            // explicit navigation clears `at_bottom`, so history browsing still
-            // detaches until the user scrolls back to the physical bottom.
-            if follow_tail {
-                table = table
-                    .animate_scrolling(false)
-                    .scroll_to_row(filtered.len() - 1, Some(egui::Align::BOTTOM));
-            } else if let Some(scroll_to) = pending_scroll {
-                let align = if pending_scroll_is_bottom {
-                    egui::Align::BOTTOM
-                } else {
-                    egui::Align::Center
-                };
-                table = table.scroll_to_row(scroll_to, Some(align));
-            }
             let use_highlight = !highlight_tokens.is_empty() || !find_tokens.is_empty();
 
             let mut clicked_row: Option<usize> = None;
@@ -1795,7 +1711,7 @@ impl App {
             let row_h = (font_size * 1.35).ceil().max(16.0);
             let header_h = (font_size * 1.6).ceil().max(20.0);
 
-            let table_out = table
+            table
                 .header(header_h, |mut h| {
                     for (i, (visible, name, _)) in cols_show.iter().enumerate() {
                         if !*visible { continue; }
@@ -1965,69 +1881,6 @@ impl App {
                         }
                     });
                 });
-
-            // Remember whether the scroll ended the frame pinned to the bottom.
-            // A downward wheel is only swallowed (above) while this holds, so a
-            // user who has scrolled up stays free to wheel back down.
-            let bottom_epsilon = 1.0;
-            let max_off = (table_out.content_size.y - table_out.inner_rect.height()).max(0.0);
-            let scroll_style = ui.spacing().scroll;
-            let vertical_bar_width = scroll_style.bar_width;
-            let vertical_bar_outer_margin = if scroll_style.floating {
-                0.0
-            } else {
-                scroll_style.bar_outer_margin
-            };
-            let vertical_bar_allocated_width = if scroll_style.floating {
-                scroll_style.floating_allocated_width
-            } else {
-                scroll_style.allocated_width()
-            };
-            let scrollbar_outer_rect = {
-                // Approximate egui::ScrollArea's full-width vertical scrollbar
-                // hit area (`max_bar_rect`). This is tighter than the whole
-                // inner-rect-to-panel-right gutter and follows the current
-                // ScrollStyle closely enough for solid/thin/floating bars.
-                let outer_rect = egui::Rect::from_min_size(
-                    table_out.inner_rect.min,
-                    table_out.inner_rect.size() + egui::vec2(vertical_bar_allocated_width, 0.0),
-                );
-                let mut max_cross = outer_rect.max.x - vertical_bar_outer_margin;
-                max_cross = max_cross.min(ui.clip_rect().max.x - vertical_bar_outer_margin);
-                egui::Rect::from_min_max(
-                    egui::pos2(max_cross - vertical_bar_width - 2.0, table_out.inner_rect.min.y),
-                    egui::pos2(max_cross + 2.0, table_out.inner_rect.max.y),
-                )
-            };
-            let dragged_scrollbar_off_tail = follow_tail
-                && (table_out.state.offset.y - max_off).abs() > bottom_epsilon
-                && ctx.input(|i| {
-                    i.pointer.primary_down()
-                        && i.pointer
-                            .latest_pos()
-                            .is_some_and(|pos| scrollbar_outer_rect.contains(pos))
-                });
-            self.at_bottom = if detached_follow_this_frame {
-                false
-            } else if dragged_scrollbar_off_tail {
-                // Explicit follow-tail uses scroll_to_row every frame. Unlike
-                // wheel input, dragging the scrollbar is handled inside
-                // ScrollArea and can change the final offset after our explicit
-                // scroll request. If the user pulled the bar away from bottom,
-                // detach so the next frame does not snap them back.
-                false
-            } else if follow_tail {
-                // `scroll_to_row` is applied through egui's scroll adjustment
-                // machinery and `table_out.state.offset` can still reflect the
-                // pre-adjustment offset for this frame. Keep follow mode latched
-                // while we explicitly request the tail, otherwise auto-scroll
-                // disables itself after the first append frame.
-                true
-            } else if pending_scroll.is_some() {
-                pending_scroll_is_bottom
-            } else {
-                (table_out.state.offset.y - max_off).abs() <= bottom_epsilon
-            };
 
             drop(model);
             if let Some(r) = clicked_row { self.selected_row = Some(r); }
