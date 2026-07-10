@@ -33,7 +33,6 @@ pub struct App {
     pub selected_row: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub visible_table_rows: usize,
-    pub focus_find: bool,
 
     // Font stems currently registered as FontFamily::Name(..); only these are
     // safe to use for per-font previews (unregistered names panic in egui).
@@ -186,7 +185,6 @@ impl App {
             selected_row: None,
             pending_scroll: None,
             visible_table_rows: 1,
-            focus_find: false,
             registered_fonts,
             line_tx,
             adb_session: None,
@@ -1109,8 +1107,31 @@ fn level_color(lv: LevelMask, cfg: &Config) -> Color32 {
     parse_color(s)
 }
 
+const EMPTY_SHORTCUT_TOP_PADDING_ROWS: usize = 3;
+
+struct EmptyShortcutRow {
+    tag: String,
+    message: String,
+}
+
+fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
+    let rows = [
+        (tr!("shortcut_file"), format!("Ctrl/Cmd+S - {}", tr!("sh_save"))),
+        (tr!("shortcut_bookmarks"), format!("Ctrl/Cmd+F2 - {}", tr!("sh_toggle_bookmark"))),
+        (tr!("shortcut_bookmarks"), format!("F2 - {}", tr!("sh_prev_bookmark"))),
+        (tr!("shortcut_bookmarks"), format!("F3 - {}", tr!("sh_next_bookmark"))),
+        (tr!("shortcut_line"), format!("Ctrl/Cmd+C - {}", tr!("sh_copy_row"))),
+        (tr!("shortcut_line"), format!("PageUp / PageDown - {}", tr!("sh_page_up_down"))),
+        (tr!("shortcut_font"), format!("Ctrl/Cmd+Plus / Ctrl/Cmd+Minus - {}", tr!("sh_font_size"))),
+        (tr!("shortcut_font"), format!("Ctrl/Cmd+0 - {}", tr!("sh_reset_font"))),
+    ];
+    rows.into_iter()
+        .map(|(tag, message)| EmptyShortcutRow { tag, message })
+        .collect()
+}
+
 fn adjusted_table_font_size(current: f32, delta: f32) -> f32 {
-    (current + delta).clamp(8.0, 32.0)
+    (current + delta).clamp(13.0, 18.0)
 }
 
 fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
@@ -1457,7 +1478,6 @@ impl App {
                     .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(w));
                 dirty |= r.changed();
-                if self.focus_find { r.request_focus(); self.focus_find = false; }
             });
 
             // Row 2: Remove | Highlight
@@ -1697,6 +1717,7 @@ impl App {
             let selected = self.selected_row;
 
             let model = self.model.read().unwrap();
+            let show_empty_shortcuts = model.entries.is_empty();
             let entries = &model.entries;
             let filtered = &model.filtered;
             let bookmarks = &model.bookmarks;
@@ -1784,6 +1805,60 @@ impl App {
                     }
                 })
                 .body(|body| {
+                    if show_empty_shortcuts {
+                        let shortcut_rows = empty_shortcut_rows();
+                        let row_count = EMPTY_SHORTCUT_TOP_PADDING_ROWS + shortcut_rows.len();
+                        body.rows(row_h, row_count, |mut row| {
+                            if row.index() < EMPTY_SHORTCUT_TOP_PADDING_ROWS {
+                                for (visible, _, _) in cols_show.iter() {
+                                    if *visible {
+                                        row.col(|_| {});
+                                    }
+                                }
+                                return;
+                            }
+                            let shortcut = &shortcut_rows[row.index() - EMPTY_SHORTCUT_TOP_PADDING_ROWS];
+                            let text = |s: &str| {
+                                egui::RichText::new(s)
+                                    .font(font.clone())
+                                    .color(Color32::DARK_GRAY)
+                            };
+                            if self.ui.col_line {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_date {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_time {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_loglv {
+                                row.col(|ui| {
+                                    ui.add(egui::Label::new(text("I")).truncate());
+                                });
+                            }
+                            if self.ui.col_pid {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_thread {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_tag {
+                                row.col(|ui| {
+                                    ui.add(egui::Label::new(text(&shortcut.tag)).truncate());
+                                });
+                            }
+                            if self.ui.col_bookmark {
+                                row.col(|_| {});
+                            }
+                            if self.ui.col_message {
+                                row.col(|ui| {
+                                    ui.add(egui::Label::new(text(&shortcut.message)).truncate());
+                                });
+                            }
+                        });
+                        return;
+                    }
                     body.rows(row_h, filtered.len(), |mut row| {
                         let row_idx = row.index();
                         let entry_idx = filtered[row_idx];
@@ -1983,8 +2058,8 @@ mod tests {
     #[test]
     fn adjusted_table_font_size_clamps_to_bounds() {
         assert_eq!(adjusted_table_font_size(13.0, 1.0), 14.0);
-        assert_eq!(adjusted_table_font_size(7.0, 0.0), 8.0);
-        assert_eq!(adjusted_table_font_size(31.5, 2.0), 32.0);
+        assert_eq!(adjusted_table_font_size(12.0, 0.0), 13.0);
+        assert_eq!(adjusted_table_font_size(17.5, 2.0), 18.0);
     }
 
     #[test]
