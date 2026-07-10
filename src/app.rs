@@ -1220,9 +1220,12 @@ impl eframe::App for App {
         }
 
         // Reveal the window now that the first frame has real content, so the
-        // user never sees a black frame during GL/app init.
+        // user never sees a black frame during GL/app init. Re-apply maximized
+        // here because some window managers lose the initial .with_maximized(true)
+        // when the window is later made visible.
         if self.first_frame {
             self.first_frame = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
     }
