@@ -23,9 +23,7 @@ fn main() -> eframe::Result<()> {
         // ui_table's fill-all-space sizing (max_scroll_height = INFINITY) so the
         // log view uses the whole window instead of a centered 1350×720 box.
         .with_maximized(true)
-        // Start hidden; App reveals the window after painting its first frame
-        // so startup shows content, not a black frame during GL/app init.
-        .with_visible(false);
+        .with_maximized(true);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }
