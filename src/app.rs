@@ -1317,11 +1317,13 @@ impl App {
                 });
 
                 ui.menu_button(tr!("m_help"), |ui| {
-                    ui.set_min_width(360.0);
-                    ui.strong(tr!("shortcuts"));
-                    ui.label(tr!("shortcuts_help"));
-                    ui.separator();
-                    ui.label(tr!("about_status"));
+                    if ui.link(format!("LogFilter v{}", env!("CARGO_PKG_VERSION"))).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl {
+                            url: "https://github.com/laomou/LogFilter".into(),
+                            new_tab: true,
+                        });
+                        ui.close();
+                    }
                 });
             });
         });
