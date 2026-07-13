@@ -4,7 +4,7 @@ use crate::filter::FilterSpec;
 use crate::io::{send_decoded_lines, send_utf8_lines};
 use crate::model::{EncodingChoice, LevelMask, Model};
 use crate::parser::parse_line;
-use crate::ui_util::{bump_global_text_sizes, fit_middle, init_i18n, install_ui_font, list_user_font_stems, open_dir, resolve_startup_lang, tune_table_visuals};
+use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use anyhow::Result;
 use egui_i18n::tr;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -883,6 +883,67 @@ impl App {
     }
 }
 
+fn tune_table_visuals(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.visuals.widgets.hovered.expansion = 0.0;
+        style.interaction.selectable_labels = false;
+    });
+}
+
+fn init_i18n() {
+    let en = include_str!("../assets/i18n/en-US.egl");
+    let zh = include_str!("../assets/i18n/zh-CN.egl");
+    egui_i18n::set_fallback("en-US");
+    egui_i18n::load_translations_from_text("en-US", en).unwrap();
+    egui_i18n::load_translations_from_text("zh-CN", zh).unwrap();
+}
+
+fn resolve_startup_lang(stored: &str) {
+    let code = match stored {
+        "zh" => "zh-CN",
+        "en" => "en-US",
+        _ => {
+            let loc = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase();
+            if loc.starts_with("zh") { "zh-CN" } else { "en-US" }
+        }
+    };
+    egui_i18n::set_language(code);
+}
+
+fn open_dir(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(path).spawn();
+}
+
+fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = |t: &str| -> f32 {
+        ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x
+    };
+    if width(s) <= max_width { return s.to_string(); }
+    let chars: Vec<char> = s.chars().collect();
+    let join = |keep: usize| -> String {
+        let head_len = (keep + 1) / 2;
+        let tail_len = keep - head_len;
+        let head: String = chars[..head_len].iter().collect();
+        let tail: String = chars[chars.len() - tail_len..].iter().collect();
+        format!("{head}…{tail}")
+    };
+    let (mut lo, mut hi, mut best) = (0usize, chars.len().saturating_sub(1), String::from("…"));
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cand = join(mid);
+        if width(&cand) <= max_width { best = cand; lo = mid + 1; }
+        else if mid == 0 { break; }
+        else { hi = mid - 1; }
+    }
+    best
+}
 
 fn level_color(lv: LevelMask, cfg: &Config) -> Color32 {
     let s = if lv.contains(LevelMask::F) { &cfg.colors.level_f }
