@@ -4,6 +4,7 @@ mod adb;
 mod app;
 mod config;
 mod filter;
+mod io;
 mod model;
 mod parser;
 mod ui_util;
