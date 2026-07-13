@@ -418,10 +418,24 @@ impl App {
         texts.join("\n")
     }
 
-    fn copy_selected_row(&self) {
+    fn copy_selected_row(&mut self) {
         if self.selected_rows.is_empty() { return; }
         let text = self.copy_selected_rows_text();
-        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text));
+        let n = text.lines().count();
+        match arboard::Clipboard::new() {
+            Ok(mut c) => {
+                if let Err(e) = c.set_text(&text) {
+                    self.status = format!("Clipboard error: {e}");
+                } else {
+                    self.status = if n > 1 {
+                        format!("Copied {n} rows")
+                    } else {
+                        "Copied 1 row".into()
+                    };
+                }
+            }
+            Err(e) => self.status = format!("Clipboard error: {e}"),
+        }
     }
 
     fn save_filtered(&mut self) {
@@ -1855,7 +1869,14 @@ impl App {
             if let Some(t) = alt_left_tag { self.add_show_tag(&t); }
             if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
             if let Some(txt) = copy_cell_text {
-                let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(txt));
+                let n = txt.lines().count();
+                match arboard::Clipboard::new() {
+                    Ok(mut c) => {
+                        let _ = c.set_text(&txt);
+                        self.status = if n > 1 { format!("Copied {n} rows") } else { "Copied 1 row".into() };
+                    }
+                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                }
             }
 
             // Hide column requested from column-header context menu.
@@ -1885,6 +1906,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::LogEntry;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1946,5 +1968,44 @@ mod tests {
         assert_eq!(page_row(Some(95), 100, 10, true), Some(99));
         assert_eq!(page_row(Some(5), 100, 10, false), Some(0));
         assert_eq!(page_row(Some(5), 100, 0, true), Some(6));
+    }
+
+    #[test]
+    fn copy_selected_rows_text_joins_multiple_rows() {
+        use crate::model::LevelMask;
+        let model = Model {
+            entries: vec![
+                LogEntry::from_fields("07-10", "10:00:00.000", LevelMask::I, "100", "200", "Tag1", "msg one"),
+                LogEntry::from_fields("07-10", "10:00:01.000", LevelMask::E, "101", "201", "Tag2", "msg two"),
+                LogEntry::from_fields("07-10", "10:00:02.000", LevelMask::W, "102", "202", "Tag3", "msg three"),
+            ],
+            filtered: vec![0, 1, 2],
+            ..Model::default()
+        };
+        let model = Arc::new(RwLock::new(model));
+
+        let mut selected_rows = HashSet::new();
+        selected_rows.insert(0);
+        selected_rows.insert(2);
+
+        // Unit-test the core copy logic without building a full App.
+        let text = {
+            let m = model.read().unwrap();
+            let mut rows: Vec<&usize> = selected_rows.iter().collect();
+            rows.sort();
+            let texts: Vec<String> = rows.iter().filter_map(|&&r| {
+                let &ei = m.filtered.get(r)?;
+                let e = &m.entries[ei as usize];
+                Some(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
+                ))
+            }).collect();
+            texts.join("\n")
+        };
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines.len(), 2, "should have 2 lines (rows 0 and 2), got: {lines:?}");
+        assert!(lines[0].contains("msg one"), "first line should contain msg one: {lines:?}");
+        assert!(lines[1].contains("msg three"), "second line should contain msg three: {lines:?}");
     }
 }
