@@ -68,19 +68,19 @@ pub fn parse_line(line: String) -> (LogEntry, LogFormat) {
     let parsed: Option<(LogFormat, LevelMask, [Span; 6])> = {
         let s = line.as_str();
         if let Some(c) = re_threadtime().captures(s) {
-            let lv = LevelMask::from_char(c["lv"].chars().next().unwrap()).unwrap_or(LevelMask::V);
+            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
             Some((LogFormat::ThreadTime, lv, [
                 span(&c, "date"), span(&c, "time"), span(&c, "pid"),
                 span(&c, "tid"), trim_span(s, span(&c, "tag")), span(&c, "msg"),
             ]))
         } else if let Some(c) = re_time().captures(s) {
-            let lv = LevelMask::from_char(c["lv"].chars().next().unwrap()).unwrap_or(LevelMask::V);
+            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
             Some((LogFormat::Time, lv, [
                 span(&c, "date"), span(&c, "time"), span(&c, "pid"),
                 EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),
             ]))
         } else if let Some(c) = re_brief().captures(s) {
-            let lv = LevelMask::from_char(c["lv"].chars().next().unwrap()).unwrap_or(LevelMask::V);
+            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
             Some((LogFormat::Brief, lv, [
                 EMPTY, EMPTY, span(&c, "pid"),
                 EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),

@@ -46,6 +46,14 @@ pub struct App {
     pub selected_cmd: String,
     pub auto_scroll: bool,
 
+    // Per-frame caches: recomputed lazily when source data changes.
+    cached_highlight_palette: Vec<Color32>,
+    cached_highlight_tokens: Vec<String>,
+    cached_find_tokens: Vec<String>,
+    /// Raw highlight/find strings that were used to produce the token caches above.
+    cached_highlight_raw: String,
+    cached_find_raw: String,
+
 }
 
 pub struct UiState {
@@ -173,6 +181,10 @@ impl App {
         // capping peak memory. 8192 ≈ a few ingest batches of headroom.
         let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
         let selected_cmd = cfg.adb.commands.first().cloned().unwrap_or_else(|| "logcat -v threadtime".into());
+        // Prime caches from the initial config so the first frame doesn't reallocate.
+        let init_hl_raw = if ui.highlight_on { ui.highlight.clone() } else { String::new() };
+        let init_find_raw = if ui.find_on { ui.find.clone() } else { String::new() };
+        let init_palette: Vec<Color32> = cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
@@ -192,6 +204,11 @@ impl App {
             selected_device: String::new(),
             selected_cmd,
             auto_scroll: true,
+            cached_highlight_palette: init_palette,
+            cached_highlight_tokens: if init_hl_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_hl_raw) },
+            cached_find_tokens: if init_find_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_find_raw) },
+            cached_highlight_raw: init_hl_raw,
+            cached_find_raw: init_find_raw,
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -606,6 +623,29 @@ impl App {
 
     fn reset_table_font_size(&mut self) {
         self.cfg.view.font_size = Config::default().view.font_size;
+    }
+
+    /// Recompute caches for highlight palette & tokens only when source data changed.
+    fn refresh_highlight_caches(&mut self) {
+        // Palette: rare change (user edits config), but a simple pointer eq is cheap
+        // enough to guard the parse loop.
+        let palette_raw = &self.cfg.colors.highlights;
+        let palette_changed = self.cached_highlight_palette.len() != palette_raw.len();
+        if palette_changed {
+            self.cached_highlight_palette = palette_raw.iter().map(|s| parse_color(s)).collect();
+        }
+
+        // Token caches: only invalidate when the raw filter text changes.
+        let hl_raw = if self.ui.highlight_on { self.ui.highlight.as_str() } else { "" };
+        let f_raw = if self.ui.find_on { self.ui.find.as_str() } else { "" };
+        if self.cached_highlight_raw.as_str() != hl_raw {
+            self.cached_highlight_tokens = if hl_raw.is_empty() { vec![] } else { FilterSpec::tokens(hl_raw) };
+            self.cached_highlight_raw = hl_raw.to_string();
+        }
+        if self.cached_find_raw.as_str() != f_raw {
+            self.cached_find_tokens = if f_raw.is_empty() { vec![] } else { FilterSpec::tokens(f_raw) };
+            self.cached_find_raw = f_raw.to_string();
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -1064,20 +1104,6 @@ fn send_decoded_lines(
     source_epoch: Arc<AtomicU64>,
     choice: EncodingChoice,
 ) {
-    let Ok(bytes) = std::fs::read(path) else { return; };
-    let text = decode_bytes(&bytes, choice);
-    for line in text.lines() {
-        if source_epoch.load(Ordering::Acquire) != epoch { return; }
-        if tx.send((epoch, line.to_string())).is_err() { return; }
-    }
-}
-
-fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
-    // `Encoding::decode` BOM-sniffs first: a leading UTF-8 / UTF-16 LE / UTF-16
-    // BE BOM overrides `choice` and is stripped from the output. With no BOM it
-    // decodes as the chosen encoding. This strips the stray U+FEFF that a
-    // UTF-8+BOM file would otherwise leave on line 1, and transparently handles
-    // UTF-16 captures (e.g. old PowerShell `adb logcat > log.txt`).
     let enc = match choice {
         EncodingChoice::Utf8 => encoding_rs::UTF_8,
         EncodingChoice::Local => {
@@ -1085,8 +1111,51 @@ fn decode_bytes(bytes: &[u8], choice: EncodingChoice) -> String {
             pick_local_encoding(&locale)
         }
     };
-    let (cow, _, _) = enc.decode(bytes);
-    cow.into_owned()
+    let Ok(file) = std::fs::File::open(path) else { return; };
+    let mut reader = BufReader::with_capacity(8192, file);
+    let mut decoder = enc.new_decoder();
+    // Accumulate decoded text across chunks so we can split into lines only when
+    // a full line is available — avoids splitting a multibyte character mid-sequence.
+    let mut text_buf = String::with_capacity(8192);
+    let mut raw_buf = vec![0u8; 8192];
+    loop {
+        use std::io::Read;
+        let Ok(n) = reader.read(&mut raw_buf) else { return; };
+        if n == 0 { break; }
+        if source_epoch.load(Ordering::Acquire) != epoch { return; }
+        let _ = decoder.decode_to_string(&raw_buf[..n], &mut text_buf, false);
+        // Flush complete lines while keeping any partial trailing line in `text_buf`.
+        {
+            // Find the last newline to keep the trailing partial line.
+            let mut drain_end = 0usize;
+            let mut bytes = text_buf.as_bytes();
+            while drain_end < bytes.len() {
+                if bytes[drain_end] == b'\n' {
+                    let line = text_buf[..drain_end].trim_end_matches(['\r', '\n']);
+                    if tx.send((epoch, line.to_string())).is_err() { return; }
+                    let next = drain_end + 1;
+                    // Drain the emitted portion so we don't re-scan on next chunk.
+                    text_buf.drain(..next);
+                    drain_end = 0;
+                    bytes = text_buf.as_bytes(); // refresh after drain
+                    if bytes.is_empty() { break; }
+                } else {
+                    drain_end += 1;
+                }
+            }
+        }
+        if source_epoch.load(Ordering::Acquire) != epoch { return; }
+    }
+    // Final flush: drain any remaining buffered bytes from the decoder.
+    let _ = decoder.decode_to_string(b"", &mut text_buf, true);
+    // Emit any remaining text without a trailing newline as a final line.
+    if !text_buf.is_empty() {
+        if source_epoch.load(Ordering::Acquire) != epoch { return; }
+        let line = text_buf.trim_end_matches(['\r', '\n']).to_string();
+        if !line.is_empty() {
+            let _ = tx.send((epoch, line));
+        }
+    }
 }
 
 fn pick_local_encoding(locale: &str) -> &'static Encoding {
@@ -1167,6 +1236,11 @@ fn build_highlighted(
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     if text.is_empty() { return job; }
+    // Fast path: no tokens → plain text, skip to_lowercase allocation.
+    if highlights.is_empty() && finds.is_empty() {
+        job.append(text, 0.0, TextFormat { color: fg, font_id: font, ..Default::default() });
+        return job;
+    }
     let low = text.to_lowercase();
 
     // Collect matches: (start, end, kind) where kind=Some(hi_index) = highlight, None = find-underline
@@ -1663,14 +1737,10 @@ impl App {
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
             let font = FontId::monospace(self.cfg.view.font_size);
-            let highlight_palette: Vec<Color32> =
-                self.cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
-            let highlight_tokens: Vec<String> = if self.ui.highlight_on {
-                FilterSpec::tokens(&self.ui.highlight)
-            } else { Vec::new() };
-            let find_tokens: Vec<String> = if self.ui.find_on {
-                FilterSpec::tokens(&self.ui.find)
-            } else { Vec::new() };
+            self.refresh_highlight_caches();
+            let highlight_palette: &[Color32] = &self.cached_highlight_palette;
+            let highlight_tokens: &[String] = &self.cached_highlight_tokens;
+            let find_tokens: &[String] = &self.cached_find_tokens;
 
             let (cl, cd, ct, clv, cpi, cth, cta, cmk, cms) = (
                 tr!("col_line"), tr!("col_date"), tr!("col_time"), tr!("col_lv"),
