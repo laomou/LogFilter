@@ -11,6 +11,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 use egui_extras::{Column, TableBuilder};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -30,7 +31,7 @@ pub struct App {
     pub status: String,
     pub ui: UiState,
 
-    pub selected_row: Option<usize>,
+    pub selected_rows: HashSet<usize>,
     pub pending_scroll: Option<usize>,
     pub visible_table_rows: usize,
 
@@ -197,7 +198,7 @@ impl App {
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             status: String::new(),
             ui,
-            selected_row: None,
+            selected_rows: HashSet::new(),
             pending_scroll: None,
             visible_table_rows: 1,
             user_font_stems: font_stems,
@@ -247,7 +248,7 @@ impl App {
             model.clear();
             model.file_path = Some(path.to_path_buf());
         }
-        self.selected_row = None;
+        self.selected_rows.clear();
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -357,7 +358,7 @@ impl App {
             let mut model = self.model.write().unwrap();
             model.clear();
         }
-        self.selected_row = None;
+        self.selected_rows.clear();
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -398,20 +399,24 @@ impl App {
             let mut m = self.model.write().unwrap();
             m.clear();
         }
-        self.selected_row = None;
+        self.selected_rows.clear();
         self.notify_filter();
     }
 
     fn copy_selected_row(&self) {
-        let Some(r) = self.selected_row else { return; };
         let m = self.model.read().unwrap();
-        let Some(&ei) = m.filtered.get(r) else { return; };
-        let e = &m.entries[ei as usize];
-        let text = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
-        );
-        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text));
+        if self.selected_rows.is_empty() { return; }
+        let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
+        rows.sort();
+        let texts: Vec<String> = rows.iter().filter_map(|&&r| {
+            let &ei = m.filtered.get(r)?;
+            let e = &m.entries[ei as usize];
+            Some(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
+            ))
+        }).collect();
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(texts.join("\n")));
     }
 
     fn save_filtered(&mut self) {
@@ -600,23 +605,27 @@ impl App {
     }
 
     fn toggle_selected_bookmark(&mut self) {
-        let Some(row) = self.selected_row else { return; };
-        let entry_idx = self.model.read().unwrap().filtered.get(row).copied();
-        if let Some(entry_idx) = entry_idx {
+        let entries: Vec<u32> = {
+            let m = self.model.read().unwrap();
+            self.selected_rows.iter().filter_map(|&r| m.filtered.get(r).copied()).collect()
+        };
+        for entry_idx in entries {
             self.toggle_bookmark(entry_idx);
         }
     }
 
     fn select_filtered_row_with_len(&mut self, row: usize, len: usize) {
         if let Some(row) = clamp_filtered_row(row, len) {
-            self.selected_row = Some(row);
+            self.selected_rows.clear();
+            self.selected_rows.insert(row);
             self.pending_scroll = Some(row);
         }
     }
 
     fn page_selected_row(&mut self, forward: bool) {
         let len = self.model.read().unwrap().filtered.len();
-        let Some(row) = page_row(self.selected_row, len, self.visible_table_rows, forward) else {
+        let anchor = self.selected_rows.iter().next().copied();
+        let Some(row) = page_row(anchor, len, self.visible_table_rows, forward) else {
             return;
         };
         self.select_filtered_row_with_len(row, len);
@@ -659,6 +668,13 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let shortcut = |key| KeyboardShortcut::new(cmd, key);
 
+        // Allow copy even when a text field is focused: text selection is
+        // disabled (selectable_labels = false), so there is no conflict.
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
+            self.copy_selected_row();
+            return;
+        }
+
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -680,10 +696,6 @@ impl App {
             return;
         }
 
-        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
-            self.copy_selected_row();
-            return;
-        }
         if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::F2))) {
             self.toggle_selected_bookmark();
             return;
@@ -708,7 +720,7 @@ impl App {
     fn jump_bookmark(&mut self, forward: bool) {
         let m = self.model.read().unwrap();
         if m.filtered.is_empty() { return; }
-        let cur = self.selected_row.unwrap_or(0);
+        let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
         let indices: Vec<usize> = (0..m.filtered.len())
             .filter(|&i| m.bookmarks.contains(&m.filtered[i]))
             .collect();
@@ -719,7 +731,8 @@ impl App {
             indices.iter().rev().find(|&&i| i < cur).copied().or_else(|| indices.last().copied())
         };
         if let Some(n) = next {
-            self.selected_row = Some(n);
+            self.selected_rows.clear();
+            self.selected_rows.insert(n);
             self.pending_scroll = Some(n);
         }
     }
@@ -1375,7 +1388,8 @@ impl App {
             let m = self.model.read().unwrap();
             if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
                 self.pending_scroll = Some(pos);
-                self.selected_row = Some(pos);
+                self.selected_rows.clear();
+                self.selected_rows.insert(pos);
             }
         }
     }
@@ -1413,11 +1427,10 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                 ui.separator();
-                if let Some(r) = self.selected_row {
-                    if let Some(&i) = model.filtered.get(r) {
-                        ui.label(format!("{} {}", tr!("line"), i + 1));
-                        ui.separator();
-                    }
+                let n = self.selected_rows.len();
+                if n > 0 {
+                    ui.label(format!("Sel {n}"));
+                    ui.separator();
                 }
                 ui.label(self.ui.encoding.to_uppercase());
                 // Transient feedback (open error, save result, adb state).
@@ -1475,7 +1488,8 @@ impl App {
                     let frac = ((pos.y - rect.min.y) / h).clamp(0.0, 1.0);
                     let target = (frac * total as f32) as usize;
                     self.pending_scroll = Some(target.min(total.saturating_sub(1)));
-                    self.selected_row = self.pending_scroll;
+                    self.selected_rows.clear();
+                    self.selected_rows.insert(self.pending_scroll.unwrap_or(0));
                 }
             }
         });
@@ -1533,7 +1547,7 @@ impl App {
             if let Some(scroll_to) = self.pending_scroll.take() {
                 table = table.scroll_to_row(scroll_to, Some(egui::Align::Center));
             }
-            let selected = self.selected_row;
+            let sel = self.selected_rows.clone();
 
             let model = self.model.read().unwrap();
             let show_empty_shortcuts = model.entries.is_empty();
@@ -1683,7 +1697,7 @@ impl App {
                         let entry_idx = filtered[row_idx];
                         let e = &entries[entry_idx as usize];
                         let col = level_color(e.level, &self.cfg);
-                        let is_selected = selected == Some(row_idx);
+                        let is_selected = sel.contains(&row_idx);
                         let is_bookmarked = bookmarks.contains(&entry_idx);
                         row.set_selected(is_selected);
 
@@ -1801,12 +1815,33 @@ impl App {
                     });
                 });
 
+            let ctrl_or_cmd = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
+            let shift = ctx.input(|i| i.modifiers.shift);
+
             drop(model);
-            if let Some(r) = clicked_row { self.selected_row = Some(r); }
+            // Multi-select: Ctrl/Cmd+click toggles; Shift+click selects range;
+            // plain click replaces selection with single row.
+            if let Some(r) = clicked_row {
+                if ctrl_or_cmd {
+                    if self.selected_rows.contains(&r) {
+                        self.selected_rows.remove(&r);
+                    } else {
+                        self.selected_rows.insert(r);
+                    }
+                } else if shift {
+                    let anchor = self.selected_rows.iter().next().copied().unwrap_or(0);
+                    let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
+                    for i in lo..=hi { self.selected_rows.insert(i); }
+                } else {
+                    self.selected_rows.clear();
+                    self.selected_rows.insert(r);
+                }
+            }
             if let Some(r) = double_clicked_row {
                 let entry_idx = self.model.read().unwrap().filtered.get(r).copied();
                 if let Some(i) = entry_idx { self.toggle_bookmark(i); }
-                self.selected_row = Some(r);
+                self.selected_rows.clear();
+                self.selected_rows.insert(r);
             }
             if let Some(t) = alt_left_tag { self.add_show_tag(&t); }
             if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
