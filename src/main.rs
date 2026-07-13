@@ -6,6 +6,7 @@ mod config;
 mod filter;
 mod model;
 mod parser;
+mod ui_util;
 
 use std::path::PathBuf;
 
