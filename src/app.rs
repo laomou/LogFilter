@@ -403,9 +403,8 @@ impl App {
         self.notify_filter();
     }
 
-    fn copy_selected_row(&self) {
+    fn copy_selected_rows_text(&self) -> String {
         let m = self.model.read().unwrap();
-        if self.selected_rows.is_empty() { return; }
         let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
         rows.sort();
         let texts: Vec<String> = rows.iter().filter_map(|&&r| {
@@ -416,7 +415,13 @@ impl App {
                 e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
             ))
         }).collect();
-        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(texts.join("\n")));
+        texts.join("\n")
+    }
+
+    fn copy_selected_row(&self) {
+        if self.selected_rows.is_empty() { return; }
+        let text = self.copy_selected_rows_text();
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text));
     }
 
     fn save_filtered(&mut self) {
@@ -1795,11 +1800,15 @@ impl App {
                                     ui.close();
                                 }
                                 if ui.button(tr!("copy_row")).clicked() {
-                                    copy_cell_text = Some(format!(
-                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                        e.line_no, e.date(), e.time(), e.level.as_char(),
-                                        e.pid(), e.tid(), e.tag(), e.message()
-                                    ));
+                                    if self.selected_rows.len() > 1 {
+                                        copy_cell_text = Some(self.copy_selected_rows_text());
+                                    } else {
+                                        copy_cell_text = Some(format!(
+                                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                            e.line_no, e.date(), e.time(), e.level.as_char(),
+                                            e.pid(), e.tid(), e.tag(), e.message()
+                                        ));
+                                    }
                                     ui.close();
                                 }
                             });
