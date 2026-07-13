@@ -1469,7 +1469,7 @@ impl App {
                     ui.label(&self.status);
                 } else if n > 0 {
                     ui.separator();
-                    ui.label(format!("Sel {n}"));
+                    ui.label(format!("Selected {n}"));
                 }
             });
         });
@@ -1857,12 +1857,12 @@ impl App {
                     } else {
                         self.selected_rows.insert(r);
                     }
-                    self.status = format!("Ctrl+click row {}, sel={}", r + 1, self.selected_rows.len());
+                    self.status = format!("Ctrl+click, selected={}", self.selected_rows.len());
                 } else if shift {
                     let anchor = self.selected_rows.iter().next().copied().unwrap_or(0);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
-                    self.status = format!("Shift+click row {}, sel={}", r + 1, self.selected_rows.len());
+                    self.status = format!("Shift+click, selected={}", self.selected_rows.len());
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
