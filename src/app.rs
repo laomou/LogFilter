@@ -34,11 +34,6 @@ pub struct App {
     pub pending_scroll: Option<usize>,
     pub visible_table_rows: usize,
 
-    // Font stems currently registered as FontFamily::Name(..); only these are
-    // safe to use for per-font previews (unregistered names panic in egui).
-    // After the lazy-load change, this contains at most one entry: the selected
-    // user font (if any). Built-in fonts are always available.
-    pub registered_fonts: Vec<String>,
     // All font stems found in config/fonts — just metadata, no bytes loaded.
     // Populated once at startup via list_user_font_stems().
     pub user_font_stems: Vec<(String, String)>,
@@ -175,7 +170,7 @@ impl App {
         // Apply the stored language (or auto-detect) at startup.
         resolve_startup_lang(&cfg.view.lang);
         let font_stems = list_user_font_stems();
-        let registered_fonts = install_ui_font(&cc.egui_ctx, &cfg.view.font, &font_stems);
+        install_ui_font(&cc.egui_ctx, &cfg.view.font, &font_stems);
         bump_global_text_sizes(&cc.egui_ctx);
         // egui defaults Ctrl+= / Ctrl+- / Ctrl+0 to changing the global zoom_factor,
         // which scales the entire UI (menus, toolbar, table). We only want those
@@ -205,7 +200,6 @@ impl App {
             selected_row: None,
             pending_scroll: None,
             visible_table_rows: 1,
-            registered_fonts,
             user_font_stems: font_stems,
             line_tx,
             adb_session: None,
@@ -1027,15 +1021,16 @@ fn list_user_font_stems() -> Vec<(String, String)> {
 /// Other fonts in config/fonts/ stay on disk until selected — this keeps
 /// memory proportional to what is actually used, not all installed fonts.
 ///
-/// Returns the list of user font stems now registered (at most one).
-fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)]) -> Vec<String> {
+/// Loads only the selected font (if any) plus built-in fonts. Other fonts in
+/// config/fonts/ stay on disk.
+fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)]) {
     let mut fonts = egui::FontDefinitions::default();
     // Drop Hack — we use Proportional for the table, Monospace is a mirror.
     fonts.font_data.remove("Hack");
     for fonts in fonts.families.values_mut() {
         fonts.retain(|name| name != "Hack");
     }
-    let mut registered: Vec<String> = Vec::new();
+    let mut loaded = false;
 
     // Load ONLY the selected font (primary), not all fonts in the directory.
     if !primary.is_empty() {
@@ -1048,9 +1043,9 @@ fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)
                 );
                 fonts.families.insert(
                     egui::FontFamily::Name(name.clone().into()),
-                    vec![name.clone()],
+                    vec![name],
                 );
-                registered.push(name);
+                loaded = true;
             }
         }
     }
@@ -1060,7 +1055,7 @@ fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)
         fonts.families.insert(egui::FontFamily::Monospace, prop);
     }
     // If a primary font was loaded, prepend it to the Monospace stack.
-    if !primary.is_empty() && !registered.is_empty() {
+    if loaded {
         fonts
             .families
             .entry(egui::FontFamily::Monospace)
@@ -1068,7 +1063,6 @@ fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)
             .insert(0, primary.to_string());
     }
     ctx.set_fonts(fonts);
-    registered
 }
 
 /// Find a font's path on disk given its file stem and the stems list.
@@ -1423,7 +1417,7 @@ impl App {
 
                     // ── Font submenu: lists imported fonts ────────────────
                     ui.menu_button(tr!("font"), |ui| {
-                        ui.set_min_width(320.0);
+                        ui.set_min_width(220.0);
                         if let Some(dir) = config::fonts_dir() {
                             // Clearly-a-button shortcut to the fonts folder so the
                             // user can drop .ttf files in without leaving the app.
@@ -1442,22 +1436,11 @@ impl App {
                                 .show(ui, |ui| {
                                     for (stem, name) in &self.user_font_stems {
                                         let sel = self.cfg.view.font == *stem;
-                                        let text = format!("{}  —  AaBb 中文 123", name);
-                                        // Only render the preview in the font's own
-                                        // face if it's actually registered; an
-                                        // unregistered FontFamily::Name panics in egui
-                                        // (e.g. a font dropped into the folder after
-                                        // startup that hasn't been loaded yet).
-                                        let label = if self.registered_fonts.iter().any(|f| f == stem) {
-                                            egui::RichText::new(text)
-                                                .family(egui::FontFamily::Name(stem.clone().into()))
-                                        } else {
-                                            egui::RichText::new(text)
-                                        };
+                                        let label = format!("{name}");
                                         let resp = ui.selectable_label(sel, label);
                                         if resp.clicked() && !sel {
                                             self.cfg.view.font = stem.clone();
-                                            self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
+                                            install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
                                             ui.close();
                                         }
                                     }
@@ -1472,7 +1455,7 @@ impl App {
                                 && !is_default
                             {
                                 self.cfg.view.font.clear();
-                                self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
+                                install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
                                 ui.close();
                             }
                         } else {
