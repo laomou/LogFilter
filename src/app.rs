@@ -418,6 +418,22 @@ impl App {
         texts.join("\n")
     }
 
+    /// Copy a single column from all selected rows, one line per row.
+    fn copy_selected_column_text(
+        entries: &[crate::model::LogEntry],
+        filtered: &[u32],
+        selected_rows: &HashSet<usize>,
+        col: fn(&crate::model::LogEntry) -> &str,
+    ) -> String {
+        let mut rows: Vec<&usize> = selected_rows.iter().collect();
+        rows.sort();
+        let texts: Vec<&str> = rows.iter().filter_map(|&&r| {
+            let &ei = filtered.get(r)?;
+            Some(col(&entries[ei as usize]))
+        }).collect();
+        texts.join("\n")
+    }
+
     fn copy_selected_row(&mut self) {
         if self.selected_rows.is_empty() { return; }
         let text = self.copy_selected_rows_text();
@@ -1762,20 +1778,6 @@ impl App {
                             if alt && resp.secondary_clicked() {
                                 alt_right_tag = Some(e.tag().to_string());
                             }
-                            resp.context_menu(|ui| {
-                                if ui.button(tr!("copy_tag")).clicked() {
-                                    copy_cell_text = Some(e.tag().to_string());
-                                    ui.close();
-                                }
-                                if ui.button(tr!("add_show_tag")).clicked() {
-                                    alt_left_tag = Some(e.tag().to_string());
-                                    ui.close();
-                                }
-                                if ui.button(tr!("add_remove_tag")).clicked() {
-                                    alt_right_tag = Some(e.tag().to_string());
-                                    ui.close();
-                                }
-                            });
                         }
                         if self.ui.col_bookmark {
                             row.col(|ui| {
@@ -1810,7 +1812,13 @@ impl App {
                             }
                             resp.context_menu(|ui| {
                                 if ui.button(tr!("copy_message")).clicked() {
-                                    copy_cell_text = Some(e.message().to_string());
+                                    if self.selected_rows.len() > 1 {
+                                        copy_cell_text = Some(Self::copy_selected_column_text(
+                                            &entries, filtered, &self.selected_rows, |e| e.message()
+                                        ));
+                                    } else {
+                                        copy_cell_text = Some(e.message().to_string());
+                                    }
                                     ui.close();
                                 }
                                 if ui.button(tr!("copy_row")).clicked() {
@@ -1851,13 +1859,16 @@ impl App {
                     } else {
                         self.selected_rows.insert(r);
                     }
+                    self.status = format!("Ctrl+click row {r}, sel={}", self.selected_rows.len());
                 } else if shift {
                     let anchor = self.selected_rows.iter().next().copied().unwrap_or(0);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
+                    self.status = format!("Shift+click row {r}, sel={}", self.selected_rows.len());
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
+                    self.status = format!("Click row {r}, sel=1");
                 }
             }
             if let Some(r) = double_clicked_row {
