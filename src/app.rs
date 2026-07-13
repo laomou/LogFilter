@@ -36,7 +36,12 @@ pub struct App {
 
     // Font stems currently registered as FontFamily::Name(..); only these are
     // safe to use for per-font previews (unregistered names panic in egui).
+    // After the lazy-load change, this contains at most one entry: the selected
+    // user font (if any). Built-in fonts are always available.
     pub registered_fonts: Vec<String>,
+    // All font stems found in config/fonts — just metadata, no bytes loaded.
+    // Populated once at startup via list_user_font_stems().
+    pub user_font_stems: Vec<(String, String)>,
 
     // adb
     pub line_tx: Sender<(u64, String)>,
@@ -169,7 +174,8 @@ impl App {
         init_i18n();
         // Apply the stored language (or auto-detect) at startup.
         resolve_startup_lang(&cfg.view.lang);
-        let registered_fonts = install_ui_font(&cc.egui_ctx, &cfg.view.font);
+        let font_stems = list_user_font_stems();
+        let registered_fonts = install_ui_font(&cc.egui_ctx, &cfg.view.font, &font_stems);
         bump_global_text_sizes(&cc.egui_ctx);
         // egui defaults Ctrl+= / Ctrl+- / Ctrl+0 to changing the global zoom_factor,
         // which scales the entire UI (menus, toolbar, table). We only want those
@@ -200,6 +206,7 @@ impl App {
             pending_scroll: None,
             visible_table_rows: 1,
             registered_fonts,
+            user_font_stems: font_stems,
             line_tx,
             adb_session: None,
             adb_devices: Vec::new(),
@@ -981,57 +988,79 @@ fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     best
 }
 
-fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut added: Vec<String> = Vec::new();
+/// Scan config/fonts/ and return (file_stem, display_name) for every supported
+/// font file found there. No bytes are loaded — just metadata for the menu.
+fn list_user_font_stems() -> Vec<(String, String)> {
+    let Some(dir) = config::fonts_dir() else { return vec![] };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    let mut entries: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("ttf") | Some("otf") | Some("ttc") | Some("otc"),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|p| {
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("font")
+                .to_string();
+            // Nicer display name: strip the common CJK size suffix.
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&stem)
+                .to_string();
+            (stem, name)
+        })
+        .collect()
+}
 
-    if let Some(dir) = config::fonts_dir() {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut entries: Vec<_> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    matches!(
-                        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
-                        Some("ttf") | Some("otf") | Some("ttc") | Some("otc"),
-                    )
-                })
-                .collect();
-            entries.sort();
-            for p in entries {
-                let name = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("font")
-                    .to_string();
-                if let Ok(bytes) = std::fs::read(&p) {
-                    fonts
-                        .font_data
-                        .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-                    // Named family so the picker can preview this font alone.
-                    fonts.families.insert(
-                        egui::FontFamily::Name(name.clone().into()),
-                        vec![name.clone()],
-                    );
-                    added.push(name);
-                }
+/// Load built-in fonts + the *single* selected user font (if any) into egui.
+/// Other fonts in config/fonts/ stay on disk until selected — this keeps
+/// memory proportional to what is actually used, not all installed fonts.
+///
+/// Returns the list of user font stems now registered (at most one).
+fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, String)]) -> Vec<String> {
+    let mut fonts = egui::FontDefinitions::default();
+    // Drop Hack — we use Proportional for the table, Monospace is a mirror.
+    fonts.font_data.remove("Hack");
+    for fonts in fonts.families.values_mut() {
+        fonts.retain(|name| name != "Hack");
+    }
+    let mut registered: Vec<String> = Vec::new();
+
+    // Load ONLY the selected font (primary), not all fonts in the directory.
+    if !primary.is_empty() {
+        if let Some((_, path)) = find_font_file(stems, primary) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let name = primary.to_string();
+                fonts.font_data.insert(
+                    name.clone(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                fonts.families.insert(
+                    egui::FontFamily::Name(name.clone().into()),
+                    vec![name.clone()],
+                );
+                registered.push(name);
             }
         }
     }
 
-    // The log table renders via FontId::monospace, but by default we want it to
-    // look like the chrome (the Proportional / Ubuntu-Light face), not Hack. So
-    // mirror the proportional face stack into the Monospace family: an unselected
-    // table then matches the menu. A selected font is inserted at the front below,
-    // still overriding the table only (the Proportional family — menu / panels /
-    // status bar — is left untouched). With no valid selection (no fonts
-    // installed, or `primary` empty / not among the loaded fonts) the table keeps
-    // the proportional default. Installed-but-unselected fonts remain available
-    // under their own `FontFamily::Name(stem)` for previews / later selection.
+    // Mirror Proportional → Monospace so the table matches the menu chrome.
     if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
         fonts.families.insert(egui::FontFamily::Monospace, prop);
     }
-    if !primary.is_empty() && added.iter().any(|n| n == primary) {
+    // If a primary font was loaded, prepend it to the Monospace stack.
+    if !primary.is_empty() && !registered.is_empty() {
         fonts
             .families
             .entry(egui::FontFamily::Monospace)
@@ -1039,7 +1068,16 @@ fn install_ui_font(ctx: &egui::Context, primary: &str) -> Vec<String> {
             .insert(0, primary.to_string());
     }
     ctx.set_fonts(fonts);
-    added
+    registered
+}
+
+/// Find a font's path on disk given its file stem and the stems list.
+fn find_font_file(stems: &[(String, String)], stem: &str) -> Option<(usize, std::path::PathBuf)> {
+    let dir = config::fonts_dir()?;
+    let pos = stems.iter().position(|(s, _)| s == stem)?;
+    // Reconstruct the path from the stored display name.
+    let file_name = &stems[pos].1;
+    Some((pos, dir.join(file_name)))
 }
 
 /// egui's stock text sizes (Body 14, Button 14, Small 10) render a bit small on
@@ -1396,32 +1434,13 @@ impl App {
                             }
                             ui.separator();
 
-                            let loaded: Vec<(String, String)> = std::fs::read_dir(&dir)
-                                .map(|rd| {
-                                    rd.flatten()
-                                        .filter_map(|e| {
-                                            let p = e.path();
-                                            let ext = p.extension()
-                                                .and_then(|s| s.to_str())
-                                                .map(|s| s.to_ascii_lowercase());
-                                            if !matches!(ext.as_deref(), Some("ttf") | Some("otf") | Some("ttc") | Some("otc")) {
-                                                return None;
-                                            }
-                                            let stem = p.file_stem()?.to_str()?.to_string();
-                                            let name = p.file_name()?.to_str()?.to_string();
-                                            Some((stem, name))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-
                             // No empty-state label: an empty folder simply shows
                             // Open-folder above and Default below with nothing
                             // listed between them.
                             egui::ScrollArea::vertical()
                                 .max_height(220.0)
                                 .show(ui, |ui| {
-                                    for (stem, name) in &loaded {
+                                    for (stem, name) in &self.user_font_stems {
                                         let sel = self.cfg.view.font == *stem;
                                         let text = format!("{}  —  AaBb 中文 123", name);
                                         // Only render the preview in the font's own
@@ -1438,7 +1457,7 @@ impl App {
                                         let resp = ui.selectable_label(sel, label);
                                         if resp.clicked() && !sel {
                                             self.cfg.view.font = stem.clone();
-                                            self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font);
+                                            self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
                                             ui.close();
                                         }
                                     }
@@ -1453,7 +1472,7 @@ impl App {
                                 && !is_default
                             {
                                 self.cfg.view.font.clear();
-                                self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font);
+                                self.registered_fonts = install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
                                 ui.close();
                             }
                         } else {
