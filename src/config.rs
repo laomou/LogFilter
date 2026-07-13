@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub window: WindowConfig,
     pub view: ViewConfig,
@@ -14,18 +15,6 @@ pub struct Config {
     pub recent: RecentConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            window: WindowConfig::default(),
-            view: ViewConfig::default(),
-            filters: FiltersConfig::default(),
-            colors: ColorsConfig::default(),
-            adb: AdbConfig::default(),
-            recent: RecentConfig::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

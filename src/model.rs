@@ -43,7 +43,7 @@ impl LevelMask {
 
     pub fn from_kernel_digit(d: u8) -> Self {
         match d {
-            0 | 1 | 2 => Self::F,
+            0..=2 => Self::F,
             3 => Self::E,
             4 => Self::W,
             5 | 6 => Self::I,

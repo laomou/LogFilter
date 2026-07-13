@@ -976,7 +976,7 @@ fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     if width(s) <= max_width { return s.to_string(); }
     let chars: Vec<char> = s.chars().collect();
     let join = |keep: usize| -> String {
-        let head_len = (keep + 1) / 2;
+        let head_len = keep.div_ceil(2);
         let tail_len = keep - head_len;
         let head: String = chars[..head_len].iter().collect();
         let tail: String = chars[chars.len() - tail_len..].iter().collect();
@@ -1220,7 +1220,7 @@ impl App {
                                 .show(ui, |ui| {
                                     for (stem, name) in &self.user_font_stems {
                                         let sel = self.cfg.view.font == *stem;
-                                        let label = format!("{name}");
+                                        let label = name.to_string();
                                         let resp = ui.selectable_label(sel, label);
                                         if resp.clicked() && !sel {
                                             self.cfg.view.font = stem.clone();
@@ -1756,8 +1756,8 @@ impl App {
                             let (_, resp) = row.col(|ui| {
                                 if use_highlight {
                                     let job = build_highlighted(
-                                        e.tag(), &highlight_tokens, &find_tokens,
-                                        col, font.clone(), &highlight_palette,
+                                        e.tag(), highlight_tokens, find_tokens,
+                                        col, font.clone(), highlight_palette,
                                     );
                                     ui.add(egui::Label::new(job).truncate());
                                 } else {
@@ -1792,8 +1792,8 @@ impl App {
                             let (_, resp) = row.col(|ui| {
                                 if use_highlight {
                                     let job = build_highlighted(
-                                        e.message(), &highlight_tokens, &find_tokens,
-                                        col, font.clone(), &highlight_palette,
+                                        e.message(), highlight_tokens, find_tokens,
+                                        col, font.clone(), highlight_palette,
                                     );
                                     ui.add(egui::Label::new(job).truncate());
                                 } else {
@@ -1812,7 +1812,7 @@ impl App {
                                 if ui.button(tr!("copy_message")).clicked() {
                                     if self.selected_rows.len() > 1 {
                                         copy_cell_text = Some(Self::copy_selected_column_text(
-                                            &entries, filtered, &self.selected_rows, |e| e.message()
+                                            entries, filtered, &self.selected_rows, |e| e.message()
                                         ));
                                     } else {
                                         copy_cell_text = Some(e.message().to_string());

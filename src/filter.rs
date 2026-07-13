@@ -2,6 +2,7 @@ use crate::model::{LevelMask, LogEntry};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct FilterSpec {
     /// None = every level passes; Some(mask) = only levels in mask pass.
     pub allowed_levels: Option<LevelMask>,
@@ -17,20 +18,6 @@ pub struct FilterSpec {
     pub errors_only: bool,
 }
 
-impl Default for FilterSpec {
-    fn default() -> Self {
-        Self {
-            allowed_levels: None,
-            allowed_pids: None,
-            allowed_tids: None,
-            allowed_tags: None,
-            find: Vec::new(),
-            remove: Vec::new(),
-            bookmarks_only: false,
-            errors_only: false,
-        }
-    }
-}
 
 impl FilterSpec {
     /// Split a raw text field on `|` into lowercased trimmed tokens.
