@@ -3,7 +3,6 @@ use crossbeam_channel::Sender;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -81,7 +80,8 @@ pub fn list_devices(adb_override: Option<&str>) -> Result<Vec<String>> {
 
 pub struct Session {
     child: Child,
-    paused: Arc<AtomicBool>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    reader_thread: Option<thread::Thread>,
     #[allow(dead_code)]
     reader_handle: Option<thread::JoinHandle<()>>,
 }
@@ -109,33 +109,50 @@ impl Session {
         let mut child = command.spawn()
             .map_err(|e| anyhow!("failed to spawn adb: {} (is adb on PATH?)", e))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused_thr = paused.clone();
         let handle = thread::Builder::new().name("adb-reader".into()).spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(|r| r.ok()) {
-                if paused_thr.load(Ordering::Relaxed) { continue; }
+                // When paused, park the reader thread: it blocks here, neither
+                // burning CPU nor consuming/discarding stdout data. The data
+                // merely buffers in the kernel pipe until resumed.
+                while paused_thr.load(std::sync::atomic::Ordering::Relaxed) {
+                    thread::park();
+                }
                 if tx.send((epoch, line)).is_err() { break; }
             }
         })?;
+        let reader_thread = handle.thread().clone();
         Ok(Self {
             child,
             paused,
+            reader_thread: Some(reader_thread),
             reader_handle: Some(handle),
         })
     }
 
     pub fn set_paused(&self, p: bool) {
-        self.paused.store(p, Ordering::Relaxed);
+        self.paused.store(p, std::sync::atomic::Ordering::Relaxed);
+        if !p {
+            // Wake the reader thread; if it was parked, it resumes reading.
+            if let Some(t) = &self.reader_thread {
+                t.unpark();
+            }
+        }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Wake the reader so it can see the broken pipe / empty read and exit.
+        if let Some(t) = &self.reader_thread {
+            t.unpark();
+        }
     }
 }
 

@@ -53,6 +53,8 @@ pub struct App {
     /// Raw highlight/find strings that were used to produce the token caches above.
     cached_highlight_raw: String,
     cached_find_raw: String,
+    /// Cached shortcut-rows for the empty-table view. Invalidated on language switch.
+    cached_shortcut_rows: Vec<EmptyShortcutRow>,
 
 }
 
@@ -209,6 +211,7 @@ impl App {
             cached_find_tokens: if init_find_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_find_raw) },
             cached_highlight_raw: init_hl_raw,
             cached_find_raw: init_find_raw,
+            cached_shortcut_rows: empty_shortcut_rows(),
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -292,8 +295,9 @@ impl App {
             }
         };
         egui_i18n::set_language(code);
+        // Rebuild: shortcut-row strings embed translated labels.
+        self.cached_shortcut_rows = empty_shortcut_rows();
     }
-
     fn spawn_ingest_thread(&self, ctx: egui::Context, rx: Receiver<(u64, String)>) {
         let model = self.model.clone();
         let wake = self.wake.clone();
@@ -1083,16 +1087,23 @@ fn send_utf8_lines(
         let Ok(n) = reader.read_until(b'\n', &mut buf) else { return; };
         if n == 0 { return; }
         if source_epoch.load(Ordering::Acquire) != epoch { return; }
-        let mut line = String::from_utf8_lossy(&buf).into_owned();
-        if first {
-            first = false;
-            if line.starts_with('\u{feff}') {
-                line.remove(0);
+        // Fast path: valid UTF-8 -> borrow & trim on the slice, no lossy scan.
+        let line: String = if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+            let mut s = s;
+            if first {
+                first = false;
+                s = s.strip_prefix('\u{feff}').unwrap_or(s);
             }
-        }
-        while line.ends_with(['\n', '\r']) {
-            line.pop();
-        }
+            s.trim_end_matches(['\n', '\r']).to_string()
+        } else {
+            let mut line = String::from_utf8_lossy(&buf).into_owned();
+            if first {
+                first = false;
+                if line.starts_with('\u{feff}') { line.remove(0); }
+            }
+            while line.ends_with(['\n', '\r']) { line.pop(); }
+            line
+        };
         if tx.send((epoch, line)).is_err() { return; }
     }
 }
@@ -1876,7 +1887,7 @@ impl App {
                 })
                 .body(|body| {
                     if show_empty_shortcuts {
-                        let shortcut_rows = empty_shortcut_rows();
+                        let shortcut_rows = &self.cached_shortcut_rows;
                         let row_count = EMPTY_SHORTCUT_TOP_PADDING_ROWS + shortcut_rows.len();
                         body.rows(row_h, row_count, |mut row| {
                             if row.index() < EMPTY_SHORTCUT_TOP_PADDING_ROWS {
