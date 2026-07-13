@@ -80,6 +80,7 @@ sh_toggle_bookmark = Toggle bookmark on current row
 sh_prev_bookmark = Previous bookmark
 sh_next_bookmark = Next bookmark
 sh_copy_row = Copy current row
+sh_copy_selected = Copy selected rows
 sh_save = Save filtered log to file
 sh_font_size = Increase / decrease font size
 sh_reset_font = Reset font size

@@ -1016,7 +1016,7 @@ fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
         (tr!("shortcut_bookmarks"), format!("Ctrl/Cmd+F2 - {}", tr!("sh_toggle_bookmark"))),
         (tr!("shortcut_bookmarks"), format!("F2 - {}", tr!("sh_prev_bookmark"))),
         (tr!("shortcut_bookmarks"), format!("F3 - {}", tr!("sh_next_bookmark"))),
-        (tr!("shortcut_line"), format!("Ctrl/Cmd+C - {}", tr!("sh_copy_row"))),
+        (tr!("shortcut_line"), format!("Ctrl/Cmd+C - {}", tr!("sh_copy_selected"))),
         (tr!("shortcut_line"), format!("PageUp / PageDown - {}", tr!("sh_page_up_down"))),
         (tr!("shortcut_font"), format!("Ctrl/Cmd+Plus / Ctrl/Cmd+Minus - {}", tr!("sh_font_size"))),
         (tr!("shortcut_font"), format!("Ctrl/Cmd+0 - {}", tr!("sh_reset_font"))),
@@ -1462,16 +1462,14 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                 ui.separator();
-                let n = self.selected_rows.len();
-                if n > 0 {
-                    ui.label(format!("Sel {n}"));
-                    ui.separator();
-                }
                 ui.label(self.ui.encoding.to_uppercase());
-                // Transient feedback (open error, save result, adb state).
+                let n = self.selected_rows.len();
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
+                } else if n > 0 {
+                    ui.separator();
+                    ui.label(format!("Sel {n}"));
                 }
             });
         });
@@ -1859,16 +1857,15 @@ impl App {
                     } else {
                         self.selected_rows.insert(r);
                     }
-                    self.status = format!("Ctrl+click row {r}, sel={}", self.selected_rows.len());
+                    self.status = format!("Ctrl+click row {}, sel={}", r + 1, self.selected_rows.len());
                 } else if shift {
                     let anchor = self.selected_rows.iter().next().copied().unwrap_or(0);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
-                    self.status = format!("Shift+click row {r}, sel={}", self.selected_rows.len());
+                    self.status = format!("Shift+click row {}, sel={}", r + 1, self.selected_rows.len());
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
-                    self.status = format!("Click row {r}, sel=1");
                 }
             }
             if let Some(r) = double_clicked_row {
