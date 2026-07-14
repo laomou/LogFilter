@@ -58,6 +58,14 @@ pub struct App {
     /// Raw highlight/find strings that were used to produce the token caches above.
     cached_highlight_raw: String,
     cached_find_raw: String,
+    /// Pre-parsed level colors (V/D/I/W/E/F) to avoid per-cell string parsing.
+    cached_level_colors: [Color32; 6],
+    /// Picker panel option cache: column type last cached for.
+    cached_picker_col: Option<PickerCol>,
+    /// Picker panel option cache: pre-built sorted option list.
+    cached_picker_options: Vec<(String, usize)>,
+    /// entries.len() at the time picker options were cached — used as invalidation key.
+    cached_picker_entries_len: usize,
     /// Cached shortcut-rows for the empty-table view. Invalidated on language switch.
     cached_shortcut_rows: Vec<EmptyShortcutRow>,
 
@@ -193,6 +201,7 @@ impl App {
         let init_hl_raw = if ui.highlight_on { ui.highlight.clone() } else { String::new() };
         let init_find_raw = if ui.find_on { ui.find.clone() } else { String::new() };
         let init_palette: Vec<Color32> = cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
+        let init_level_colors = parse_level_colors(&cfg);
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
@@ -219,6 +228,10 @@ impl App {
             cached_find_tokens: if init_find_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_find_raw) },
             cached_highlight_raw: init_hl_raw,
             cached_find_raw: init_find_raw,
+            cached_level_colors: init_level_colors,
+            cached_picker_col: None,
+            cached_picker_options: Vec::new(),
+            cached_picker_entries_len: 0,
             cached_shortcut_rows: empty_shortcut_rows(),
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
@@ -844,47 +857,69 @@ impl App {
         }
     }
 
+    /// Build a sorted Vec of (label, count) pairs for a picker column.
+    /// Called only when the cached list is stale, not per frame.
+    fn build_sorted_options(model: &Model, col: PickerCol) -> Vec<(String, usize)> {
+        let mut v = match col {
+            PickerCol::Pid => model.pid_counts.iter().map(|(k, &c)| (k.clone(), c)).collect::<Vec<_>>(),
+            PickerCol::Tid => model.tid_counts.iter().map(|(k, &c)| (k.clone(), c)).collect(),
+            PickerCol::Tag => model.tag_counts.iter().map(|(k, &c)| (k.clone(), c)).collect(),
+            PickerCol::Level => {
+                let labels = ['V', 'D', 'I', 'W', 'E', 'F'];
+                labels.iter().enumerate()
+                    .filter(|&(i, _)| model.level_counts[i] > 0)
+                    .map(|(i, &lb)| (lb.to_string(), model.level_counts[i]))
+                    .collect()
+            }
+        };
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
     fn render_picker(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.ui.picker.clone() else { return; };
 
-        // Build option list from Model counts (all loaded entries, not filtered).
-        let (title, options, current_selected) = {
+        // Build/reuse cached option list (sorted by count desc, then key).
+        // The sorted list invalidates only when the picker column changes or new
+        // entries were appended (entries.len() differs). This avoids a full
+        // clone+sort per frame while the picker is open.
+        {
             let m = self.model.read().unwrap();
+            let entries_len = m.entries.len();
+            if self.cached_picker_col != Some(picker.col) || self.cached_picker_entries_len != entries_len {
+                self.cached_picker_options = Self::build_sorted_options(&m, picker.col);
+                self.cached_picker_col = Some(picker.col);
+                self.cached_picker_entries_len = entries_len;
+            }
+        }
+        let options: Vec<(String, usize)> = self.cached_picker_options.clone();
+
+        let (title, current_selected) = {
             match picker.col {
                 PickerCol::Pid => {
-                    let mut v: Vec<(String, usize)> = m.pid_counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
-                    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                    let sel = self.ui.allowed_pids.clone().unwrap_or_else(|| v.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_pid"), v, sel)
+                    let sel = self.ui.allowed_pids.clone()
+                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
+                    (tr!("filter_pid"), sel)
                 }
                 PickerCol::Tid => {
-                    let mut v: Vec<(String, usize)> = m.tid_counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
-                    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                    let sel = self.ui.allowed_tids.clone().unwrap_or_else(|| v.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_thread"), v, sel)
+                    let sel = self.ui.allowed_tids.clone()
+                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
+                    (tr!("filter_thread"), sel)
                 }
                 PickerCol::Tag => {
-                    let mut v: Vec<(String, usize)> = m.tag_counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
-                    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                    let sel = self.ui.allowed_tags.clone().unwrap_or_else(|| v.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_tag"), v, sel)
+                    let sel = self.ui.allowed_tags.clone()
+                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
+                    (tr!("filter_tag"), sel)
                 }
                 PickerCol::Level => {
                     let masks = crate::model::LEVEL_MASKS;
                     let labels = ['V','D','I','W','E','F'];
-                    let mut v: Vec<(String, usize)> = Vec::new();
-                    for (i, &lv) in masks.iter().enumerate() {
-                        let c = m.level_counts[i];
-                        if c > 0 { v.push((labels[i].to_string(), c)); }
-                        let _ = lv;
-                    }
-                    // For level, "selected" is a set of char labels
                     let current_mask = self.ui.allowed_levels.unwrap_or(LevelMask::ALL);
                     let sel: std::collections::HashSet<String> = (0..6)
                         .filter(|&i| current_mask.contains(masks[i]))
                         .map(|i| labels[i].to_string())
                         .collect();
-                    (tr!("filter_lv"), v, sel)
+                    (tr!("filter_lv"), sel)
                 }
             }
         };
@@ -1065,14 +1100,25 @@ fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     best
 }
 
-fn level_color(lv: LevelMask, cfg: &Config) -> Color32 {
-    let s = if lv.contains(LevelMask::F) { &cfg.colors.level_f }
-        else if lv.contains(LevelMask::E) { &cfg.colors.level_e }
-        else if lv.contains(LevelMask::W) { &cfg.colors.level_w }
-        else if lv.contains(LevelMask::I) { &cfg.colors.level_i }
-        else if lv.contains(LevelMask::D) { &cfg.colors.level_d }
-        else { &cfg.colors.level_v };
-    parse_color(s)
+fn level_color(lv: LevelMask, colors: &[Color32; 6]) -> Color32 {
+    let idx = crate::model::level_index(lv).unwrap_or(0);
+    colors[idx]
+}
+
+/// Parse the 6 level colors from Config into an array (once at startup).
+fn parse_level_colors(cfg: &Config) -> [Color32; 6] {
+    let masks = crate::model::LEVEL_MASKS;
+    let strings: [&str; 6] = [
+        &cfg.colors.level_v, &cfg.colors.level_d, &cfg.colors.level_i,
+        &cfg.colors.level_w, &cfg.colors.level_e, &cfg.colors.level_f,
+    ];
+    let mut colors = [Color32::BLACK; 6];
+    for (i, s) in strings.iter().enumerate() {
+        colors[i] = parse_color(s);
+    }
+    // Keep unused binding for future-proofing — ensure masks aligns with strings.
+    let _ = masks;
+    colors
 }
 
 const EMPTY_SHORTCUT_TOP_PADDING_ROWS: usize = 3;
@@ -1850,7 +1896,7 @@ impl App {
                         let row_idx = row.index();
                         let entry_idx = filtered[row_idx];
                         let e = &entries[entry_idx as usize];
-                        let col = level_color(e.level, &self.cfg);
+                        let col = level_color(e.level, &self.cached_level_colors);
                         let is_selected = sel.contains(&row_idx);
                         let is_bookmarked = bookmarks.contains(&entry_idx);
                         row.set_selected(is_selected);
