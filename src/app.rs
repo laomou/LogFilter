@@ -831,7 +831,6 @@ impl App {
                 } else {
                     self.move_selected_row(1);
                 }
-                return;
             }
         }
     }
@@ -2098,7 +2097,7 @@ mod tests {
             [
                 &[0xEF, 0xBB, 0xBF, b'f', b'i', b'r', b's', b't', b'\r', b'\n'][..],
                 &[b'b', b'a', b'd', b' ', 0xFF, b'\r', b'\n'][..],
-                &[b'l', b'a', b's', b't'][..],
+                b"last",
             ]
             .concat(),
         )

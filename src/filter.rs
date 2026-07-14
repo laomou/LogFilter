@@ -114,8 +114,7 @@ mod tests {
 
     #[test]
     fn level_mask_filters() {
-        let mut spec = FilterSpec::default();
-        spec.allowed_levels = Some(LevelMask::E);
+        let spec = FilterSpec { allowed_levels: Some(LevelMask::E), ..FilterSpec::default() };
         let hs = HashSet::new();
         assert!(spec.matches(&e("x", "T", LevelMask::E), &hs));
         assert!(!spec.matches(&e("x", "T", LevelMask::D), &hs));
@@ -123,14 +122,12 @@ mod tests {
 
     #[test]
     fn find_or_remove() {
-        let mut spec = FilterSpec::default();
-        spec.find = vec!["hello".into()];
+        let spec = FilterSpec { find: vec!["hello".into()], ..FilterSpec::default() };
         let hs = HashSet::new();
         assert!(spec.matches(&e("Hello world", "T", LevelMask::I), &hs));
         assert!(!spec.matches(&e("bye", "T", LevelMask::I), &hs));
 
-        let mut spec = FilterSpec::default();
-        spec.remove = vec!["spam".into()];
+        let spec = FilterSpec { remove: vec!["spam".into()], ..FilterSpec::default() };
         assert!(!spec.matches(&e("spam here", "T", LevelMask::I), &hs));
         assert!(spec.matches(&e("clean", "T", LevelMask::I), &hs));
     }
