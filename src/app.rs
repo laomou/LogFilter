@@ -1480,7 +1480,7 @@ impl App {
                 });
 
                 ui.menu_button(tr!("m_help"), |ui| {
-                    if ui.link(format!("LogFilter v{}", env!("CARGO_PKG_VERSION"))).clicked() {
+                    if ui.link("LogFilter").clicked() {
                         ui.ctx().open_url(egui::OpenUrl {
                             url: "https://github.com/laomou/LogFilter".into(),
                             new_tab: true,
