@@ -18,8 +18,9 @@ fn main() -> eframe::Result<()> {
 
     let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
+    let title = format!("LogFilter v{}", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("LogFilter")
+        .with_title(title)
         .with_inner_size([1350.0, 720.0]);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
