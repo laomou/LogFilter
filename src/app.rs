@@ -1140,28 +1140,67 @@ fn build_highlighted(
         job.append(text, 0.0, TextFormat { color: fg, font_id: font, ..Default::default() });
         return job;
     }
-    let low = text.to_lowercase();
 
     // Collect matches: (start, end, kind) where kind=Some(hi_index) = highlight, None = find-underline
     let mut hits: Vec<(usize, usize, Option<usize>)> = Vec::new();
-    for (ti, tok) in highlights.iter().enumerate() {
-        if tok.is_empty() { continue; }
-        let mut off = 0;
-        while let Some(pos) = low[off..].find(tok.as_str()) {
-            let s = off + pos;
-            hits.push((s, s + tok.len(), Some(ti)));
-            off = s + tok.len().max(1);
+
+    // Fast(er) path: when all tokens and text are pure ASCII, use byte-level
+    // case folding with to_ascii_lowercase — zero allocation, unlike
+    // text.to_lowercase() which allocates a new String every call.
+    let all_ascii = text.is_ascii()
+        && highlights.iter().all(|t| t.is_ascii())
+        && finds.iter().all(|t| t.is_ascii());
+    if all_ascii {
+        let hay = text.as_bytes();
+        for (ti, tok) in highlights.iter().enumerate() {
+            if tok.is_empty() { continue; }
+            let nee = tok.as_bytes();
+            if nee.len() > hay.len() { continue; }
+            'outer: for start in 0..=hay.len() - nee.len() {
+                for (j, &nb) in nee.iter().enumerate() {
+                    if hay[start + j].to_ascii_lowercase() != nb {
+                        continue 'outer;
+                    }
+                }
+                hits.push((start, start + nee.len(), Some(ti)));
+            }
+        }
+        for tok in finds {
+            if tok.is_empty() { continue; }
+            let nee = tok.as_bytes();
+            if nee.len() > hay.len() { continue; }
+            'outer: for start in 0..=hay.len() - nee.len() {
+                for (j, &nb) in nee.iter().enumerate() {
+                    if hay[start + j].to_ascii_lowercase() != nb {
+                        continue 'outer;
+                    }
+                }
+                hits.push((start, start + nee.len(), None));
+            }
+        }
+    } else {
+        // Fallback: Unicode-correct lowercasing for non-ASCII text or tokens.
+        let low = text.to_lowercase();
+        for (ti, tok) in highlights.iter().enumerate() {
+            if tok.is_empty() { continue; }
+            let mut off = 0;
+            while let Some(pos) = low[off..].find(tok.as_str()) {
+                let s = off + pos;
+                hits.push((s, s + tok.len(), Some(ti)));
+                off = s + tok.len().max(1);
+            }
+        }
+        for tok in finds {
+            if tok.is_empty() { continue; }
+            let mut off = 0;
+            while let Some(pos) = low[off..].find(tok.as_str()) {
+                let s = off + pos;
+                hits.push((s, s + tok.len(), None));
+                off = s + tok.len().max(1);
+            }
         }
     }
-    for tok in finds {
-        if tok.is_empty() { continue; }
-        let mut off = 0;
-        while let Some(pos) = low[off..].find(tok.as_str()) {
-            let s = off + pos;
-            hits.push((s, s + tok.len(), None));
-            off = s + tok.len().max(1);
-        }
-    }
+
     hits.sort_by_key(|h| (h.0, h.1));
 
     // Merge overlaps: keep earliest-start, longest span; later hits inside get dropped.
