@@ -32,8 +32,12 @@ pub struct App {
     pub ui: UiState,
 
     pub selected_rows: HashSet<usize>,
+    /// Anchor row for Shift+Arrow / Shift+Click range selection.
+    pub selection_anchor: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub visible_table_rows: usize,
+    /// Window inner size captured each frame, saved on exit.
+    last_window_size: Option<egui::Vec2>,
 
     // All font stems found in config/fonts — just metadata, no bytes loaded.
     // Populated once at startup via list_user_font_stems().
@@ -199,8 +203,10 @@ impl App {
             status: String::new(),
             ui,
             selected_rows: HashSet::new(),
+            selection_anchor: None,
             pending_scroll: None,
             visible_table_rows: 1,
+            last_window_size: None,
             user_font_stems: font_stems,
             line_tx,
             adb_session: None,
@@ -654,6 +660,7 @@ impl App {
             self.selected_rows.clear();
             self.selected_rows.insert(row);
             self.pending_scroll = Some(row);
+            self.selection_anchor = Some(row);
         }
     }
 
@@ -664,6 +671,49 @@ impl App {
             return;
         };
         self.select_filtered_row_with_len(row, len);
+    }
+
+    /// Move selection by `delta` rows (±1) and update the selection anchor.
+    fn move_selected_row(&mut self, delta: isize) {
+        let m = self.model.read().unwrap();
+        let len = m.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
+        drop(m);
+        let new = if delta < 0 {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(len.saturating_sub(1))
+        };
+        self.selected_rows.clear();
+        self.selected_rows.insert(new);
+        self.pending_scroll = Some(new);
+        self.selection_anchor = Some(new);
+    }
+
+    /// Extend the selection range from `selection_anchor` by `delta` rows (±1).
+    fn extend_selection(&mut self, delta: isize) {
+        let m = self.model.read().unwrap();
+        let len = m.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let anchor = self.selection_anchor.unwrap_or(0);
+        let cur = self.selected_rows.iter().next().copied().unwrap_or(anchor);
+        drop(m);
+        let new = if delta < 0 {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(len.saturating_sub(1))
+        };
+        let (lo, hi) = if new < anchor { (new, anchor) } else { (anchor, new) };
+        self.selected_rows.clear();
+        for i in lo..=hi {
+            self.selected_rows.insert(i);
+        }
+        self.pending_scroll = Some(new);
     }
 
     fn adjust_table_font_size(&mut self, delta: f32) {
@@ -749,6 +799,27 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown)) {
             self.page_selected_row(true);
+            return;
+        }
+        // ArrowUp/ArrowDown: move selection by 1 row; Shift extends the range.
+        {
+            let shift = ctx.input(|i| i.modifiers.shift);
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                if shift {
+                    self.extend_selection(-1);
+                } else {
+                    self.move_selected_row(-1);
+                }
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                if shift {
+                    self.extend_selection(1);
+                } else {
+                    self.move_selected_row(1);
+                }
+                return;
+            }
         }
     }
 
@@ -769,6 +840,7 @@ impl App {
             self.selected_rows.clear();
             self.selected_rows.insert(n);
             self.pending_scroll = Some(n);
+            self.selection_anchor = Some(n);
         }
     }
 
@@ -1133,6 +1205,8 @@ fn build_highlighted(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Capture window inner size each frame so we can persist it on exit.
+        self.last_window_size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
         self.handle_shortcuts(&ctx);
         self.ui_menu_bar(ui);
         self.ui_options_panel(ui);
@@ -1153,6 +1227,10 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.ui.write_back(&mut self.cfg);
+        if let Some(size) = self.last_window_size {
+            self.cfg.window.width = size.x;
+            self.cfg.window.height = size.y;
+        }
         let _ = config::save(&self.cfg);
     }
 }
@@ -1339,6 +1417,7 @@ impl App {
         //   Row 1: 🔍 Find (fills width)
         //   Row 2: Remove (half) · Highlight (half)
         //   Row 3: adb toolbar · Goto · Auto-scroll
+        let ctx = ui.ctx().clone();
         let mut dirty = false;
         let mut goto_target: Option<usize> = None;
         egui::Panel::top("options").show(ui, |ui| {
@@ -1412,7 +1491,7 @@ impl App {
                 ui.separator();
                 ui.label(tr!("goto"));
                 let goto_resp = ui.add(egui::TextEdit::singleline(&mut self.ui.goto_line).desired_width(70.0));
-                if goto_resp.changed() {
+                if goto_resp.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(n) = self.ui.goto_line.trim().parse::<usize>() {
                         if n > 0 { goto_target = Some(n - 1); }
                     }
@@ -1525,6 +1604,7 @@ impl App {
                     self.pending_scroll = Some(target.min(total.saturating_sub(1)));
                     self.selected_rows.clear();
                     self.selected_rows.insert(self.pending_scroll.unwrap_or(0));
+                    self.selection_anchor = self.pending_scroll;
                 }
             }
         });
@@ -1868,6 +1948,7 @@ impl App {
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
+                    self.selection_anchor = Some(r);
                 }
             }
             if let Some(r) = double_clicked_row {
@@ -1875,6 +1956,7 @@ impl App {
                 if let Some(i) = entry_idx { self.toggle_bookmark(i); }
                 self.selected_rows.clear();
                 self.selected_rows.insert(r);
+                self.selection_anchor = Some(r);
             }
             if let Some(t) = alt_left_tag { self.add_show_tag(&t); }
             if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
