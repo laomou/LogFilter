@@ -1575,7 +1575,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(tr!("goto"));
-                let goto_resp = ui.add(egui::TextEdit::singleline(&mut self.ui.goto_line).desired_width(70.0));
+                let goto_resp = ui.add(egui::TextEdit::singleline(&mut self.ui.goto_line).desired_width(90.0));
                 if goto_resp.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(n) = self.ui.goto_line.trim().parse::<usize>() {
                         if n > 0 { goto_target = Some(n - 1); }
@@ -1796,13 +1796,11 @@ impl App {
                         if !*visible { continue; }
                         let kind = col_kinds[i];
                         let pk = picker_of(kind);
-                        // Dropdown marker: use ⏷ (U+23F7), which lives in
-                        // emoji-icon-font — part of the Monospace fallback chain.
-                        // ▾/▼ (U+25BE/25BC) exist only in Hack, which the
-                        // "table font follows the menu" mirror dropped from
-                        // Monospace, so they'd render as tofu boxes.
+                        // Dropdown marker: use ▼ (U+25BC) — a universally recognized
+                        // "click for menu" symbol rendered from the Proportional
+                        // font fallback chain (Monospace now mirrors Proportional).
                         let label = if pk.is_some() {
-                            format!("{name} \u{23F7}")
+                            format!("{name} ▼")
                         } else {
                             name.to_string()
                         };
