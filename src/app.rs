@@ -1360,7 +1360,6 @@ impl App {
                 });
 
                 ui.menu_button(tr!("m_format"), |ui| {
-                    ui.set_min_width(220.0);
 
                     // ── Font submenu: lists imported fonts ────────────────
                     ui.menu_button(tr!("font"), |ui| {
@@ -1412,7 +1411,6 @@ impl App {
 
                     // ── Size submenu: preset point sizes ──────────────────
                     ui.menu_button(tr!("size"), |ui| {
-                        ui.set_min_width(180.0);
                         let presets = [13.0, 14.0, 15.0, 16.0, 17.0, 18.0];
                         for &p in &presets {
                             let sel = (self.cfg.view.font_size - p).abs() < 0.01;
