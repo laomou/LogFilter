@@ -1714,9 +1714,9 @@ impl App {
                 (self.ui.col_time,     &ct,   100.0),
                 (self.ui.col_loglv,    &clv,   44.0),
                 (self.ui.col_pid,      &cpi,   60.0),
-                (self.ui.col_thread,   &cth,   60.0),
+                (self.ui.col_thread,   &cth,   80.0),
                 (self.ui.col_tag,      &cta,  140.0),
-                (self.ui.col_bookmark, &cmk,   30.0),
+                (self.ui.col_bookmark, &cmk,   36.0),
                 (self.ui.col_message,  &cms,  300.0),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
