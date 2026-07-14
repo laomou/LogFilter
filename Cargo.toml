@@ -2,7 +2,7 @@
 name = "logfilter"
 version = "0.1.0"
 edition = "2021"
-description = "Android logcat viewer/filter, Rust port of the Java Swing LogFilter"
+description = "Android logcat viewer/filter"
 license = "MIT"
 
 [dependencies]
