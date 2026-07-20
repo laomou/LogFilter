@@ -32,8 +32,12 @@ pub struct App {
     pub ui: UiState,
 
     pub selected_rows: HashSet<usize>,
-    /// Anchor row for Shift+Arrow / Shift+Click range selection.
+    /// Fixed end of a range selection (set on plain click / single-row moves).
     pub selection_anchor: Option<usize>,
+    /// Moving end of a range selection — the row that Shift+Arrow / Shift+Click
+    /// extends toward. Distinct from the anchor so that repeatedly pressing
+    /// Shift+↓ always moves the leading edge forward, not a random HashSet element.
+    pub selection_cursor: Option<usize>,
     pub pending_scroll: Option<usize>,
     pub visible_table_rows: usize,
     /// Window inner size captured each frame, saved on exit.
@@ -213,6 +217,7 @@ impl App {
             ui,
             selected_rows: HashSet::new(),
             selection_anchor: None,
+            selection_cursor: None,
             pending_scroll: None,
             visible_table_rows: 1,
             last_window_size: None,
@@ -268,6 +273,8 @@ impl App {
             model.file_path = Some(path.to_path_buf());
         }
         self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -378,6 +385,8 @@ impl App {
             model.clear();
         }
         self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -419,6 +428,8 @@ impl App {
             m.clear();
         }
         self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
         self.notify_filter();
     }
 
@@ -674,6 +685,7 @@ impl App {
             self.selected_rows.insert(row);
             self.pending_scroll = Some(row);
             self.selection_anchor = Some(row);
+            self.selection_cursor = Some(row);
         }
     }
 
@@ -693,7 +705,7 @@ impl App {
         if len == 0 {
             return;
         }
-        let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
+        let cur = self.selection_cursor.unwrap_or(0).min(len.saturating_sub(1));
         drop(m);
         let new = if delta < 0 {
             cur.saturating_sub(1)
@@ -704,6 +716,7 @@ impl App {
         self.selected_rows.insert(new);
         self.pending_scroll = Some(new);
         self.selection_anchor = Some(new);
+        self.selection_cursor = Some(new);
     }
 
     /// Extend the selection range from `selection_anchor` by `delta` rows (±1).
@@ -713,8 +726,10 @@ impl App {
         if len == 0 {
             return;
         }
-        let anchor = self.selection_anchor.unwrap_or(0);
-        let cur = self.selected_rows.iter().next().copied().unwrap_or(anchor);
+        let anchor = self.selection_anchor.unwrap_or(0).min(len.saturating_sub(1));
+        // Use the explicit cursor (moving end) rather than an arbitrary HashSet
+        // element — HashSet iteration order is non-deterministic.
+        let cur = self.selection_cursor.unwrap_or(anchor).min(len.saturating_sub(1));
         drop(m);
         let new = if delta < 0 {
             cur.saturating_sub(1)
@@ -727,6 +742,7 @@ impl App {
             self.selected_rows.insert(i);
         }
         self.pending_scroll = Some(new);
+        self.selection_cursor = Some(new);
     }
 
     fn adjust_table_font_size(&mut self, delta: f32) {
@@ -815,22 +831,25 @@ impl App {
             return;
         }
         // ArrowUp/ArrowDown: move selection by 1 row; Shift extends the range.
+        // Two separate consume_key calls are needed — consume_key does an EXACT
+        // modifier match, so NONE only fires without Shift and SHIFT only fires
+        // with Shift. Reading the modifier first then consuming with NONE is wrong
+        // because the consume always returns false when Shift is actually held.
         {
-            let shift = ctx.input(|i| i.modifiers.shift);
+            if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::ArrowUp)) {
+                self.extend_selection(-1);
+                return;
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
-                if shift {
-                    self.extend_selection(-1);
-                } else {
-                    self.move_selected_row(-1);
-                }
+                self.move_selected_row(-1);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::ArrowDown)) {
+                self.extend_selection(1);
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                if shift {
-                    self.extend_selection(1);
-                } else {
-                    self.move_selected_row(1);
-                }
+                self.move_selected_row(1);
             }
         }
     }
@@ -853,6 +872,7 @@ impl App {
             self.selected_rows.insert(n);
             self.pending_scroll = Some(n);
             self.selection_anchor = Some(n);
+            self.selection_cursor = Some(n);
         }
     }
 
@@ -1224,24 +1244,47 @@ fn build_highlighted(
             }
         }
     } else {
-        // Fallback: Unicode-correct lowercasing for non-ASCII text or tokens.
-        let low = text.to_lowercase();
-        for (ti, tok) in highlights.iter().enumerate() {
+        // Fallback: Unicode-correct case-insensitive search.
+        // We search the *original* `text` char-by-char so that all byte offsets
+        // we record are valid indices into `text` — unlike searching a
+        // `text.to_lowercase()` copy, which can change byte lengths for
+        // characters such as ẞ (3 bytes) → ß (2 bytes), making offsets from the
+        // lowercased copy invalid when applied back to `text`.
+        let all_tokens: Vec<(Option<usize>, &str)> = highlights.iter()
+            .enumerate()
+            .map(|(i, t)| (Some(i), t.as_str()))
+            .chain(finds.iter().map(|t| (None, t.as_str())))
+            .collect();
+
+        for (kind, tok) in &all_tokens {
             if tok.is_empty() { continue; }
-            let mut off = 0;
-            while let Some(pos) = low[off..].find(tok.as_str()) {
-                let s = off + pos;
-                hits.push((s, s + tok.len(), Some(ti)));
-                off = s + tok.len().max(1);
-            }
-        }
-        for tok in finds {
-            if tok.is_empty() { continue; }
-            let mut off = 0;
-            while let Some(pos) = low[off..].find(tok.as_str()) {
-                let s = off + pos;
-                hits.push((s, s + tok.len(), None));
-                off = s + tok.len().max(1);
+            // Collect the token's chars lowercased once.
+            let tok_chars: Vec<char> = tok.chars().collect();
+            let tok_char_count = tok_chars.len();
+            // Slide a window of tok_char_count chars over text.
+            // Use char_indices so we always have valid byte positions.
+            let char_positions: Vec<(usize, char)> = text.char_indices().collect();
+            let n = char_positions.len();
+            if tok_char_count > n { continue; }
+            let mut i = 0;
+            while i + tok_char_count <= n {
+                let matches = char_positions[i..i + tok_char_count]
+                    .iter()
+                    .zip(tok_chars.iter())
+                    .all(|((_, tc), nc)| tc.to_lowercase().eq(nc.to_lowercase()));
+                if matches {
+                    let s = char_positions[i].0;
+                    let e = if i + tok_char_count < n {
+                        char_positions[i + tok_char_count].0
+                    } else {
+                        text.len()
+                    };
+                    hits.push((s, e, *kind));
+                    // Advance past this match; always move at least 1 char.
+                    i += tok_char_count.max(1);
+                } else {
+                    i += 1;
+                }
             }
         }
     }
@@ -1687,6 +1730,7 @@ impl App {
                     self.selected_rows.clear();
                     self.selected_rows.insert(self.pending_scroll.unwrap_or(0));
                     self.selection_anchor = self.pending_scroll;
+                    self.selection_cursor = self.pending_scroll;
                 }
             }
         });
@@ -2021,14 +2065,17 @@ impl App {
                     }
                     self.status = format!("Ctrl+click, selected={}", self.selected_rows.len());
                 } else if shift {
-                    let anchor = self.selected_rows.iter().next().copied().unwrap_or(0);
+                    // Use the stored anchor (fixed end), not an arbitrary HashSet element.
+                    let anchor = self.selection_anchor.unwrap_or(r);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
+                    self.selection_cursor = Some(r);
                     self.status = format!("Shift+click, selected={}", self.selected_rows.len());
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
                     self.selection_anchor = Some(r);
+                    self.selection_cursor = Some(r);
                 }
             }
             if let Some(r) = double_clicked_row {
@@ -2037,6 +2084,7 @@ impl App {
                 self.selected_rows.clear();
                 self.selected_rows.insert(r);
                 self.selection_anchor = Some(r);
+                self.selection_cursor = Some(r);
             }
             if let Some(t) = alt_left_tag { self.add_show_tag(&t); }
             if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
