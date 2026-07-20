@@ -62,36 +62,74 @@ fn trim_span(line: &str, sp: Span) -> Span {
     (start, start + trimmed.len() as u32)
 }
 
+#[allow(dead_code)]
 pub fn parse_line(line: String) -> (LogEntry, LogFormat) {
+    parse_line_hinted(line, LogFormat::Unknown)
+}
+
+/// Like [`parse_line`] but tries `hint` first to avoid redundant regex attempts
+/// on homogeneous log streams. Falls back to the full scan if the hint misses.
+pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat) {
     // Extract spans + level in an inner scope so the regex captures (which
     // borrow `line`) are dropped before we move `line` into the entry's buffer.
     let parsed: Option<(LogFormat, LevelMask, [Span; 6])> = {
         let s = line.as_str();
-        if let Some(c) = re_threadtime().captures(s) {
+
+        // Helper closures — called at most once each.
+        let try_threadtime = |s: &str| re_threadtime().captures(s).map(|c| {
             let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            Some((LogFormat::ThreadTime, lv, [
+            (LogFormat::ThreadTime, lv, [
                 span(&c, "date"), span(&c, "time"), span(&c, "pid"),
                 span(&c, "tid"), trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ]))
-        } else if let Some(c) = re_time().captures(s) {
+            ])
+        });
+        let try_time = |s: &str| re_time().captures(s).map(|c| {
             let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            Some((LogFormat::Time, lv, [
+            (LogFormat::Time, lv, [
                 span(&c, "date"), span(&c, "time"), span(&c, "pid"),
                 EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ]))
-        } else if let Some(c) = re_brief().captures(s) {
+            ])
+        });
+        let try_brief = |s: &str| re_brief().captures(s).map(|c| {
             let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            Some((LogFormat::Brief, lv, [
+            (LogFormat::Brief, lv, [
                 EMPTY, EMPTY, span(&c, "pid"),
                 EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ]))
-        } else if let Some(c) = re_kernel().captures(s) {
+            ])
+        });
+        let try_kernel = |s: &str| re_kernel().captures(s).map(|c| {
             let digit: u8 = c["lv"].parse().unwrap_or(7);
-            Some((LogFormat::Kernel, LevelMask::from_kernel_digit(digit), [
+            (LogFormat::Kernel, LevelMask::from_kernel_digit(digit), [
                 EMPTY, span(&c, "time"), EMPTY, EMPTY, EMPTY, span(&c, "msg"),
-            ]))
+            ])
+        });
+
+        // Try the hinted format first; fall back to the full scan only on a miss.
+        let hinted = match hint {
+            LogFormat::ThreadTime => try_threadtime(s),
+            LogFormat::Time       => try_time(s),
+            LogFormat::Brief      => try_brief(s),
+            LogFormat::Kernel     => try_kernel(s),
+            LogFormat::Unknown    => None,
+        };
+
+        if hinted.is_some() {
+            hinted
         } else {
-            None
+            // Full scan in priority order (ThreadTime → Time → Brief → Kernel),
+            // skipping whichever format the hint already tried.
+            match hint {
+                LogFormat::ThreadTime =>
+                    try_time(s).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
+                LogFormat::Time =>
+                    try_threadtime(s).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
+                LogFormat::Brief =>
+                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_kernel(s)),
+                LogFormat::Kernel =>
+                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_brief(s)),
+                LogFormat::Unknown =>
+                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
+            }
         }
     };
 
