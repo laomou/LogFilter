@@ -18,10 +18,11 @@ pub fn send_utf8_lines(
         Err(_) => return,
     };
     if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
-        // UTF-16 BOM detected: re-open is not needed since we have the handle.
-        // Reconstruct the file from the reader and decode as UTF-16.
+        // UTF-16 BOM detected: pick LE/BE and delegate to the decoded path.
+        let is_le = bom.starts_with(&[0xFF, 0xFE]);
         let file2 = reader.into_inner();
-        send_decoded_lines(file2, tx, epoch, source_epoch, EncodingChoice::Utf8);
+        let enc = if is_le { encoding_rs::UTF_16LE } else { encoding_rs::UTF_16BE };
+        send_decoded_lines_with_enc(file2, tx, epoch, source_epoch, enc);
         return;
     }
 
@@ -67,6 +68,16 @@ pub fn send_decoded_lines(
             pick_local_encoding(&locale)
         }
     };
+    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc);
+}
+
+fn send_decoded_lines_with_enc(
+    file: File,
+    tx: Sender<(u64, String)>,
+    epoch: u64,
+    source_epoch: Arc<AtomicU64>,
+    enc: &'static Encoding,
+) {
     let mut reader = BufReader::with_capacity(8192, file);
     let mut decoder = enc.new_decoder();
     // Accumulate decoded text across chunks so we can split into lines only when
@@ -79,26 +90,9 @@ pub fn send_decoded_lines(
         if n == 0 { break; }
         if source_epoch.load(Ordering::Acquire) != epoch { return; }
         let _ = decoder.decode_to_string(&raw_buf[..n], &mut text_buf, false);
-        // Flush complete lines while keeping any partial trailing line in `text_buf`.
-        {
-            // Find the last newline to keep the trailing partial line.
-            let mut drain_end = 0usize;
-            let mut bytes = text_buf.as_bytes();
-            while drain_end < bytes.len() {
-                if bytes[drain_end] == b'\n' {
-                    let line = text_buf[..drain_end].trim_end_matches(['\r', '\n']);
-                    if tx.send((epoch, line.to_string())).is_err() { return; }
-                    let next = drain_end + 1;
-                    // Drain the emitted portion so we don't re-scan on next chunk.
-                    text_buf.drain(..next);
-                    drain_end = 0;
-                    bytes = text_buf.as_bytes(); // refresh after drain
-                    if bytes.is_empty() { break; }
-                } else {
-                    drain_end += 1;
-                }
-            }
-        }
+        // Flush complete lines in one pass, then drain once per chunk (O(n)).
+        let consumed = flush_lines(&text_buf, &tx, epoch);
+        if consumed > 0 { text_buf.drain(..consumed); }
         if source_epoch.load(Ordering::Acquire) != epoch { return; }
     }
     // Final flush: drain any remaining buffered bytes from the decoder.
@@ -111,6 +105,28 @@ pub fn send_decoded_lines(
             let _ = tx.send((epoch, line));
         }
     }
+}
+
+/// Scan `buf` for complete lines (terminated by `\n`), send each via `tx`,
+/// and return the number of bytes consumed (the processed prefix length).
+/// The caller drains that prefix once — O(n) per chunk instead of O(n²).
+fn flush_lines(
+    buf: &str,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+) -> usize {
+    let bytes = buf.as_bytes();
+    let mut consumed = 0usize;
+    let mut scan = 0usize;
+    while scan < bytes.len() {
+        if bytes[scan] == b'\n' {
+            let line = buf[consumed..scan].trim_end_matches(['\r', '\n']);
+            if tx.send((epoch, line.to_string())).is_err() { return consumed; }
+            consumed = scan + 1;
+        }
+        scan += 1;
+    }
+    consumed
 }
 
 pub fn pick_local_encoding(locale: &str) -> &'static Encoding {
