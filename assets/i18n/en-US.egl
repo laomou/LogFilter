@@ -107,3 +107,15 @@ status_failed_open_dropped = Failed to open dropped file: {e}
 # quick-filter toggles
 bookmarks_only = Bookmarks only
 errors_only = Errors only
+
+# clipboard / save status
+status_clipboard_error = Clipboard error: {e}
+status_copied_row = Copied 1 row
+status_copied_rows = Copied {n} rows
+status_nothing_to_save = Nothing to save
+status_saved = Saved {n} lines → {path}
+status_save_failed = Save failed: {e}
+
+# selection status
+status_ctrl_click = Ctrl+click, selected={n}
+status_shift_click = Shift+click, selected={n}

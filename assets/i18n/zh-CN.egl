@@ -76,6 +76,21 @@ sh_copy_selected = 复制选中行
 about_status = LogFilter — Rust 移植版
 shortcuts_help = F2/F3 书签跳转 · Ctrl/Cmd+F2 切换书签 · Ctrl/Cmd+C 复制行 · Ctrl/Cmd+S 保存 · PageUp/PageDown · Ctrl/Cmd+加减调整字号
 
+# keyboard shortcuts window
+sh_find = 聚焦查找框
+sh_toggle_bookmark = 切换当前行书签
+sh_prev_bookmark = 上一个书签
+sh_next_bookmark = 下一个书签
+sh_copy_row = 复制当前行
+sh_save = 保存过滤结果到文件
+sh_font_size = 增大 / 减小字号
+sh_reset_font = 重置字号
+sh_page_up_down = 向上 / 向下翻页
+sh_double_click_lbl = 双击
+sh_double_click = 切换书签
+sh_alt_click_lbl = Alt+点击
+sh_alt_click = 仅显示此标签 / 排除此标签
+
 # formatted status messages
 status_loaded = 已加载 {path} — {n} 行
 status_adb_started = adb {cmd} 已启动
@@ -92,3 +107,15 @@ status_failed_open_dropped = 打开拖入文件失败: {e}
 # quick-filter toggles
 bookmarks_only = 仅书签
 errors_only = 仅错误
+
+# clipboard / save status
+status_clipboard_error = 剪贴板错误: {e}
+status_copied_row = 已复制 1 行
+status_copied_rows = 已复制 {n} 行
+status_nothing_to_save = 无内容可保存
+status_saved = 已保存 {n} 行 → {path}
+status_save_failed = 保存失败: {e}
+
+# selection status
+status_ctrl_click = Ctrl+点击，已选 {n} 行
+status_shift_click = Shift+点击，已选 {n} 行
