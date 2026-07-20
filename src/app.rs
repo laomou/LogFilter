@@ -199,19 +199,32 @@ impl UiState {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
-        tune_table_visuals(&cc.egui_ctx);
         let cfg = config::load();
+        let mut app = Self::from_ctx(&cc.egui_ctx, cfg, initial_file);
+        // Pre-populate the device combo on startup so the user doesn't have to
+        // click ↻ once before they can pick a device. Skipped in the test-only
+        // constructor since it shells out to adb.
+        app.refresh_devices();
+        app
+    }
+
+    /// Core constructor shared by the production `new` and the test harness.
+    /// Takes an `egui::Context` (not the eframe `CreationContext`) and an
+    /// already-loaded `Config` so tests can inject a default config without
+    /// touching the user's real config file or spawning an adb probe.
+    fn from_ctx(ctx: &egui::Context, cfg: Config, initial_file: Option<PathBuf>) -> Self {
+        tune_table_visuals(ctx);
         init_i18n();
         // Apply the stored language (or auto-detect) at startup.
         resolve_startup_lang(&cfg.view.lang);
         let font_stems = list_user_font_stems();
-        install_ui_font(&cc.egui_ctx, &cfg.view.font, &font_stems);
-        bump_global_text_sizes(&cc.egui_ctx);
+        install_ui_font(ctx, &cfg.view.font, &font_stems);
+        bump_global_text_sizes(ctx);
         // egui defaults Ctrl+= / Ctrl+- / Ctrl+0 to changing the global zoom_factor,
         // which scales the entire UI (menus, toolbar, table). We only want those
         // shortcuts to change the table font size, so disable egui's handler and
         // implement our own in `update()`.
-        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let ui = UiState::from_config(&cfg);
         let shared_filter = Arc::new(RwLock::new(ui.to_filter_spec()));
         // Bounded so a fast file reader can't buffer the whole file as queued
@@ -261,11 +274,8 @@ impl App {
             cached_col_widths: init_col_widths,
             save_result_rx: None,
         };
-        app.spawn_filter_thread(cc.egui_ctx.clone());
-        app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
-        // Pre-populate the device combo on startup so the user doesn't have to
-        // click ↻ once before they can pick a device.
-        app.refresh_devices();
+        app.spawn_filter_thread(ctx.clone());
+        app.spawn_ingest_thread(ctx.clone(), line_rx);
         if let Some(path) = initial_file {
             if let Err(e) = app.open_file(&path) {
                 app.status = format!("Failed to open {}: {}", path.display(), e);
@@ -273,6 +283,14 @@ impl App {
         }
         app.notify_filter();
         app
+    }
+
+    /// Test-only constructor: builds an `App` on the given egui context with a
+    /// default `Config`, skipping config-file I/O and the adb device probe so
+    /// UI tests run hermetically.
+    #[cfg(test)]
+    pub fn new_for_test(ctx: &egui::Context) -> Self {
+        Self::from_ctx(ctx, Config::default(), None)
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
@@ -2356,3 +2374,44 @@ mod tests {
         assert!(lines[1].contains("msg three"), "second line should contain msg three: {lines:?}");
     }
 }
+
+/// UI-level tests driving the real `App::ui` through egui_kittest — no window,
+/// no adb, default config. These cover the interactive layer (menus, panels,
+/// clicks, keyboard) that the plain-function unit tests above can't reach.
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable as _;
+    use egui_kittest::Harness;
+
+    /// Build a kittest `Harness` wrapping a hermetic `App`. `build_eframe` hands
+    /// us a kittest `CreationContext`; we take its egui `Context` and construct
+    /// the `App` via the test-only constructor (default config, no adb probe).
+    /// The harness then drives the real `eframe::App::ui` each `run()`.
+    fn harness<'a>() -> Harness<'a, App> {
+        Harness::builder()
+            .with_size(egui::vec2(1350.0, 720.0))
+            .build_eframe(|cc| App::new_for_test(&cc.egui_ctx))
+    }
+
+    #[test]
+    fn options_panel_renders_and_bookmarks_toggle_flips_state() {
+        let mut h = harness();
+        // First frame lays out the whole UI.
+        h.run();
+
+        // The "Bookmarks only" quick-filter checkbox should be present and off.
+        assert!(!h.state().ui.bookmarks_only, "starts unchecked");
+
+        // Click it; a follow-up frame applies the toggle.
+        let label = tr!("bookmarks_only");
+        h.get_by_label(label.as_str()).click();
+        h.run();
+
+        assert!(
+            h.state().ui.bookmarks_only,
+            "clicking 'Bookmarks only' should set ui.bookmarks_only = true"
+        );
+    }
+}
+
