@@ -71,7 +71,7 @@ type Span = (u32, u32);
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     raw: Box<str>,
-    pub line_no: u32,
+    pub line_no: u64,
     pub level: LevelMask,
     date: Span,
     time: Span,
@@ -93,7 +93,7 @@ impl LogEntry {
         tag: Span,
         message: Span,
     ) -> Self {
-        Self { raw, line_no: 0, level, date, time, pid, tid, tag, message }
+        Self { raw, line_no: 0u64, level, date, time, pid, tid, tag, message }
     }
 
     #[inline]
@@ -128,7 +128,7 @@ impl LogEntry {
         let i = push(&mut raw, tid);
         let g = push(&mut raw, tag);
         let m = push(&mut raw, message);
-        Self { raw: raw.into_boxed_str(), line_no: 1, level, date: d, time: t, pid: p, tid: i, tag: g, message: m }
+        Self { raw: raw.into_boxed_str(), line_no: 1u64, level, date: d, time: t, pid: p, tid: i, tag: g, message: m }
     }
 }
 
@@ -168,9 +168,9 @@ impl Model {
     }
 
     pub fn append(&mut self, mut entry: LogEntry) {
-        entry.line_no = (self.entries.len() as u32) + 1;
+        entry.line_no = (self.entries.len() as u64) + 1;
         if entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F) {
-            self.error_lines.push(entry.line_no - 1);
+            self.error_lines.push(entry.line_no as u32 - 1);
         }
         // Bump per-value counts. Clone the key only when it's a new distinct
         // value (cardinality is tiny), not once per line.

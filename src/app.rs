@@ -77,6 +77,8 @@ pub struct App {
     cached_shortcut_rows: Vec<EmptyShortcutRow>,
     /// Column widths mirrored from the table each frame; persisted to config on exit.
     cached_col_widths: [f32; 9],
+    /// Pending result from a background save_filtered() operation.
+    save_result_rx: Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
 
 }
 
@@ -252,6 +254,7 @@ impl App {
             cached_picker_entries_len: 0,
             cached_shortcut_rows: empty_shortcut_rows(),
             cached_col_widths: init_col_widths,
+            save_result_rx: None,
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -268,10 +271,10 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
-        // Validate access synchronously so the common errors (missing file, no
-        // permission) are still reported inline; the heavy read+decode+parse is
-        // moved off the UI thread below.
-        let _ = std::fs::File::open(path)?;
+        // Open the file here to validate access and hold the handle through the
+        // background load — avoids TOCTOU (open-to-use race) and eliminates the
+        // duplicate open in the reader thread.
+        let file = std::fs::File::open(path)?;
 
         // Stop any adb session so its lines don't interleave with the file.
         self.adb_stop();
@@ -302,12 +305,11 @@ impl App {
         let tx = self.line_tx.clone();
         let source_epoch = self.source_epoch.clone();
         let choice = self.encoding_choice();
-        let path = path.to_path_buf();
         thread::Builder::new()
             .name("file-load".into())
             .spawn(move || match choice {
-                EncodingChoice::Utf8 => send_utf8_lines(&path, tx, epoch, source_epoch),
-                EncodingChoice::Local => send_decoded_lines(&path, tx, epoch, source_epoch, choice),
+                EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
+                EncodingChoice::Local => send_decoded_lines(file, tx, epoch, source_epoch, choice),
             })?;
         Ok(())
     }
@@ -559,26 +561,40 @@ impl App {
             .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
-        let res = (|| -> Result<(), std::io::Error> {
-            use std::io::{BufWriter, Write};
-            let f = std::fs::File::create(&dest)?;
-            let mut w = BufWriter::new(f);
-            for &ei in &m.filtered {
+
+        // Snapshot the filtered entries so the background thread doesn't need
+        // to hold the model lock while writing (which could block the UI).
+        let rows: Vec<(u64, String, String, char, String, String, String, String)> = m.filtered
+            .iter()
+            .map(|&ei| {
                 let e = &m.entries[ei as usize];
-                writeln!(
-                    w,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    e.line_no, e.date(), e.time(), e.level.as_char(),
-                    e.pid(), e.tid(), e.tag(), e.message(),
-                )?;
-            }
-            w.flush()?;
-            Ok(())
-        })();
-        match res {
-            Ok(()) => self.status = tr!("status_saved", { n: &m.filtered.len().to_string(), path: &dest.display().to_string() }),
-            Err(e) => self.status = tr!("status_save_failed", { e: &format!("{e}") }),
-        }
+                (e.line_no, e.date().to_string(), e.time().to_string(),
+                 e.level.as_char(), e.pid().to_string(), e.tid().to_string(),
+                 e.tag().to_string(), e.message().to_string())
+            })
+            .collect();
+        drop(m);
+
+        let n = rows.len();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.save_result_rx = Some(rx);
+        thread::Builder::new().name("save-filtered".into()).spawn(move || {
+            let res = (|| -> Result<(), std::io::Error> {
+                use std::io::{BufWriter, Write};
+                let f = std::fs::File::create(&dest)?;
+                let mut w = BufWriter::new(f);
+                for (line_no, date, time, lv, pid, tid, tag, msg) in &rows {
+                    writeln!(w, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", line_no, date, time, lv, pid, tid, tag, msg)?;
+                }
+                w.flush()?;
+                Ok(())
+            })();
+            let result = match res {
+                Ok(()) => Ok((n, dest)),
+                Err(e) => Err(format!("{e}")),
+            };
+            let _ = tx.send(result);
+        }).expect("spawn save thread");
     }
 
     /// Alt+left-click on a Tag cell → "only this tag".
@@ -679,7 +695,7 @@ impl App {
                     let m = model.read().unwrap();
                     let hi = end.min(m.entries.len());
                     for j in i..hi {
-                        if spec.matches(&m.entries[j], &m.bookmarks) {
+                        if spec.matches(&m.entries[j], j as u32, &m.bookmarks) {
                             out.push(j as u32);
                         }
                     }
@@ -1395,6 +1411,22 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         // Capture window inner size each frame so we can persist it on exit.
         self.last_window_size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
+
+        // Poll background save result.
+        if let Some(rx) = &self.save_result_rx {
+            match rx.try_recv() {
+                Ok(Ok((n, path))) => {
+                    self.status = tr!("status_saved", { n: &n.to_string(), path: &path.display().to_string() });
+                    self.save_result_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.status = tr!("status_save_failed", { e: &e });
+                    self.save_result_rx = None;
+                }
+                Err(_) => {} // still in progress
+            }
+        }
+
         self.handle_shortcuts(&ctx);
         self.ui_menu_bar(ui);
         self.ui_options_panel(ui);
@@ -2231,7 +2263,8 @@ mod tests {
 
         let (tx, rx) = bounded(8);
         let source_epoch = Arc::new(AtomicU64::new(42));
-        send_utf8_lines(&path, tx, 42, source_epoch);
+        let file = std::fs::File::open(&path).unwrap();
+        send_utf8_lines(file, tx, 42, source_epoch);
         let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
 
         let _ = std::fs::remove_file(path);

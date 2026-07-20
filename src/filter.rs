@@ -28,7 +28,7 @@ impl FilterSpec {
             .collect()
     }
 
-    pub fn matches(&self, entry: &LogEntry, bookmarks: &HashSet<u32>) -> bool {
+    pub fn matches(&self, entry: &LogEntry, entry_idx: u32, bookmarks: &HashSet<u32>) -> bool {
         if let Some(mask) = self.allowed_levels {
             if !mask.intersects(entry.level) {
                 return false;
@@ -49,7 +49,7 @@ impl FilterSpec {
                 return false;
             }
         }
-        if self.bookmarks_only && !bookmarks.contains(&(entry.line_no - 1)) {
+        if self.bookmarks_only && !bookmarks.contains(&entry_idx) {
             return false;
         }
         if self.errors_only && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F)) {
@@ -116,20 +116,20 @@ mod tests {
     fn level_mask_filters() {
         let spec = FilterSpec { allowed_levels: Some(LevelMask::E), ..FilterSpec::default() };
         let hs = HashSet::new();
-        assert!(spec.matches(&e("x", "T", LevelMask::E), &hs));
-        assert!(!spec.matches(&e("x", "T", LevelMask::D), &hs));
+        assert!(spec.matches(&e("x", "T", LevelMask::E), 0, &hs));
+        assert!(!spec.matches(&e("x", "T", LevelMask::D), 0, &hs));
     }
 
     #[test]
     fn find_or_remove() {
         let spec = FilterSpec { find: vec!["hello".into()], ..FilterSpec::default() };
         let hs = HashSet::new();
-        assert!(spec.matches(&e("Hello world", "T", LevelMask::I), &hs));
-        assert!(!spec.matches(&e("bye", "T", LevelMask::I), &hs));
+        assert!(spec.matches(&e("Hello world", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("bye", "T", LevelMask::I), 0, &hs));
 
         let spec = FilterSpec { remove: vec!["spam".into()], ..FilterSpec::default() };
-        assert!(!spec.matches(&e("spam here", "T", LevelMask::I), &hs));
-        assert!(spec.matches(&e("clean", "T", LevelMask::I), &hs));
+        assert!(!spec.matches(&e("spam here", "T", LevelMask::I), 0, &hs));
+        assert!(spec.matches(&e("clean", "T", LevelMask::I), 0, &hs));
     }
 
     #[test]
@@ -155,8 +155,8 @@ mod tests {
         set.insert("1".to_string());
         spec.allowed_pids = Some(set);
         let hs = HashSet::new();
-        assert!(spec.matches(&e("m", "T", LevelMask::I), &hs));
+        assert!(spec.matches(&e("m", "T", LevelMask::I), 0, &hs));
         let other = LogEntry::from_fields("", "", LevelMask::I, "99", "1", "T", "m");
-        assert!(!spec.matches(&other, &hs));
+        assert!(!spec.matches(&other, 0, &hs));
     }
 }
