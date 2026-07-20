@@ -106,6 +106,10 @@ pub struct UiState {
 
     pub goto_line: String,
 
+    // Quick-filter toggles
+    pub bookmarks_only: bool,
+    pub errors_only: bool,
+
     // Picker panel state (open only when Some).
     pub picker: Option<PickerState>,
 }
@@ -154,6 +158,8 @@ impl UiState {
             col_tag: true,
             col_message: true,
             goto_line: String::new(),
+            bookmarks_only: false,
+            errors_only: false,
             picker: None,
         }
     }
@@ -166,8 +172,8 @@ impl UiState {
             allowed_tags: self.allowed_tags.clone(),
             find: if self.find_on { FilterSpec::tokens(&self.find) } else { vec![] },
             remove: if self.remove_on { FilterSpec::tokens(&self.remove) } else { vec![] },
-            bookmarks_only: false,
-            errors_only: false,
+            bookmarks_only: self.bookmarks_only,
+            errors_only: self.errors_only,
         }
     }
 
@@ -468,26 +474,31 @@ impl App {
         if self.selected_rows.is_empty() { return; }
         let text = self.copy_selected_rows_text();
         let n = text.lines().count();
+        self.copy_text_to_clipboard(&text, n);
+    }
+
+    /// Copy `text` to the system clipboard and set the status bar accordingly.
+    fn copy_text_to_clipboard(&mut self, text: &str, n: usize) {
         match arboard::Clipboard::new() {
             Ok(mut c) => {
-                if let Err(e) = c.set_text(&text) {
-                    self.status = format!("Clipboard error: {e}");
+                if let Err(e) = c.set_text(text) {
+                    self.status = tr!("status_clipboard_error", { e: &format!("{e}") });
                 } else {
                     self.status = if n > 1 {
-                        format!("Copied {n} rows")
+                        tr!("status_copied_rows", { n: &n.to_string() })
                     } else {
-                        "Copied 1 row".into()
+                        tr!("status_copied_row")
                     };
                 }
             }
-            Err(e) => self.status = format!("Clipboard error: {e}"),
+            Err(e) => self.status = tr!("status_clipboard_error", { e: &format!("{e}") }),
         }
     }
 
     fn save_filtered(&mut self) {
         let m = self.model.read().unwrap();
         if m.filtered.is_empty() && m.entries.is_empty() {
-            self.status = "Nothing to save".into();
+            self.status = tr!("status_nothing_to_save");
             return;
         }
         let default_name = format!(
@@ -515,8 +526,8 @@ impl App {
             Ok(())
         })();
         match res {
-            Ok(()) => self.status = format!("Saved {} lines → {}", m.filtered.len(), dest.display()),
-            Err(e) => self.status = format!("Save failed: {}", e),
+            Ok(()) => self.status = tr!("status_saved", { n: &m.filtered.len().to_string(), path: &dest.display().to_string() }),
+            Err(e) => self.status = tr!("status_save_failed", { e: &format!("{e}") }),
         }
     }
 
@@ -1570,6 +1581,9 @@ impl App {
                 dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight)
                     .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(text_w)).changed();
+                ui.separator();
+                dirty |= ui.checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only")).changed();
+                dirty |= ui.checkbox(&mut self.ui.errors_only, tr!("errors_only")).changed();
             });
 
             // Row 3: adb toolbar + Goto + Auto-scroll
@@ -2063,14 +2077,14 @@ impl App {
                     } else {
                         self.selected_rows.insert(r);
                     }
-                    self.status = format!("Ctrl+click, selected={}", self.selected_rows.len());
+                    self.status = tr!("status_ctrl_click", { n: &self.selected_rows.len().to_string() });
                 } else if shift {
                     // Use the stored anchor (fixed end), not an arbitrary HashSet element.
                     let anchor = self.selection_anchor.unwrap_or(r);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
                     self.selection_cursor = Some(r);
-                    self.status = format!("Shift+click, selected={}", self.selected_rows.len());
+                    self.status = tr!("status_shift_click", { n: &self.selected_rows.len().to_string() });
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
@@ -2090,13 +2104,7 @@ impl App {
             if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
             if let Some(txt) = copy_cell_text {
                 let n = txt.lines().count();
-                match arboard::Clipboard::new() {
-                    Ok(mut c) => {
-                        let _ = c.set_text(&txt);
-                        self.status = if n > 1 { format!("Copied {n} rows") } else { "Copied 1 row".into() };
-                    }
-                    Err(e) => self.status = format!("Clipboard error: {e}"),
-                }
+                self.copy_text_to_clipboard(&txt, n);
             }
 
             // Hide column requested from column-header context menu.
