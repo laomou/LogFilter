@@ -1,26 +1,27 @@
 use crate::model::EncodingChoice;
 use crossbeam_channel::Sender;
 use encoding_rs::Encoding;
+use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub fn send_utf8_lines(
-    path: &Path,
+    file: File,
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
 ) {
-    let Ok(file) = std::fs::File::open(path) else { return; };
     let mut reader = BufReader::new(file);
     let bom = match reader.fill_buf() {
         Ok(buf) => buf,
         Err(_) => return,
     };
     if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
-        drop(reader);
-        send_decoded_lines(path, tx, epoch, source_epoch, EncodingChoice::Utf8);
+        // UTF-16 BOM detected: re-open is not needed since we have the handle.
+        // Reconstruct the file from the reader and decode as UTF-16.
+        let file2 = reader.into_inner();
+        send_decoded_lines(file2, tx, epoch, source_epoch, EncodingChoice::Utf8);
         return;
     }
 
@@ -53,7 +54,7 @@ pub fn send_utf8_lines(
 }
 
 pub fn send_decoded_lines(
-    path: &Path,
+    file: File,
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
@@ -66,7 +67,6 @@ pub fn send_decoded_lines(
             pick_local_encoding(&locale)
         }
     };
-    let Ok(file) = std::fs::File::open(path) else { return; };
     let mut reader = BufReader::with_capacity(8192, file);
     let mut decoder = enc.new_decoder();
     // Accumulate decoded text across chunks so we can split into lines only when
