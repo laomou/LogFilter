@@ -106,6 +106,10 @@ pub struct UiState {
 
     pub goto_line: String,
 
+    // Quick-filter toggles
+    pub bookmarks_only: bool,
+    pub errors_only: bool,
+
     // Picker panel state (open only when Some).
     pub picker: Option<PickerState>,
 }
@@ -154,6 +158,8 @@ impl UiState {
             col_tag: true,
             col_message: true,
             goto_line: String::new(),
+            bookmarks_only: false,
+            errors_only: false,
             picker: None,
         }
     }
@@ -166,8 +172,8 @@ impl UiState {
             allowed_tags: self.allowed_tags.clone(),
             find: if self.find_on { FilterSpec::tokens(&self.find) } else { vec![] },
             remove: if self.remove_on { FilterSpec::tokens(&self.remove) } else { vec![] },
-            bookmarks_only: false,
-            errors_only: false,
+            bookmarks_only: self.bookmarks_only,
+            errors_only: self.errors_only,
         }
     }
 
@@ -1570,6 +1576,9 @@ impl App {
                 dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight)
                     .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
                     .desired_width(text_w)).changed();
+                ui.separator();
+                dirty |= ui.checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only")).changed();
+                dirty |= ui.checkbox(&mut self.ui.errors_only, tr!("errors_only")).changed();
             });
 
             // Row 3: adb toolbar + Goto + Auto-scroll

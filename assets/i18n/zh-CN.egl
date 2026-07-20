@@ -88,3 +88,7 @@ status_adb_devices_zero = 无设备
 status_adb_devices_failed = adb 设备列表失败: {e}
 status_failed_open = 打开失败: {e}
 status_failed_open_dropped = 打开拖入文件失败: {e}
+
+# quick-filter toggles
+bookmarks_only = 仅书签
+errors_only = 仅错误
