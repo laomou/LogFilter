@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::thread;
 
@@ -102,10 +102,12 @@ impl Session {
         if let Some(d) = device {
             command.arg("-s").arg(d);
         }
-        for tok in cmd.split_whitespace() {
+        // Split the command string respecting shell quoting (e.g. `logcat -s "My Tag"`).
+        // Falls back to simple whitespace split if the string is not valid shell syntax.
+        let args = shlex::split(cmd).unwrap_or_else(|| cmd.split_whitespace().map(str::to_string).collect());
+        for tok in args {
             command.arg(tok);
         }
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()
             .map_err(|e| anyhow!("failed to spawn adb: {} (is adb on PATH?)", e))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
