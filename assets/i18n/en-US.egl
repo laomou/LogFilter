@@ -101,6 +101,9 @@ status_adb_resumed = adb resumed
 status_adb_devices = adb devices: {n} device(s)
 status_adb_devices_zero = no devices
 status_adb_devices_failed = adb devices failed: {e}
+status_adb_ended = adb session ended
+status_adb_ended_err = adb session ended: {e}
+status_load_truncated = File load truncated by a read error: {e}
 status_failed_open = Failed to open: {e}
 status_failed_open_dropped = Failed to open dropped file: {e}
 

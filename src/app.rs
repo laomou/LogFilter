@@ -79,6 +79,10 @@ pub struct App {
     cached_col_widths: [f32; 9],
     /// Pending result from a background save_filtered() operation.
     save_result_rx: Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
+    /// Set by the background file-load thread when a mid-stream read error
+    /// truncates a load, so the UI can tell the user the file loaded only
+    /// partially instead of silently presenting it as complete.
+    load_error: Arc<Mutex<Option<String>>>,
 
 }
 
@@ -260,6 +264,7 @@ impl App {
             cached_shortcut_rows: empty_shortcut_rows(),
             cached_col_widths: init_col_widths,
             save_result_rx: None,
+            load_error: Arc::new(Mutex::new(None)),
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -300,6 +305,7 @@ impl App {
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
+        self.reset_column_filters();
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -310,11 +316,24 @@ impl App {
         let tx = self.line_tx.clone();
         let source_epoch = self.source_epoch.clone();
         let choice = self.encoding_choice();
+        let load_error = self.load_error.clone();
+        let src = path.display().to_string();
+        // Clear any error from a previous load before starting this one.
+        *self.load_error.lock().unwrap() = None;
         thread::Builder::new()
             .name("file-load".into())
-            .spawn(move || match choice {
-                EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
-                EncodingChoice::Local => send_decoded_lines(file, tx, epoch, source_epoch, choice),
+            .spawn(move || {
+                let res = match choice {
+                    EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
+                    EncodingChoice::Local => send_decoded_lines(file, tx, epoch, source_epoch, choice),
+                };
+                if let Err(e) = res {
+                    // A mid-stream read error truncated the load; record it so
+                    // the UI surfaces "partially loaded" rather than silence.
+                    if let Ok(mut slot) = load_error.lock() {
+                        *slot = Some(format!("{src}: {e}"));
+                    }
+                }
             })?;
         Ok(())
     }
@@ -326,8 +345,25 @@ impl App {
         }
     }
 
-    fn notify_filter(&self) {
+    fn notify_filter(&mut self) {
+        // A filter-spec change rebuilds `filtered` (asynchronously, on the filter
+        // thread), so the current selection positions — which index into the OLD
+        // `filtered` — become meaningless. Clear them rather than let stale/out-of
+        // -range indices repoint at unrelated rows (wrong Ctrl+C / F2 target) or
+        // inflate the "Selected N" status count.
+        self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
         *self.shared_filter.write().unwrap() = self.ui.to_filter_spec();
+        self.refilter();
+    }
+
+    /// Bump the filter generation and wake the filter thread to recompute
+    /// `filtered` from scratch, WITHOUT clearing the selection or rewriting the
+    /// shared spec. Used when the underlying data a filter depends on changed
+    /// but the spec itself didn't — e.g. a bookmark toggled while the
+    /// "bookmarks only" filter is active.
+    fn refilter(&self) {
         self.gen.fetch_add(1, Ordering::AcqRel);
         let (lock, cvar) = &*self.wake;
         *lock.lock().unwrap() = true;
@@ -450,6 +486,7 @@ impl App {
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
+        self.reset_column_filters();
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
@@ -494,6 +531,19 @@ impl App {
         self.selection_anchor = None;
         self.selection_cursor = None;
         self.notify_filter();
+    }
+
+    /// Reset the value-based column-picker filters (PID/TID/tag/level). These
+    /// hold literal string/level values captured from one source; carrying them
+    /// into a different file or adb session silently filters the new data by
+    /// unrelated values (often leaving a blank table with no visible cause).
+    /// Text filters (find/remove/highlight) are content patterns and are kept.
+    fn reset_column_filters(&mut self) {
+        self.ui.allowed_pids = None;
+        self.ui.allowed_tids = None;
+        self.ui.allowed_tags = None;
+        self.ui.disallowed_tags.clear();
+        self.ui.allowed_levels = None;
     }
 
     fn copy_selected_rows_text(&self) -> String {
@@ -744,11 +794,19 @@ impl App {
     }
 
     fn toggle_bookmark(&mut self, entry_idx: u32) {
-        let mut m = self.model.write().unwrap();
-        if m.bookmarks.contains(&entry_idx) {
-            m.bookmarks.remove(&entry_idx);
-        } else {
-            m.bookmarks.insert(entry_idx);
+        {
+            let mut m = self.model.write().unwrap();
+            if m.bookmarks.contains(&entry_idx) {
+                m.bookmarks.remove(&entry_idx);
+            } else {
+                m.bookmarks.insert(entry_idx);
+            }
+        }
+        // When the "bookmarks only" filter is active, the set of matching rows
+        // just changed, so the filtered view must be recomputed — otherwise an
+        // unbookmarked row lingers (or a newly bookmarked one stays hidden).
+        if self.ui.bookmarks_only {
+            self.refilter();
         }
     }
 
@@ -1439,7 +1497,34 @@ impl eframe::App for App {
                     self.status = tr!("status_save_failed", { e: &e });
                     self.save_result_rx = None;
                 }
-                Err(_) => {} // still in progress
+                Err(crossbeam_channel::TryRecvError::Empty) => {} // still in progress
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // The save thread dropped its sender without sending a result
+                    // (it panicked). Surface a failure rather than spin forever
+                    // treating it as "in progress".
+                    self.status = tr!("status_save_failed", { e: &"save thread terminated unexpectedly".to_string() });
+                    self.save_result_rx = None;
+                }
+            }
+        }
+
+        // Surface a truncated file load (mid-stream read error) once.
+        if let Some(msg) = self.load_error.lock().unwrap().take() {
+            self.status = tr!("status_load_truncated", { e: &msg });
+        }
+
+        // Detect an adb session that ended on its own (device unplugged, adb
+        // exited, bad command) so the UI stops showing it as live and surfaces
+        // any captured stderr instead of a silently frozen stream.
+        if let Some(s) = &self.adb_session {
+            if s.has_ended() {
+                let err = s.stderr_text();
+                self.adb_session = None;
+                self.status = if err.is_empty() {
+                    tr!("status_adb_ended")
+                } else {
+                    tr!("status_adb_ended_err", { e: &err })
+                };
             }
         }
 
@@ -1468,7 +1553,12 @@ impl eframe::App for App {
             self.cfg.window.height = size.y;
         }
         self.cfg.view.columns = self.cached_col_widths;
-        let _ = config::save(&self.cfg);
+        // On exit there's no UI left to surface a status, but a failed save
+        // silently loses the user's window size / filters / column widths /
+        // recent files. Log it so it's at least diagnosable rather than invisible.
+        if let Err(e) = config::save(&self.cfg) {
+            eprintln!("logfilter: failed to save config on exit: {e}");
+        }
     }
 }
 
@@ -1744,6 +1834,11 @@ impl App {
                 self.pending_scroll = Some(pos);
                 self.selected_rows.clear();
                 self.selected_rows.insert(pos);
+                // Anchor/cursor must follow the jump too, or subsequent Arrow /
+                // Shift+Arrow navigation moves from the stale previous position
+                // instead of the row the user just jumped to.
+                self.selection_anchor = Some(pos);
+                self.selection_cursor = Some(pos);
             }
         }
     }
@@ -2197,8 +2292,14 @@ impl App {
                     }
                     self.status = tr!("status_ctrl_click", { n: &self.selected_rows.len().to_string() });
                 } else if shift {
-                    // Use the stored anchor (fixed end), not an arbitrary HashSet element.
-                    let anchor = self.selection_anchor.unwrap_or(r);
+                    // Use the stored anchor (fixed end), not an arbitrary HashSet
+                    // element. Clamp it to the current filtered length so a stale
+                    // anchor can never expand the range past the visible rows
+                    // (mirrors the keyboard extend_selection clamp).
+                    let len = self.model.read().unwrap().filtered.len();
+                    let max = len.saturating_sub(1);
+                    let anchor = self.selection_anchor.unwrap_or(r).min(max);
+                    let r = r.min(max);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
                     for i in lo..=hi { self.selected_rows.insert(i); }
                     self.selection_cursor = Some(r);
@@ -2280,7 +2381,7 @@ mod tests {
         let (tx, rx) = bounded(8);
         let source_epoch = Arc::new(AtomicU64::new(42));
         let file = std::fs::File::open(&path).unwrap();
-        send_utf8_lines(file, tx, 42, source_epoch);
+        send_utf8_lines(file, tx, 42, source_epoch).expect("clean read should return Ok");
         let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
 
         let _ = std::fs::remove_file(path);
