@@ -1246,6 +1246,8 @@ fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
         (tr!("shortcut_bookmarks"), format!("F3 - {}", tr!("sh_next_bookmark"))),
         (tr!("shortcut_line"), format!("Ctrl/Cmd+C - {}", tr!("sh_copy_selected"))),
         (tr!("shortcut_line"), format!("PageUp / PageDown - {}", tr!("sh_page_up_down"))),
+        (tr!("shortcut_line"), format!("{} - {}", tr!("sh_double_click_lbl"), tr!("sh_double_click"))),
+        (tr!("shortcut_line"), format!("{} - {}", tr!("sh_alt_click_lbl"), tr!("sh_alt_click"))),
         (tr!("shortcut_font"), format!("Ctrl/Cmd+Plus / Ctrl/Cmd+Minus - {}", tr!("sh_font_size"))),
         (tr!("shortcut_font"), format!("Ctrl/Cmd+0 - {}", tr!("sh_reset_font"))),
     ];
