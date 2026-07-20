@@ -4,6 +4,7 @@ use crate::filter::FilterSpec;
 use crate::io::{send_decoded_lines, send_utf8_lines};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::{parse_line_hinted};
+use crate::lock::{MutexExt, RwLockExt};
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use anyhow::Result;
 use egui_i18n::tr;
@@ -293,12 +294,12 @@ impl App {
         // from a previous load/adb are dropped by the ingest thread. Write the
         // format hint first so the ingest thread never reads a stale hint for
         // this epoch.
-        *self.source_format_hint.lock().unwrap() = LogFormat::Unknown;
+        *self.source_format_hint.lock_recover() = LogFormat::Unknown;
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Reset the model synchronously (cheap) and let lines stream in.
         {
-            let mut model = self.model.write().unwrap();
+            let mut model = self.model.write_recover();
             model.clear();
             model.file_path = Some(path.to_path_buf());
         }
@@ -319,7 +320,7 @@ impl App {
         let load_error = self.load_error.clone();
         let src = path.display().to_string();
         // Clear any error from a previous load before starting this one.
-        *self.load_error.lock().unwrap() = None;
+        *self.load_error.lock_recover() = None;
         thread::Builder::new()
             .name("file-load".into())
             .spawn(move || {
@@ -354,7 +355,7 @@ impl App {
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
-        *self.shared_filter.write().unwrap() = self.ui.to_filter_spec();
+        *self.shared_filter.write_recover() = self.ui.to_filter_spec();
         self.refilter();
     }
 
@@ -366,7 +367,7 @@ impl App {
     fn refilter(&self) {
         self.gen.fetch_add(1, Ordering::AcqRel);
         let (lock, cvar) = &*self.wake;
-        *lock.lock().unwrap() = true;
+        *lock.lock_recover() = true;
         cvar.notify_one();
     }
 
@@ -418,12 +419,12 @@ impl App {
                 let cur = source_epoch.load(Ordering::Acquire);
                 // Refresh hint on epoch change (new file or adb command).
                 if cur != hint_epoch {
-                    hint = *source_format_hint.lock().unwrap();
+                    hint = *source_format_hint.lock_recover();
                     hint_epoch = cur;
                 }
                 let mut appended = false;
                 {
-                    let mut m = model.write().unwrap();
+                    let mut m = model.write_recover();
                     for (ep, line) in batch.drain(..) {
                         if ep != cur { continue; }
                         let (entry, fmt) = parse_line_hinted(line, hint);
@@ -441,7 +442,7 @@ impl App {
                     // do NOT bump `gen` — that's reserved for filter-spec changes,
                     // which force a full recompute (see spawn_filter_thread).
                     let (lock, cvar) = &*wake;
-                    *lock.lock().unwrap() = true;
+                    *lock.lock_recover() = true;
                     cvar.notify_one();
                     ctx.request_repaint();
                 }
@@ -473,14 +474,14 @@ impl App {
         self.adb_stop();
         // Write the format hint before bumping the epoch so the ingest thread
         // never races between seeing the new epoch and reading a stale hint.
-        *self.source_format_hint.lock().unwrap() = detect_format_from_cmd(&self.selected_cmd);
+        *self.source_format_hint.lock_recover() = detect_format_from_cmd(&self.selected_cmd);
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         // A fresh run starts from an empty table — clear any entries left from a
         // previous run/file (mirrors the file-load path). The epoch bump above
         // already ensures stale queued lines are dropped by the ingest thread.
         {
-            let mut model = self.model.write().unwrap();
+            let mut model = self.model.write_recover();
             model.clear();
         }
         self.selected_rows.clear();
@@ -524,7 +525,7 @@ impl App {
 
     fn clear(&mut self) {
         {
-            let mut m = self.model.write().unwrap();
+            let mut m = self.model.write_recover();
             m.clear();
         }
         self.selected_rows.clear();
@@ -547,7 +548,7 @@ impl App {
     }
 
     fn copy_selected_rows_text(&self) -> String {
-        let m = self.model.read().unwrap();
+        let m = self.model.read_recover();
         let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
         rows.sort();
         let texts: Vec<String> = rows.iter().filter_map(|&&r| {
@@ -603,7 +604,7 @@ impl App {
     }
 
     fn save_filtered(&mut self) {
-        let m = self.model.read().unwrap();
+        let m = self.model.read_recover();
         if m.filtered.is_empty() && m.entries.is_empty() {
             self.status = tr!("status_nothing_to_save");
             return;
@@ -717,17 +718,21 @@ impl App {
             let mut last_spec_gen: u64 = u64::MAX;
             let mut processed_len: usize = 0;
             loop {
-                let mut pending = lock.lock().unwrap();
+                let mut pending = lock.lock_recover();
                 while !*pending {
-                    let (p, _) = cvar.wait_timeout(pending, Duration::from_secs(60)).unwrap();
+                    // Recover the guard on poisoning rather than crashing the
+                    // filter thread if another thread panicked while holding it.
+                    let (p, _) = cvar
+                        .wait_timeout(pending, Duration::from_secs(60))
+                        .unwrap_or_else(|e| e.into_inner());
                     pending = p;
                 }
                 *pending = false;
                 drop(pending);
 
                 let spec_gen = gen.load(Ordering::Acquire);
-                let spec = spec_lock.read().unwrap().clone();
-                let entries_len = model.read().unwrap().entries.len();
+                let spec = spec_lock.read_recover().clone();
+                let entries_len = model.read_recover().entries.len();
 
                 let full = spec_gen != last_spec_gen || entries_len < processed_len;
                 let start = if full { 0 } else { processed_len };
@@ -748,7 +753,7 @@ impl App {
                         break;
                     }
                     let end = (i + CHUNK).min(entries_len);
-                    let m = model.read().unwrap();
+                    let m = model.read_recover();
                     let hi = end.min(m.entries.len());
                     for j in i..hi {
                         if spec.matches(&m.entries[j], j as u32, &m.bookmarks) {
@@ -773,7 +778,7 @@ impl App {
                 // Commit under the write lock, re-validating against a clear that
                 // could have landed since we snapshotted `entries_len` — otherwise
                 // `filtered` could hold indices past the end of a shrunk log.
-                let mut m = model.write().unwrap();
+                let mut m = model.write_recover();
                 if gen.load(Ordering::Acquire) != spec_gen || m.entries.len() < entries_len {
                     drop(m);
                     processed_len = 0;
@@ -795,7 +800,7 @@ impl App {
 
     fn toggle_bookmark(&mut self, entry_idx: u32) {
         {
-            let mut m = self.model.write().unwrap();
+            let mut m = self.model.write_recover();
             if m.bookmarks.contains(&entry_idx) {
                 m.bookmarks.remove(&entry_idx);
             } else {
@@ -812,7 +817,7 @@ impl App {
 
     fn toggle_selected_bookmark(&mut self) {
         let entries: Vec<u32> = {
-            let m = self.model.read().unwrap();
+            let m = self.model.read_recover();
             self.selected_rows.iter().filter_map(|&r| m.filtered.get(r).copied()).collect()
         };
         for entry_idx in entries {
@@ -831,7 +836,7 @@ impl App {
     }
 
     fn page_selected_row(&mut self, forward: bool) {
-        let len = self.model.read().unwrap().filtered.len();
+        let len = self.model.read_recover().filtered.len();
         let anchor = self.selected_rows.iter().next().copied();
         let Some(row) = page_row(anchor, len, self.visible_table_rows, forward) else {
             return;
@@ -841,7 +846,7 @@ impl App {
 
     /// Move selection by `delta` rows (±1) and update the selection anchor.
     fn move_selected_row(&mut self, delta: isize) {
-        let m = self.model.read().unwrap();
+        let m = self.model.read_recover();
         let len = m.filtered.len();
         if len == 0 {
             return;
@@ -862,7 +867,7 @@ impl App {
 
     /// Extend the selection range from `selection_anchor` by `delta` rows (±1).
     fn extend_selection(&mut self, delta: isize) {
-        let m = self.model.read().unwrap();
+        let m = self.model.read_recover();
         let len = m.filtered.len();
         if len == 0 {
             return;
@@ -996,7 +1001,7 @@ impl App {
     }
 
     fn jump_bookmark(&mut self, forward: bool) {
-        let m = self.model.read().unwrap();
+        let m = self.model.read_recover();
         if m.filtered.is_empty() { return; }
         let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
         let indices: Vec<usize> = (0..m.filtered.len())
@@ -1044,7 +1049,7 @@ impl App {
         // entries were appended (entries.len() differs). This avoids a full
         // clone+sort per frame while the picker is open.
         {
-            let m = self.model.read().unwrap();
+            let m = self.model.read_recover();
             let entries_len = m.entries.len();
             if self.cached_picker_col != Some(picker.col) || self.cached_picker_entries_len != entries_len {
                 self.cached_picker_options = Self::build_sorted_options(&m, picker.col);
@@ -1509,7 +1514,7 @@ impl eframe::App for App {
         }
 
         // Surface a truncated file load (mid-stream read error) once.
-        if let Some(msg) = self.load_error.lock().unwrap().take() {
+        if let Some(msg) = self.load_error.lock_recover().take() {
             self.status = tr!("status_load_truncated", { e: &msg });
         }
 
@@ -1829,7 +1834,7 @@ impl App {
         });
         if dirty { self.notify_filter(); }
         if let Some(row) = goto_target {
-            let m = self.model.read().unwrap();
+            let m = self.model.read_recover();
             if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
                 self.pending_scroll = Some(pos);
                 self.selected_rows.clear();
@@ -1846,7 +1851,7 @@ impl App {
     fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
-            let model = self.model.read().unwrap();
+            let model = self.model.read_recover();
             ui.horizontal(|ui| {
                 match &model.file_path {
                     Some(p) => {
@@ -1895,7 +1900,7 @@ impl App {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
-            let model = self.model.read().unwrap();
+            let model = self.model.read_recover();
             let total = model.filtered.len();
             if total > 0 {
                 let h = rect.height();
@@ -1998,7 +2003,7 @@ impl App {
             }
             let sel = self.selected_rows.clone();
 
-            let model = self.model.read().unwrap();
+            let model = self.model.read_recover();
             let show_empty_shortcuts = model.entries.is_empty();
             let entries = &model.entries;
             let filtered = &model.filtered;
@@ -2296,7 +2301,7 @@ impl App {
                     // element. Clamp it to the current filtered length so a stale
                     // anchor can never expand the range past the visible rows
                     // (mirrors the keyboard extend_selection clamp).
-                    let len = self.model.read().unwrap().filtered.len();
+                    let len = self.model.read_recover().filtered.len();
                     let max = len.saturating_sub(1);
                     let anchor = self.selection_anchor.unwrap_or(r).min(max);
                     let r = r.min(max);
@@ -2312,7 +2317,7 @@ impl App {
                 }
             }
             if let Some(r) = double_clicked_row {
-                let entry_idx = self.model.read().unwrap().filtered.get(r).copied();
+                let entry_idx = self.model.read_recover().filtered.get(r).copied();
                 if let Some(i) = entry_idx { self.toggle_bookmark(i); }
                 self.selected_rows.clear();
                 self.selected_rows.insert(r);
@@ -2438,7 +2443,7 @@ mod tests {
 
         // Unit-test the core copy logic without building a full App.
         let text = {
-            let m = model.read().unwrap();
+            let m = model.read_recover();
             let mut rows: Vec<&usize> = selected_rows.iter().collect();
             rows.sort();
             let texts: Vec<String> = rows.iter().filter_map(|&&r| {
