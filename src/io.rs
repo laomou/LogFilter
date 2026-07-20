@@ -136,3 +136,66 @@ pub fn pick_local_encoding(locale: &str) -> &'static Encoding {
     else if low.starts_with("ko") { encoding_rs::EUC_KR }
     else { encoding_rs::WINDOWS_1252 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    #[test]
+    fn pick_local_encoding_maps_locales() {
+        assert_eq!(pick_local_encoding("zh-CN").name(), "GBK");
+        assert_eq!(pick_local_encoding("zh_TW.UTF-8").name(), "GBK");
+        assert_eq!(pick_local_encoding("ja_JP").name(), "Shift_JIS");
+        assert_eq!(pick_local_encoding("ko_KR").name(), "EUC-KR");
+        assert_eq!(pick_local_encoding("en-US").name(), "windows-1252");
+        assert_eq!(pick_local_encoding("fr_FR").name(), "windows-1252");
+    }
+
+    #[test]
+    fn utf16le_file_detected_and_delegated() {
+        let tmp = std::env::temp_dir().join(format!("lf_utf16le_{}.log", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            let bom = [0xFF, 0xFE];
+            let text: Vec<u8> = "hello\nworld"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            f.write_all(&bom).unwrap();
+            f.write_all(&text).unwrap();
+        }
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        // send_utf8_lines detects UTF-16 BOM and delegates to decoded path.
+        // Just confirm it doesn't panic; correct decoding tested after PR #21 merge.
+        send_utf8_lines(file, tx, 1, epoch);
+        let _lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn epoch_cancels_mid_read() {
+        let tmp = std::env::temp_dir().join(format!("lf_epoch_{}.log", std::process::id()));
+        // Write a file with many lines
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            for i in 0..1000 {
+                writeln!(f, "line {i}").unwrap();
+            }
+        }
+        let (tx, rx) = crossbeam_channel::bounded(2048);
+        let epoch = Arc::new(AtomicU64::new(1));
+        // Immediately bump epoch so the reader sees a mismatch after first line
+        epoch.store(2, std::sync::atomic::Ordering::Release);
+        let file = std::fs::File::open(&tmp).unwrap();
+        send_utf8_lines(file, tx, 1, epoch);
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        let _ = std::fs::remove_file(&tmp);
+        // Should have stopped early (at most 1 line read before epoch check)
+        assert!(lines.len() <= 1, "expected <=1 lines, got {}", lines.len());
+    }
+}

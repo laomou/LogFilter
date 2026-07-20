@@ -204,4 +204,69 @@ mod tests {
         assert_eq!(f, LogFormat::Unknown);
         assert_eq!(e.message(), "totally random garbage");
     }
+
+    #[test]
+    fn hinted_threadtime_hits_fast_path() {
+        let line = "01-01 12:34:56.789  1 2 I Tag: msg";
+        let (e, f) = parse_line_hinted(line.to_string(), LogFormat::ThreadTime);
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.tag(), "Tag");
+        assert_eq!(e.message(), "msg");
+    }
+
+    #[test]
+    fn hint_mismatch_falls_back() {
+        // Hint says Brief, but it's actually ThreadTime — should still parse correctly.
+        let line = "01-01 12:34:56.789  100  200 W SysUI: drawn";
+        let (e, f) = parse_line_hinted(line.to_string(), LogFormat::Brief);
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.level, LevelMask::W);
+        assert_eq!(e.tag(), "SysUI");
+    }
+
+    #[test]
+    fn multibyte_tag() {
+        let line = "01-01 12:34:56.789  1 2 I 日志Tag: 消息body";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.tag(), "日志Tag");
+        assert_eq!(e.message(), "消息body");
+    }
+
+    #[test]
+    fn empty_message_after_colon() {
+        let line = "01-01 12:34:56.789  1 2 I Tag:";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.tag(), "Tag");
+        assert_eq!(e.message(), "");
+    }
+
+    #[test]
+    fn empty_and_whitespace_lines() {
+        let (e1, f1) = parse_line(String::new());
+        assert_eq!(f1, LogFormat::Unknown);
+        assert_eq!(e1.message(), "");
+
+        let (e2, f2) = parse_line("   ".to_string());
+        assert_eq!(f2, LogFormat::Unknown);
+        // Whitespace-only lines are preserved verbatim as Unknown entries
+        assert_eq!(e2.message(), "   ");
+    }
+
+    #[test]
+    fn kernel_level_digit_boundaries() {
+        // <0> = Fatal
+        let (e, f) = parse_line("<0>[0.001] critical".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::F);
+        // <4> = Warning
+        let (e, f) = parse_line("<4>[0.002] warn msg".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::W);
+        // <7> = Debug
+        let (e, f) = parse_line("<7>[0.003] debug msg".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::D);
+    }
 }

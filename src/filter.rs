@@ -166,4 +166,101 @@ mod tests {
         let other = LogEntry::from_fields("", "", LevelMask::I, "99", "1", "T", "m");
         assert!(!spec.matches(&other, 0, &hs));
     }
+
+    #[test]
+    fn allowed_tags_filters() {
+        let spec = FilterSpec {
+            allowed_tags: Some(["OK".into()].into()),
+            ..Default::default()
+        };
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("m", "OK", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("m", "BAD", LevelMask::I), 0, &hs));
+    }
+
+    #[test]
+    fn allowed_tids_filters() {
+        let spec = FilterSpec {
+            allowed_tids: Some(["200".into()].into()),
+            ..Default::default()
+        };
+        let hs = HashSet::new();
+        let entry = LogEntry::from_fields("", "", LevelMask::I, "1", "200", "T", "m");
+        assert!(spec.matches(&entry, 0, &hs));
+        let other = LogEntry::from_fields("", "", LevelMask::I, "1", "999", "T", "m");
+        assert!(!spec.matches(&other, 0, &hs));
+    }
+
+    #[test]
+    fn disallowed_tags_rejects() {
+        let spec = FilterSpec {
+            disallowed_tags: ["BAD".into()].into(),
+            ..Default::default()
+        };
+        let hs = HashSet::new();
+        assert!(!spec.matches(&e("m", "BAD", LevelMask::I), 0, &hs));
+        assert!(spec.matches(&e("m", "OK", LevelMask::I), 0, &hs));
+    }
+
+    #[test]
+    fn disallowed_plus_allowed_tags() {
+        let spec = FilterSpec {
+            allowed_tags: Some(["A".into(), "B".into()].into()),
+            disallowed_tags: ["B".into()].into(),
+            ..Default::default()
+        };
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("m", "A", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("m", "B", LevelMask::I), 0, &hs));
+    }
+
+    #[test]
+    fn bookmarks_only_filters() {
+        let spec = FilterSpec { bookmarks_only: true, ..Default::default() };
+        let mut bm = HashSet::new();
+        bm.insert(5u32);
+        assert!(spec.matches(&e("m", "T", LevelMask::I), 5, &bm));
+        assert!(!spec.matches(&e("m", "T", LevelMask::I), 3, &bm));
+    }
+
+    #[test]
+    fn errors_only_filters() {
+        let spec = FilterSpec { errors_only: true, ..Default::default() };
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("m", "T", LevelMask::E), 0, &hs));
+        assert!(spec.matches(&e("m", "T", LevelMask::F), 0, &hs));
+        assert!(!spec.matches(&e("m", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("m", "T", LevelMask::W), 0, &hs));
+    }
+
+    #[test]
+    fn multiple_find_tokens_or_semantics() {
+        let spec = FilterSpec { find: vec!["foo".into(), "bar".into()], ..Default::default() };
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("contains foo here", "T", LevelMask::I), 0, &hs));
+        assert!(spec.matches(&e("has bar inside", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("neither word", "T", LevelMask::I), 0, &hs));
+    }
+
+    #[test]
+    fn multiple_remove_tokens_or_semantics() {
+        let spec = FilterSpec { remove: vec!["spam".into(), "ads".into()], ..Default::default() };
+        let hs = HashSet::new();
+        assert!(!spec.matches(&e("spam message", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("has ads", "T", LevelMask::I), 0, &hs));
+        assert!(spec.matches(&e("clean line", "T", LevelMask::I), 0, &hs));
+    }
+
+    #[test]
+    fn find_and_remove_combined() {
+        let spec = FilterSpec {
+            find: vec!["hello".into()],
+            remove: vec!["hello world".into()],
+            ..Default::default()
+        };
+        let hs = HashSet::new();
+        assert!(spec.matches(&e("hello there", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("hello world", "T", LevelMask::I), 0, &hs));
+        assert!(!spec.matches(&e("no match", "T", LevelMask::I), 0, &hs));
+    }
 }

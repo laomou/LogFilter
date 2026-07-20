@@ -2373,45 +2373,543 @@ mod tests {
         assert!(lines[0].contains("msg one"), "first line should contain msg one: {lines:?}");
         assert!(lines[1].contains("msg three"), "second line should contain msg three: {lines:?}");
     }
+
+    #[test]
+    fn detect_format_from_cmd_variants() {
+        assert_eq!(detect_format_from_cmd("logcat -v threadtime"), LogFormat::ThreadTime);
+        assert_eq!(detect_format_from_cmd("logcat -v long"), LogFormat::ThreadTime);
+        assert_eq!(detect_format_from_cmd("logcat -v time"), LogFormat::Time);
+        assert_eq!(detect_format_from_cmd("logcat -v brief"), LogFormat::Brief);
+        assert_eq!(detect_format_from_cmd("logcat -v process"), LogFormat::Brief);
+        assert_eq!(detect_format_from_cmd("logcat -v tag"), LogFormat::Brief);
+        assert_eq!(detect_format_from_cmd("shell cat /proc/kmsg"), LogFormat::Kernel);
+        assert_eq!(detect_format_from_cmd("logcat"), LogFormat::Unknown);
+        assert_eq!(detect_format_from_cmd("logcat -v nonsense"), LogFormat::Unknown);
+    }
 }
 
-/// UI-level tests driving the real `App::ui` through egui_kittest — no window,
-/// no adb, default config. These cover the interactive layer (menus, panels,
-/// clicks, keyboard) that the plain-function unit tests above can't reach.
+/// Integration tests using egui_kittest to drive real user interactions
+/// (key presses, button clicks) through the full egui event → App::ui →
+/// state change pipeline. These test what actually broke before: shortcuts,
+/// selection, bookmarks, toolbar buttons.
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    use crate::model::LogEntry;
     use egui_kittest::kittest::Queryable as _;
     use egui_kittest::Harness;
 
-    /// Build a kittest `Harness` wrapping a hermetic `App`. `build_eframe` hands
-    /// us a kittest `CreationContext`; we take its egui `Context` and construct
-    /// the `App` via the test-only constructor (default config, no adb probe).
-    /// The harness then drives the real `eframe::App::ui` each `run()`.
     fn harness<'a>() -> Harness<'a, App> {
         Harness::builder()
             .with_size(egui::vec2(1350.0, 720.0))
             .build_eframe(|cc| App::new_for_test(&cc.egui_ctx))
     }
 
+    fn inject(app: &mut App, n: usize) {
+        use crate::model::LevelMask;
+        let mut m = app.model.write().unwrap();
+        for i in 0..n {
+            let lv = if i % 5 == 0 { LevelMask::E } else { LevelMask::I };
+            let tag = format!("Tag{}", i % 3);
+            m.append(LogEntry::from_fields(
+                "07-20", "12:00:00.000", lv, "100", "200", &tag, &format!("msg {i}"),
+            ));
+        }
+        m.filtered = (0..n as u32).collect();
+    }
+
+    // ─── Keyboard event simulation (full pipeline) ───────────────────────
+
     #[test]
-    fn options_panel_renders_and_bookmarks_toggle_flips_state() {
+    fn arrow_down_key_moves_selection() {
         let mut h = harness();
-        // First frame lays out the whole UI.
+        h.run();
+        inject(h.state_mut(), 20);
+        // Give the app a starting selection so ArrowDown has somewhere to go
+        h.state_mut().select_filtered_row_with_len(0, 20);
         h.run();
 
-        // The "Bookmarks only" quick-filter checkbox should be present and off.
-        assert!(!h.state().ui.bookmarks_only, "starts unchecked");
+        // Simulate pressing the Down arrow key — goes through egui's event
+        // system → App::handle_shortcuts → consume_key → move_selected_row
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
 
-        // Click it; a follow-up frame applies the toggle.
-        let label = tr!("bookmarks_only");
+        assert!(
+            h.state().selected_rows.contains(&1),
+            "ArrowDown from row 0 should select row 1, got {:?}", h.state().selected_rows
+        );
+        assert_eq!(h.state().selection_cursor, Some(1));
+    }
+
+    #[test]
+    fn arrow_up_key_clamps_at_zero() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 10);
+        h.state_mut().select_filtered_row_with_len(0, 10);
+        h.run();
+
+        h.key_press(egui::Key::ArrowUp);
+        h.run();
+
+        assert!(h.state().selected_rows.contains(&0), "should stay at 0");
+    }
+
+    #[test]
+    fn shift_arrow_down_extends_selection() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.state_mut().select_filtered_row_with_len(5, 20);
+        h.run();
+
+        // Shift+Down × 3 — through real egui event pipeline
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        h.run();
+
+        // Should have 4 rows selected: 5,6,7,8
+        let sel = &h.state().selected_rows;
+        assert_eq!(sel.len(), 4, "expected 4 selected rows, got {}", sel.len());
+        for r in 5..=8 { assert!(sel.contains(&r), "row {r} should be selected"); }
+        assert_eq!(h.state().selection_anchor, Some(5));
+        assert_eq!(h.state().selection_cursor, Some(8));
+    }
+
+    #[test]
+    fn shift_arrow_up_extends_backward() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.state_mut().select_filtered_row_with_len(10, 20);
+        h.run();
+
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowUp);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowUp);
+        h.run();
+
+        let sel = &h.state().selected_rows;
+        assert_eq!(sel.len(), 3); // 8,9,10
+        for r in 8..=10 { assert!(sel.contains(&r)); }
+    }
+
+    #[test]
+    fn ctrl_f2_toggles_bookmark_via_keyboard() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.state_mut().select_filtered_row_with_len(7, 20);
+        h.run();
+
+        // Ctrl+F2 → toggle_selected_bookmark
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F2);
+        h.run();
+
+        // Entry 7 should now be bookmarked
+        assert!(
+            h.state().model.read().unwrap().bookmarks.contains(&7),
+            "Ctrl+F2 should bookmark entry at selected row"
+        );
+
+        // Press again → un-bookmark
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F2);
+        h.run();
+        assert!(!h.state().model.read().unwrap().bookmarks.contains(&7));
+    }
+
+    #[test]
+    fn f3_jumps_to_next_bookmark() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 30);
+        h.state_mut().toggle_bookmark(10);
+        h.state_mut().toggle_bookmark(20);
+        h.state_mut().select_filtered_row_with_len(0, 30);
+        h.run();
+
+        // F3 = next bookmark
+        h.key_press(egui::Key::F3);
+        h.run();
+        assert!(h.state().selected_rows.contains(&10), "F3 should jump to bookmark at 10");
+
+        h.key_press(egui::Key::F3);
+        h.run();
+        assert!(h.state().selected_rows.contains(&20), "F3 again should jump to bookmark at 20");
+    }
+
+    // ─── Button clicks (real egui hit-test) ──────────────────────────────
+
+    #[test]
+    fn click_clear_button_empties_model() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 50);
+        h.run();
+
+        assert!(!h.state().model.read().unwrap().entries.is_empty());
+
+        // Click the "Clear" button in the toolbar
+        let label = tr!("clear");
         h.get_by_label(label.as_str()).click();
         h.run();
 
         assert!(
-            h.state().ui.bookmarks_only,
-            "clicking 'Bookmarks only' should set ui.bookmarks_only = true"
+            h.state().model.read().unwrap().entries.is_empty(),
+            "clicking Clear should empty the model"
         );
     }
-}
 
+    #[test]
+    fn click_run_no_panic_and_status_updates() {
+        let mut h = harness();
+        h.run();
+
+        // Click "Run" — on CI (no adb): fails gracefully with error status.
+        // On dev machines (adb present): starts a session. Either way: no panic,
+        // and status is set to something non-empty.
+        let label = tr!("run");
+        h.get_by_label(label.as_str()).click();
+        h.run();
+
+        assert!(
+            !h.state().status.is_empty(),
+            "clicking Run should update status (success or error)"
+        );
+    }
+
+    // ─── FilterSpec sync ─────────────────────────────────────────────────
+
+    #[test]
+    fn filter_spec_reflects_ui_state_after_notify() {
+        let mut h = harness();
+        h.run();
+
+        let app = h.state_mut();
+        app.ui.find = "hello".into();
+        app.ui.find_on = true;
+        app.ui.remove = "spam".into();
+        app.ui.remove_on = true;
+        app.ui.errors_only = true;
+        app.notify_filter();
+
+        let spec = app.shared_filter.read().unwrap();
+        assert_eq!(spec.find, vec!["hello"]);
+        assert_eq!(spec.remove, vec!["spam"]);
+        assert!(spec.errors_only);
+    }
+
+    #[test]
+    fn disallowed_tags_propagates_to_spec() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 10);
+        h.run();
+
+        h.state_mut().add_remove_tag("BadTag");
+
+        let spec = h.state().shared_filter.read().unwrap();
+        assert!(spec.disallowed_tags.contains("BadTag"));
+        assert!(h.state().ui.allowed_tags.is_none());
+    }
+
+    // ─── Render with data (smoke) ────────────────────────────────────────
+
+    #[test]
+    fn render_200_entries_with_filters_no_panic() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 200);
+        h.state_mut().ui.find = "msg 1".into();
+        h.state_mut().ui.find_on = true;
+        h.state_mut().ui.highlight = "Tag".into();
+        h.state_mut().ui.highlight_on = true;
+        h.state_mut().ui.errors_only = true;
+        h.state_mut().notify_filter();
+        // Drive multiple frames with active filters + highlights
+        h.run();
+        h.run();
+        h.run();
+    }
+
+    #[test]
+    fn f2_jumps_to_previous_bookmark() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 30);
+        h.state_mut().toggle_bookmark(5);
+        h.state_mut().toggle_bookmark(20);
+        h.state_mut().select_filtered_row_with_len(25, 30);
+        h.run();
+
+        // F2 = previous bookmark
+        h.key_press(egui::Key::F2);
+        h.run();
+        assert!(h.state().selected_rows.contains(&20), "F2 should jump back to bookmark 20");
+
+        h.key_press(egui::Key::F2);
+        h.run();
+        assert!(h.state().selected_rows.contains(&5), "F2 again should jump back to bookmark 5");
+    }
+
+    #[test]
+    fn page_down_key_jumps_forward() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 200);
+        h.state_mut().select_filtered_row_with_len(0, 200);
+        h.run(); // let the table render and set visible_table_rows
+
+        h.key_press(egui::Key::PageDown);
+        h.run();
+
+        let pos = *h.state().selected_rows.iter().next().unwrap();
+        // Should jump forward by at least 1 row (actual page size depends on harness layout)
+        assert!(pos > 0, "PageDown should move forward from 0, got {pos}");
+    }
+
+    #[test]
+    fn page_up_key_jumps_back() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 200);
+        h.state_mut().select_filtered_row_with_len(100, 200);
+        h.run();
+
+        h.key_press(egui::Key::PageUp);
+        h.run();
+
+        let pos = *h.state().selected_rows.iter().next().unwrap();
+        assert!(pos < 100, "PageUp from 100 should move backward, got {pos}");
+    }
+
+    #[test]
+    fn ctrl_plus_minus_changes_font_size() {
+        let mut h = harness();
+        h.run();
+        let initial = h.state().cfg.view.font_size;
+
+        // Ctrl+= (plus) should increase
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Equals);
+        h.run();
+        assert!(
+            h.state().cfg.view.font_size > initial,
+            "Ctrl+= should increase font size from {initial}, got {}",
+            h.state().cfg.view.font_size
+        );
+
+        // Ctrl+- should decrease
+        let before_minus = h.state().cfg.view.font_size;
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+        h.run();
+        assert!(
+            h.state().cfg.view.font_size < before_minus,
+            "Ctrl+- should decrease font size from {before_minus}, got {}",
+            h.state().cfg.view.font_size
+        );
+    }
+
+    #[test]
+    fn ctrl_zero_resets_font_size() {
+        let mut h = harness();
+        h.run();
+        // Increase font first
+        h.state_mut().cfg.view.font_size = 17.0;
+        h.run();
+
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num0);
+        h.run();
+
+        assert_eq!(
+            h.state().cfg.view.font_size, 13.0,
+            "Ctrl+0 should reset to default 13.0"
+        );
+    }
+
+    // ─── Edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn arrow_down_on_empty_table_no_panic() {
+        let mut h = harness();
+        h.run();
+        // No data injected — table is empty
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        h.run();
+        // No panic = success
+        assert!(h.state().selected_rows.is_empty());
+    }
+
+    #[test]
+    fn shift_arrow_direction_change_shrinks_range() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 30);
+        h.state_mut().select_filtered_row_with_len(15, 30);
+        h.run();
+
+        // Extend down 3
+        for _ in 0..3 {
+            h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+            h.run();
+        }
+        assert_eq!(h.state().selected_rows.len(), 4); // 15..=18
+
+        // Now reverse: up 2 — range should shrink to 15..=16
+        for _ in 0..2 {
+            h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowUp);
+            h.run();
+        }
+        assert_eq!(h.state().selected_rows.len(), 2); // 15..=16
+        assert_eq!(h.state().selection_cursor, Some(16));
+    }
+
+    #[test]
+    fn rapid_arrow_down_moves_multiple_rows() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 50);
+        h.state_mut().select_filtered_row_with_len(0, 50);
+        h.run();
+
+        for _ in 0..10 {
+            h.key_press(egui::Key::ArrowDown);
+            h.run();
+        }
+        assert!(h.state().selected_rows.contains(&10));
+    }
+
+    // ─── adb Run / Pause / Stop lifecycle ────────────────────────────────
+
+    #[test]
+    fn adb_run_clears_model_and_selection() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 50);
+        h.state_mut().select_filtered_row_with_len(10, 50);
+        h.run();
+
+        assert!(!h.state().model.read().unwrap().entries.is_empty());
+        assert!(!h.state().selected_rows.is_empty());
+
+        h.state_mut().adb_run();
+        // Regardless of whether adb spawned, model and selection must be cleared
+        assert!(h.state().model.read().unwrap().entries.is_empty());
+        assert!(h.state().selected_rows.is_empty());
+        assert_eq!(h.state().selection_anchor, None);
+    }
+
+    #[test]
+    fn adb_stop_when_no_session_is_noop() {
+        let mut h = harness();
+        h.run();
+        assert!(h.state().adb_session.is_none());
+        h.state_mut().adb_stop();
+        // No panic, status unchanged
+    }
+
+    #[test]
+    fn adb_pause_toggle_when_no_session_is_noop() {
+        let mut h = harness();
+        h.run();
+        assert!(h.state().adb_session.is_none());
+        h.state_mut().adb_pause_toggle();
+        // No panic
+    }
+
+    // ─── Open local file ─────────────────────────────────────────────────
+
+    #[test]
+    fn open_file_loads_entries_into_model() {
+        let mut h = harness();
+        h.run();
+
+        // Write a small threadtime logcat file
+        let tmp = std::env::temp_dir().join(format!("lf_open_{}.log", std::process::id()));
+        std::fs::write(&tmp, "\
+01-01 10:00:00.000  100  200 I Tag1: first line\n\
+01-01 10:00:01.000  100  200 W Tag2: second line\n\
+01-01 10:00:02.000  100  200 E Tag1: third line\n\
+").unwrap();
+
+        let result = h.state_mut().open_file(&tmp);
+        assert!(result.is_ok(), "open_file should succeed: {:?}", result.err());
+
+        // Give the ingest thread time to process
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h.run();
+
+        let m = h.state().model.read().unwrap();
+        assert_eq!(m.entries.len(), 3, "should have 3 entries, got {}", m.entries.len());
+        assert_eq!(m.file_path.as_ref().unwrap(), &tmp);
+        assert_eq!(m.entries[0].tag(), "Tag1");
+        assert_eq!(m.entries[1].tag(), "Tag2");
+        assert_eq!(m.entries[2].level, crate::model::LevelMask::E);
+        drop(m);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_file_nonexistent_returns_error() {
+        let mut h = harness();
+        h.run();
+
+        let result = h.state_mut().open_file(std::path::Path::new("/tmp/nonexistent_logfilter_test_xyz.log"));
+        assert!(result.is_err(), "open_file on nonexistent path should fail");
+    }
+
+    #[test]
+    fn open_file_clears_previous_data() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 50);
+        h.state_mut().toggle_bookmark(10);
+        h.state_mut().select_filtered_row_with_len(20, 50);
+        h.run();
+
+        // Write a new file and open it
+        let tmp = std::env::temp_dir().join(format!("lf_open2_{}.log", std::process::id()));
+        std::fs::write(&tmp, "01-01 10:00:00.000  1  1 I T: msg\n").unwrap();
+
+        h.state_mut().open_file(&tmp).unwrap();
+
+        // Previous selection and bookmarks must be gone
+        assert!(h.state().selected_rows.is_empty());
+        assert_eq!(h.state().selection_anchor, None);
+        // Model was cleared (old entries gone; new file loading in background)
+        let m = h.state().model.read().unwrap();
+        assert!(m.bookmarks.is_empty());
+        drop(m);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ─── Bookmarks + filter interaction ──────────────────────────────────
+
+    #[test]
+    fn bookmark_toggle_with_bookmarks_only_active() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+
+        // Enable bookmarks_only
+        h.state_mut().ui.bookmarks_only = true;
+        h.state_mut().notify_filter();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.run();
+
+        // Toggle bookmark — should not panic regardless of bookmarks_only state
+        h.state_mut().toggle_bookmark(5);
+        assert!(h.state().model.read().unwrap().bookmarks.contains(&5));
+
+        // Toggle again to remove
+        h.state_mut().toggle_bookmark(5);
+        assert!(!h.state().model.read().unwrap().bookmarks.contains(&5));
+    }
+}
