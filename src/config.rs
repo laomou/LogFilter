@@ -138,7 +138,10 @@ pub fn fonts_dir() -> Option<PathBuf> {
 pub fn load() -> Config {
     if let Some(path) = config_path() {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            return toml::from_str(&text).unwrap_or_default();
+            match toml::from_str(&text) {
+                Ok(cfg) => return cfg,
+                Err(e) => eprintln!("logfilter: failed to parse config at {}: {e}", path.display()),
+            }
         }
     }
     // Fall back to INI migration if the user is launching from the old repo dir.
