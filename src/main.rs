@@ -6,6 +6,7 @@ mod config;
 mod filter;
 mod fonts;
 mod io;
+mod lock;
 mod model;
 mod parser;
 
