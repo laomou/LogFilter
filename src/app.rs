@@ -2,8 +2,8 @@ use crate::adb;
 use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::io::{send_decoded_lines, send_utf8_lines};
-use crate::model::{EncodingChoice, LevelMask, Model};
-use crate::parser::parse_line;
+use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
+use crate::parser::parse_line_hinted;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use anyhow::Result;
 use egui_i18n::tr;
@@ -27,6 +27,10 @@ pub struct App {
     /// new load/adb-run bumps it; the ingest thread drops any queued line whose
     /// epoch != this, so a superseded load can't interleave into the new one.
     pub source_epoch: Arc<AtomicU64>,
+    /// Format hint for the current source, encoded as a u8 (see format_to_u8).
+    /// Set by adb_run() based on the selected command; reset to Unknown by
+    /// open_file() so the ingest thread can detect format from content.
+    source_format_hint: Arc<Mutex<LogFormat>>,
     pub wake: Arc<(Mutex<bool>, Condvar)>,
     pub status: String,
     pub ui: UiState,
@@ -72,6 +76,9 @@ pub struct App {
     cached_picker_entries_len: usize,
     /// Cached shortcut-rows for the empty-table view. Invalidated on language switch.
     cached_shortcut_rows: Vec<EmptyShortcutRow>,
+    /// Column widths captured from the table body each frame so they can be
+    /// written to cfg.view.columns in on_exit.
+    cached_col_widths: [f32; 9],
 
 }
 
@@ -212,12 +219,14 @@ impl App {
         let init_find_raw = if ui.find_on { ui.find.clone() } else { String::new() };
         let init_palette: Vec<Color32> = cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
         let init_level_colors = parse_level_colors(&cfg);
+        let init_col_widths = cfg.view.columns;
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
             shared_filter,
             gen: Arc::new(AtomicU64::new(0)),
             source_epoch: Arc::new(AtomicU64::new(0)),
+            source_format_hint: Arc::new(Mutex::new(LogFormat::Unknown)),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             status: String::new(),
             ui,
@@ -244,6 +253,7 @@ impl App {
             cached_picker_options: Vec::new(),
             cached_picker_entries_len: 0,
             cached_shortcut_rows: empty_shortcut_rows(),
+            cached_col_widths: init_col_widths,
         };
         app.spawn_filter_thread(cc.egui_ctx.clone());
         app.spawn_ingest_thread(cc.egui_ctx.clone(), line_rx);
@@ -268,6 +278,8 @@ impl App {
         // Stop any adb session so its lines don't interleave with the file.
         self.adb_stop();
 
+        // File format is unknown until the ingest thread detects it from content.
+        *self.source_format_hint.lock().unwrap() = LogFormat::Unknown;
         // Claim a fresh source epoch *before* clearing so any lines still queued
         // from a previous load/adb are dropped by the ingest thread.
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -336,8 +348,11 @@ impl App {
         let model = self.model.clone();
         let wake = self.wake.clone();
         let source_epoch = self.source_epoch.clone();
+        let source_format_hint = self.source_format_hint.clone();
         thread::Builder::new().name("ingest".into()).spawn(move || {
             let mut batch: Vec<(u64, String)> = Vec::with_capacity(256);
+            let mut hint = LogFormat::Unknown;
+            let mut hint_epoch = u64::MAX;
             loop {
                 // block for first line
                 let Ok(first) = rx.recv() else { return; };
@@ -356,12 +371,22 @@ impl App {
                 // Drop lines from a superseded source (an older file load / adb
                 // session) so they never interleave into the current one.
                 let cur = source_epoch.load(Ordering::Acquire);
+                // New source: read the hint published by open_file/adb_run.
+                if cur != hint_epoch {
+                    hint = *source_format_hint.lock().unwrap();
+                    hint_epoch = cur;
+                }
                 let mut appended = false;
                 {
                     let mut m = model.write().unwrap();
                     for (ep, line) in batch.drain(..) {
                         if ep != cur { continue; }
-                        let (entry, _) = parse_line(line);
+                        let (entry, fmt) = parse_line_hinted(line, hint);
+                        // Lock in the format on the first non-Unknown line so all
+                        // subsequent lines skip the other regex attempts.
+                        if hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
+                            hint = fmt;
+                        }
                         m.append(entry);
                         appended = true;
                     }
@@ -381,6 +406,9 @@ impl App {
 
     fn adb_run(&mut self) {
         self.adb_stop();
+        // Write the format hint before bumping the epoch so the ingest thread
+        // always reads a consistent pair: new epoch → new hint.
+        *self.source_format_hint.lock().unwrap() = detect_format_from_cmd(&self.selected_cmd);
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         // A fresh run starts from an empty table — clear any entries left from a
@@ -1068,6 +1096,28 @@ impl App {
     }
 }
 
+/// Infer the expected log format from an adb command string.
+/// Returns `Unknown` when the command doesn't carry enough information.
+fn detect_format_from_cmd(cmd: &str) -> LogFormat {
+    // `shell cat /proc/kmsg` and similar kernel-log commands.
+    if cmd.contains("/kmsg") || cmd.contains("/dmesg") { return LogFormat::Kernel; }
+    // `-v <format>` flag.
+    let mut parts = cmd.split_whitespace();
+    while let Some(tok) = parts.next() {
+        if tok == "-v" {
+            match parts.next() {
+                Some("threadtime") => return LogFormat::ThreadTime,
+                Some("time")       => return LogFormat::Time,
+                Some("brief")      => return LogFormat::Brief,
+                _ => {}
+            }
+        }
+    }
+    // No explicit -v flag: logcat defaults to brief.
+    if cmd.trim_start().starts_with("logcat") { return LogFormat::Brief; }
+    LogFormat::Unknown
+}
+
 fn tune_table_visuals(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.visuals.widgets.hovered.expansion = 0.0;
@@ -1369,6 +1419,7 @@ impl eframe::App for App {
             self.cfg.window.width = size.x;
             self.cfg.window.height = size.y;
         }
+        self.cfg.view.columns = self.cached_col_widths;
         let _ = config::save(&self.cfg);
     }
 }
@@ -1766,15 +1817,15 @@ impl App {
                 tr!("col_message"),
             );
             let cols_show: [(bool, &str, f32); 9] = [
-                (self.ui.col_line,     &cl,    60.0),
-                (self.ui.col_date,     &cd,    60.0),
-                (self.ui.col_time,     &ct,   100.0),
-                (self.ui.col_loglv,    &clv,   44.0),
-                (self.ui.col_pid,      &cpi,   60.0),
-                (self.ui.col_thread,   &cth,   80.0),
-                (self.ui.col_tag,      &cta,  140.0),
-                (self.ui.col_bookmark, &cmk,   36.0),
-                (self.ui.col_message,  &cms,  300.0),
+                (self.ui.col_line,     &cl,    self.cached_col_widths[0]),
+                (self.ui.col_date,     &cd,    self.cached_col_widths[1]),
+                (self.ui.col_time,     &ct,    self.cached_col_widths[2]),
+                (self.ui.col_loglv,    &clv,   self.cached_col_widths[3]),
+                (self.ui.col_pid,      &cpi,   self.cached_col_widths[4]),
+                (self.ui.col_thread,   &cth,   self.cached_col_widths[5]),
+                (self.ui.col_tag,      &cta,   self.cached_col_widths[6]),
+                (self.ui.col_bookmark, &cmk,   self.cached_col_widths[7]),
+                (self.ui.col_message,  &cms,   self.cached_col_widths[8]),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
             let table_available_height = ui.available_height();
@@ -1819,6 +1870,9 @@ impl App {
             let alt = ctx.input(|i| i.modifiers.alt);
             let mut open_picker: Option<(PickerCol, egui::Pos2)> = None;
             let mut hide_col_idx: Option<usize> = None;
+            // Widths captured from body.widths() this frame: maps visible-column
+            // order back to the 9-slot array so on_exit can persist them.
+            let mut new_col_widths: Option<Vec<f32>> = None;
 
             // Column meta for header interactions
             #[derive(Clone, Copy)]
@@ -1891,6 +1945,10 @@ impl App {
                     }
                 })
                 .body(|body| {
+                    // Capture column widths from egui_extras each frame so we can
+                    // persist them on exit. body.widths() is ordered by visible
+                    // columns only; record them for write-back below.
+                    new_col_widths = Some(body.widths().to_vec());
                     if show_empty_shortcuts {
                         let shortcut_rows = &self.cached_shortcut_rows;
                         let row_count = EMPTY_SHORTCUT_TOP_PADDING_ROWS + shortcut_rows.len();
@@ -2063,6 +2121,19 @@ impl App {
                         }
                     });
                 });
+
+            // Map visible-column widths back to the 9-slot array.
+            if let Some(widths) = new_col_widths {
+                let mut wi = 0usize;
+                for (i, (visible, _, _)) in cols_show.iter().enumerate() {
+                    if *visible {
+                        if let Some(&w) = widths.get(wi) {
+                            self.cached_col_widths[i] = w;
+                        }
+                        wi += 1;
+                    }
+                }
+            }
 
             let ctrl_or_cmd = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
             let shift = ctx.input(|i| i.modifiers.shift);
