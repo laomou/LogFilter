@@ -564,7 +564,8 @@ impl App {
 
         // Snapshot the filtered entries so the background thread doesn't need
         // to hold the model lock while writing (which could block the UI).
-        let rows: Vec<(u64, String, String, char, String, String, String, String)> = m.filtered
+        type Row = (u64, String, String, char, String, String, String, String);
+        let rows: Vec<Row> = m.filtered
             .iter()
             .map(|&ei| {
                 let e = &m.entries[ei as usize];
