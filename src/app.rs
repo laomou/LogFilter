@@ -95,6 +95,9 @@ pub struct UiState {
     pub allowed_pids: Option<std::collections::HashSet<String>>,
     pub allowed_tids: Option<std::collections::HashSet<String>>,
     pub allowed_tags: Option<std::collections::HashSet<String>>,
+    /// Tags explicitly excluded via Alt+right-click — applied even when
+    /// `allowed_tags` is None so newly streamed tags are also blocked.
+    pub disallowed_tags: std::collections::HashSet<String>,
     pub allowed_levels: Option<LevelMask>,
 
     // Encoding (set via Encoding menu)
@@ -153,6 +156,7 @@ impl UiState {
             allowed_pids: None,
             allowed_tids: None,
             allowed_tags: None,
+            disallowed_tags: std::collections::HashSet::new(),
             allowed_levels: None,
             encoding: cfg.view.encoding.clone(),
             col_bookmark: false,
@@ -177,6 +181,7 @@ impl UiState {
             allowed_pids: self.allowed_pids.clone(),
             allowed_tids: self.allowed_tids.clone(),
             allowed_tags: self.allowed_tags.clone(),
+            disallowed_tags: self.disallowed_tags.clone(),
             find: if self.find_on { FilterSpec::tokens(&self.find) } else { vec![] },
             remove: if self.remove_on { FilterSpec::tokens(&self.remove) } else { vec![] },
             bookmarks_only: self.bookmarks_only,
@@ -610,12 +615,12 @@ impl App {
     /// Alt+right-click on a Tag cell → exclude this tag.
     fn add_remove_tag(&mut self, tag: &str) {
         if tag.is_empty() { return; }
-        let mut set = match self.ui.allowed_tags.clone() {
-            Some(s) => s,
-            None => self.model.read().unwrap().tag_counts.keys().cloned().collect(),
-        };
-        set.remove(tag);
-        self.ui.allowed_tags = Some(set);
+        // Add to the blacklist; also remove from allowed_tags if it's an explicit
+        // allowlist so the two sets stay consistent.
+        self.ui.disallowed_tags.insert(tag.to_string());
+        if let Some(ref mut set) = self.ui.allowed_tags {
+            set.remove(tag);
+        }
         self.notify_filter();
     }
 
@@ -1064,7 +1069,7 @@ impl App {
                             match picker.col {
                                 PickerCol::Pid   => self.ui.allowed_pids = None,
                                 PickerCol::Tid   => self.ui.allowed_tids = None,
-                                PickerCol::Tag   => self.ui.allowed_tags = None,
+                                PickerCol::Tag   => { self.ui.allowed_tags = None; self.ui.disallowed_tags.clear(); },
                                 PickerCol::Level => self.ui.allowed_levels = None,
                             }
                             close = true;
@@ -1113,7 +1118,15 @@ impl App {
             match picker.col {
                 PickerCol::Pid => self.ui.allowed_pids = Some(selected.clone()),
                 PickerCol::Tid => self.ui.allowed_tids = Some(selected.clone()),
-                PickerCol::Tag => self.ui.allowed_tags = Some(selected.clone()),
+                PickerCol::Tag => {
+                    // Keep disallowed_tags in sync: anything visible in the picker
+                    // but not selected is explicitly excluded.
+                    self.ui.disallowed_tags = options.iter()
+                        .map(|(k, _)| k.clone())
+                        .filter(|k| !selected.contains(k))
+                        .collect();
+                    self.ui.allowed_tags = Some(selected.clone());
+                },
                 PickerCol::Level => {
                     let masks = crate::model::LEVEL_MASKS;
                     let labels = ['V','D','I','W','E','F'];

@@ -10,6 +10,10 @@ pub struct FilterSpec {
     pub allowed_pids: Option<HashSet<String>>,
     pub allowed_tids: Option<HashSet<String>>,
     pub allowed_tags: Option<HashSet<String>>,
+    /// Tags explicitly excluded via Alt+right-click. Takes effect even when
+    /// `allowed_tags` is None (all-pass), so newly streamed tags are also
+    /// excluded without needing to snapshot the full tag set at click time.
+    pub disallowed_tags: HashSet<String>,
 
     pub find: Vec<String>,
     pub remove: Vec<String>,
@@ -48,6 +52,9 @@ impl FilterSpec {
             if !set.contains(entry.tag()) {
                 return false;
             }
+        }
+        if !self.disallowed_tags.is_empty() && self.disallowed_tags.contains(entry.tag()) {
+            return false;
         }
         if self.bookmarks_only && !bookmarks.contains(&entry_idx) {
             return false;
