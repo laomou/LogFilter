@@ -103,3 +103,7 @@ status_adb_devices_zero = no devices
 status_adb_devices_failed = adb devices failed: {e}
 status_failed_open = Failed to open: {e}
 status_failed_open_dropped = Failed to open dropped file: {e}
+
+# quick-filter toggles
+bookmarks_only = Bookmarks only
+errors_only = Errors only
