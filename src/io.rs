@@ -1,6 +1,6 @@
 use crate::model::EncodingChoice;
 use crossbeam_channel::Sender;
-use encoding_rs::Encoding;
+use encoding_rs::{CoderResult, Decoder, Encoding};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,14 +91,11 @@ fn send_decoded_lines_with_enc(
         let n = reader.read(&mut raw_buf)?;
         if n == 0 { break; }
         if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
-        let _ = decoder.decode_to_string(&raw_buf[..n], &mut text_buf, false);
-        // Flush complete lines in one pass, then drain once per chunk (O(n)).
-        let consumed = flush_lines(&text_buf, &tx, epoch);
-        if consumed > 0 { text_buf.drain(..consumed); }
+        decode_chunk(&mut decoder, &raw_buf[..n], false, &mut text_buf, &tx, epoch);
         if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
     }
     // Final flush: drain any remaining buffered bytes from the decoder.
-    let _ = decoder.decode_to_string(b"", &mut text_buf, true);
+    decode_chunk(&mut decoder, b"", true, &mut text_buf, &tx, epoch);
     // Emit any remaining text without a trailing newline as a final line.
     if !text_buf.is_empty() {
         if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
@@ -109,6 +106,44 @@ fn send_decoded_lines_with_enc(
         if tx.send((epoch, line)).is_err() { return Ok(()); }
     }
     Ok(())
+}
+
+/// Decode all of `input`, growing `text_buf` or flushing complete lines when
+/// the decoder reports a full output buffer. `decode_to_string` deliberately
+/// does not reallocate its destination; ignoring `OutputFull` would otherwise
+/// discard the unconsumed suffix of a long log line.
+fn decode_chunk(
+    decoder: &mut Decoder,
+    mut input: &[u8],
+    last: bool,
+    text_buf: &mut String,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+) {
+    loop {
+        if text_buf.len() == text_buf.capacity() {
+            text_buf.reserve(8192);
+        }
+        let (result, read, _) = decoder.decode_to_string(input, text_buf, last);
+        input = &input[read..];
+
+        // Drain complete lines to free space before allocating more. A single
+        // very long line has no newline to drain, in which case reserve grows
+        // the backing buffer and the next iteration resumes the same input.
+        let consumed = flush_lines(text_buf, tx, epoch);
+        if consumed > 0 {
+            text_buf.drain(..consumed);
+        }
+
+        match result {
+            CoderResult::InputEmpty => return,
+            CoderResult::OutputFull => {
+                if consumed == 0 {
+                    text_buf.reserve(8192);
+                }
+            }
+        }
+    }
 }
 
 /// Scan `buf` for complete lines (terminated by `\n`), send each via `tx`,
@@ -229,5 +264,24 @@ mod tests {
 
         assert_eq!(utf8_lines, vec!["first", ""]);
         assert_eq!(decoded_lines, utf8_lines);
+    }
+
+    #[test]
+    fn decoded_reader_preserves_long_line_larger_than_initial_buffer() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lf_long_decoded_line_{}.log",
+            std::process::id()
+        ));
+        let line = "x".repeat(32 * 1024);
+        std::fs::write(&tmp, &line).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::UTF_8).unwrap();
+        let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(lines, vec![line]);
     }
 }
