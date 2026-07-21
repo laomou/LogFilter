@@ -207,8 +207,13 @@ impl UiState {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
-        let cfg = config::load();
+    /// Production constructor. `main` loads the config once so it can apply
+    /// persisted native-window settings before handing the same config to App.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        cfg: Config,
+        initial_file: Option<PathBuf>,
+    ) -> Self {
         let mut app = Self::from_ctx(&cc.egui_ctx, cfg, initial_file);
         // Pre-populate the device combo on startup so the user doesn't have to
         // click ↻ once before they can pick a device. Skipped in the test-only
