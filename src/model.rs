@@ -209,3 +209,81 @@ pub fn level_index(lv: LevelMask) -> Option<usize> {
 pub const LEVEL_MASKS: [LevelMask; 6] = [
     LevelMask::V, LevelMask::D, LevelMask::I, LevelMask::W, LevelMask::E, LevelMask::F,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_sets_line_no_sequentially() {
+        let mut m = Model::default();
+        for _ in 0..3 {
+            m.append(LogEntry::from_fields("", "", LevelMask::I, "1", "1", "T", "x"));
+        }
+        assert_eq!(m.entries[0].line_no, 1);
+        assert_eq!(m.entries[1].line_no, 2);
+        assert_eq!(m.entries[2].line_no, 3);
+    }
+
+    #[test]
+    fn append_tracks_error_lines() {
+        let mut m = Model::default();
+        m.append(LogEntry::from_fields("", "", LevelMask::I, "1", "1", "T", "info"));
+        m.append(LogEntry::from_fields("", "", LevelMask::E, "1", "1", "T", "err"));
+        m.append(LogEntry::from_fields("", "", LevelMask::W, "1", "1", "T", "warn"));
+        m.append(LogEntry::from_fields("", "", LevelMask::F, "1", "1", "T", "fatal"));
+        // error_lines stores entry indices of E/F entries
+        assert_eq!(m.error_lines, vec![1, 3]);
+    }
+
+    #[test]
+    fn append_bumps_counts() {
+        let mut m = Model::default();
+        m.append(LogEntry::from_fields("", "", LevelMask::I, "100", "200", "TagA", "x"));
+        m.append(LogEntry::from_fields("", "", LevelMask::I, "100", "200", "TagA", "x"));
+        m.append(LogEntry::from_fields("", "", LevelMask::E, "100", "300", "TagB", "x"));
+        assert_eq!(m.pid_counts["100"], 3);
+        assert_eq!(m.tid_counts["200"], 2);
+        assert_eq!(m.tid_counts["300"], 1);
+        assert_eq!(m.tag_counts["TagA"], 2);
+        assert_eq!(m.tag_counts["TagB"], 1);
+        assert_eq!(m.level_counts[2], 2); // I
+        assert_eq!(m.level_counts[4], 1); // E
+    }
+
+    #[test]
+    fn clear_resets_everything() {
+        let mut m = Model::default();
+        m.append(LogEntry::from_fields("", "", LevelMask::E, "1", "1", "T", "x"));
+        m.bookmarks.insert(0);
+        m.filtered.push(0);
+        m.clear();
+        assert!(m.entries.is_empty());
+        assert!(m.filtered.is_empty());
+        assert!(m.bookmarks.is_empty());
+        assert!(m.error_lines.is_empty());
+        assert!(m.pid_counts.is_empty());
+        assert_eq!(m.level_counts, [0; 6]);
+    }
+
+    #[test]
+    fn level_mask_from_char_variants() {
+        assert_eq!(LevelMask::from_char('V'), Some(LevelMask::V));
+        assert_eq!(LevelMask::from_char('v'), Some(LevelMask::V));
+        assert_eq!(LevelMask::from_char('E'), Some(LevelMask::E));
+        assert_eq!(LevelMask::from_char('A'), Some(LevelMask::F)); // alias
+        assert_eq!(LevelMask::from_char('a'), Some(LevelMask::F));
+        assert_eq!(LevelMask::from_char('X'), None);
+    }
+
+    #[test]
+    fn level_index_maps_correctly() {
+        assert_eq!(level_index(LevelMask::V), Some(0));
+        assert_eq!(level_index(LevelMask::D), Some(1));
+        assert_eq!(level_index(LevelMask::I), Some(2));
+        assert_eq!(level_index(LevelMask::W), Some(3));
+        assert_eq!(level_index(LevelMask::E), Some(4));
+        assert_eq!(level_index(LevelMask::F), Some(5));
+        assert_eq!(level_index(LevelMask::empty()), None);
+    }
+}
