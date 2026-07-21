@@ -73,7 +73,7 @@ mod tests {
         .join();
         assert!(rw.read().is_err(), "rwlock should be poisoned");
         assert_eq!(&*rw.read_recover(), "ok");
-        rw.write_recover().push_str("!");
+        rw.write_recover().push('!');
         assert_eq!(&*rw.read_recover(), "ok!");
     }
 }
