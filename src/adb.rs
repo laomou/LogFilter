@@ -83,8 +83,9 @@ pub struct Session {
     child: Child,
     paused: Arc<std::sync::atomic::AtomicBool>,
     reader_thread: Option<thread::Thread>,
-    #[allow(dead_code)]
     reader_handle: Option<thread::JoinHandle<()>>,
+    stderr_handle: Option<thread::JoinHandle<()>>,
+    stopped: bool,
     /// Set true when the adb stdout closes (process exited / stream ended), so
     /// the UI can detect a session that died on its own and stop showing it as
     /// live. Distinct from `stop()`, which the user initiated.
@@ -146,23 +147,27 @@ impl Session {
 
         // Drain stderr on its own thread into a shared buffer.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
-        if let Some(mut es) = child.stderr.take() {
+        let stderr_handle = if let Some(mut es) = child.stderr.take() {
             let buf = stderr_buf.clone();
-            let _ = thread::Builder::new().name("adb-stderr".into()).spawn(move || {
+            Some(thread::Builder::new().name("adb-stderr".into()).spawn(move || {
                 let mut s = String::new();
                 if es.read_to_string(&mut s).is_ok() && !s.is_empty() {
                     if let Ok(mut guard) = buf.lock() {
                         guard.push_str(&s);
                     }
                 }
-            });
-        }
+            })?)
+        } else {
+            None
+        };
 
         Ok(Self {
             child,
             paused,
             reader_thread: Some(reader_thread),
             reader_handle: Some(handle),
+            stderr_handle,
+            stopped: false,
             ended,
             stderr: stderr_buf,
         })
@@ -194,17 +199,68 @@ impl Session {
     }
 
     pub fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
         let _ = self.child.kill();
-        let _ = self.child.wait();
         // Wake the reader so it can see the broken pipe / empty read and exit.
+        self.paused.store(false, Ordering::Relaxed);
         if let Some(t) = &self.reader_thread {
             t.unpark();
         }
+        let _ = self.child.wait();
+        self.join_workers();
+    }
+
+    /// Join the stdout/stderr workers after the child has exited. Handles are
+    /// consumed so a later `Drop` cannot attempt to join them twice.
+    fn join_workers(&mut self) {
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_handle.take() {
+            let _ = handle.join();
+        }
+        self.reader_thread = None;
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_reaps_stdout_and_stderr_workers() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let mut session = Session::start(
+            Some("/bin/sh"),
+            None,
+            "-c 'printf output; printf error >&2'",
+            tx,
+            1,
+        )
+        .expect("shell-backed session should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !session.has_ended() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(session.has_ended(), "stdout worker should observe process exit");
+
+        session.stop();
+
+        assert_eq!(rx.try_recv(), Ok((1, "output".into())));
+        assert_eq!(session.stderr_text(), "error");
+        assert!(session.reader_handle.is_none());
+        assert!(session.stderr_handle.is_none());
+        assert!(session.reader_thread.is_none());
     }
 }
