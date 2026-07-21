@@ -103,9 +103,10 @@ fn send_decoded_lines_with_enc(
     if !text_buf.is_empty() {
         if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
         let line = text_buf.trim_end_matches(['\r', '\n']).to_string();
-        if !line.is_empty() {
-            let _ = tx.send((epoch, line));
-        }
+        // Match the UTF-8 reader's `read_until` behavior: a final logical line
+        // is preserved even if CR/LF normalization leaves it empty (for example
+        // a file ending in a lone `\r`).
+        if tx.send((epoch, line)).is_err() { return Ok(()); }
     }
     Ok(())
 }
@@ -200,5 +201,33 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         // Should have stopped early (at most 1 line read before epoch check)
         assert!(lines.len() <= 1, "expected <=1 lines, got {}", lines.len());
+    }
+
+    #[test]
+    fn decoded_reader_preserves_empty_final_line_like_utf8_reader() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lf_final_empty_line_{}.log",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"first\n\r").unwrap();
+
+        let read_lines = |decoded: bool| {
+            let (tx, rx) = crossbeam_channel::bounded(16);
+            let epoch = Arc::new(AtomicU64::new(1));
+            let file = std::fs::File::open(&tmp).unwrap();
+            if decoded {
+                send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::UTF_8).unwrap();
+            } else {
+                send_utf8_lines(file, tx, 1, epoch).unwrap();
+            }
+            rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>()
+        };
+
+        let utf8_lines = read_lines(false);
+        let decoded_lines = read_lines(true);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(utf8_lines, vec!["first", ""]);
+        assert_eq!(decoded_lines, utf8_lines);
     }
 }
