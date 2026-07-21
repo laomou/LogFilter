@@ -1,17 +1,17 @@
 use crate::adb;
 use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
-use crate::io::{send_decoded_lines, send_utf8_lines};
-use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
-use crate::parser::{parse_line_hinted};
-use crate::lock::{MutexExt, RwLockExt};
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
+use crate::io::{send_decoded_lines, send_utf8_lines};
+use crate::lock::{MutexExt, RwLockExt};
+use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
+use crate::parser::parse_line_hinted;
 use anyhow::Result;
-use egui_i18n::tr;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 use egui_extras::{Column, TableBuilder};
+use egui_i18n::tr;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,12 +83,12 @@ pub struct App {
     /// Column widths mirrored from the table each frame; persisted to config on exit.
     cached_col_widths: [f32; 9],
     /// Pending result from a background save_filtered() operation.
-    save_result_rx: Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
+    save_result_rx:
+        Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
     /// Set by the background file-load thread when a mid-stream read error
     /// truncates a load, so the UI can tell the user the file loaded only
     /// partially instead of silently presenting it as complete.
     load_error: Arc<Mutex<Option<String>>>,
-
 }
 
 pub struct UiState {
@@ -191,8 +191,16 @@ impl UiState {
             allowed_tids: self.allowed_tids.clone(),
             allowed_tags: self.allowed_tags.clone(),
             disallowed_tags: self.disallowed_tags.clone(),
-            find: if self.find_on { FilterSpec::tokens(&self.find) } else { vec![] },
-            remove: if self.remove_on { FilterSpec::tokens(&self.remove) } else { vec![] },
+            find: if self.find_on {
+                FilterSpec::tokens(&self.find)
+            } else {
+                vec![]
+            },
+            remove: if self.remove_on {
+                FilterSpec::tokens(&self.remove)
+            } else {
+                vec![]
+            },
             bookmarks_only: self.bookmarks_only,
             errors_only: self.errors_only,
         }
@@ -245,11 +253,29 @@ impl App {
         // Strings ahead of the (slower) parse/append step — it blocks instead,
         // capping peak memory. 8192 ≈ a few ingest batches of headroom.
         let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
-        let selected_cmd = cfg.adb.commands.first().cloned().unwrap_or_else(|| "logcat -v threadtime".into());
+        let selected_cmd = cfg
+            .adb
+            .commands
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "logcat -v threadtime".into());
         // Prime caches from the initial config so the first frame doesn't reallocate.
-        let init_hl_raw = if ui.highlight_on { ui.highlight.clone() } else { String::new() };
-        let init_find_raw = if ui.find_on { ui.find.clone() } else { String::new() };
-        let init_palette: Vec<Color32> = cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
+        let init_hl_raw = if ui.highlight_on {
+            ui.highlight.clone()
+        } else {
+            String::new()
+        };
+        let init_find_raw = if ui.find_on {
+            ui.find.clone()
+        } else {
+            String::new()
+        };
+        let init_palette: Vec<Color32> = cfg
+            .colors
+            .highlights
+            .iter()
+            .map(|s| parse_color(s))
+            .collect();
         let init_palette_raw = cfg.colors.highlights.clone();
         let init_level_colors = parse_level_colors(&cfg);
         let init_col_widths = cfg.view.columns;
@@ -278,8 +304,16 @@ impl App {
             auto_scroll: true,
             cached_highlight_palette: init_palette,
             cached_highlight_palette_raw: init_palette_raw,
-            cached_highlight_tokens: if init_hl_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_hl_raw) },
-            cached_find_tokens: if init_find_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_find_raw) },
+            cached_highlight_tokens: if init_hl_raw.is_empty() {
+                vec![]
+            } else {
+                FilterSpec::tokens(&init_hl_raw)
+            },
+            cached_find_tokens: if init_find_raw.is_empty() {
+                vec![]
+            } else {
+                FilterSpec::tokens(&init_find_raw)
+            },
             cached_highlight_raw: init_hl_raw,
             cached_find_raw: init_find_raw,
             cached_level_colors: init_level_colors,
@@ -355,7 +389,9 @@ impl App {
             .spawn(move || {
                 let res = match choice {
                     EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
-                    EncodingChoice::Local => send_decoded_lines(file, tx, epoch, source_epoch, choice),
+                    EncodingChoice::Local => {
+                        send_decoded_lines(file, tx, epoch, source_epoch, choice)
+                    }
                 };
                 if let Err(e) = res {
                     // A mid-stream read error truncated the load; record it so
@@ -408,8 +444,14 @@ impl App {
             "zh" => "zh-CN",
             "en" => "en-US",
             _ => {
-                let loc = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase();
-                if loc.starts_with("zh") { "zh-CN" } else { "en-US" }
+                let loc = sys_locale::get_locale()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if loc.starts_with("zh") {
+                    "zh-CN"
+                } else {
+                    "en-US"
+                }
             }
         };
         egui_i18n::set_language(code);
@@ -421,77 +463,88 @@ impl App {
         let wake = self.wake.clone();
         let source_epoch = self.source_epoch.clone();
         let source_format_hint = self.source_format_hint.clone();
-        thread::Builder::new().name("ingest".into()).spawn(move || {
-            let mut batch: Vec<(u64, String)> = Vec::with_capacity(256);
-            // Cached hint to avoid locking on every line; refreshed when the
-            // epoch changes. Locked to the first non-Unknown format seen so
-            // we skip the full 4-regex scan for homogeneous streams.
-            let mut hint = LogFormat::Unknown;
-            let mut hint_epoch: u64 = u64::MAX;
-            loop {
-                // block for first line
-                let Ok(first) = rx.recv() else { return; };
-                batch.clear();
-                batch.push(first);
-                // drain more if available (up to 512 lines / 25ms)
-                let deadline = std::time::Instant::now() + Duration::from_millis(25);
-                while batch.len() < 512 {
-                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remain.is_zero() { break; }
-                    match rx.recv_timeout(remain) {
-                        Ok(l) => batch.push(l),
-                        Err(_) => break,
-                    }
-                }
-                // Drop lines from a superseded source (an older file load / adb
-                // session) so they never interleave into the current one.
-                let cur = source_epoch.load(Ordering::Acquire);
-                // Refresh hint on epoch change (new file or adb command).
-                if cur != hint_epoch {
-                    hint = *source_format_hint.lock_recover();
-                    hint_epoch = cur;
-                }
-                let mut appended = false;
-                {
-                    let mut m = model.write_recover();
-                    for (ep, line) in batch.drain(..) {
-                        if ep != cur { continue; }
-                        let (entry, fmt) = parse_line_hinted(line, hint);
-                        // Lock in the format on the first matched line so subsequent
-                        // lines skip the full scan entirely.
-                        if hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
-                            hint = fmt;
+        thread::Builder::new()
+            .name("ingest".into())
+            .spawn(move || {
+                let mut batch: Vec<(u64, String)> = Vec::with_capacity(256);
+                // Cached hint to avoid locking on every line; refreshed when the
+                // epoch changes. Locked to the first non-Unknown format seen so
+                // we skip the full 4-regex scan for homogeneous streams.
+                let mut hint = LogFormat::Unknown;
+                let mut hint_epoch: u64 = u64::MAX;
+                loop {
+                    // block for first line
+                    let Ok(first) = rx.recv() else {
+                        return;
+                    };
+                    batch.clear();
+                    batch.push(first);
+                    // drain more if available (up to 512 lines / 25ms)
+                    let deadline = std::time::Instant::now() + Duration::from_millis(25);
+                    while batch.len() < 512 {
+                        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                        if remain.is_zero() {
+                            break;
                         }
-                        m.append(entry);
-                        appended = true;
+                        match rx.recv_timeout(remain) {
+                            Ok(l) => batch.push(l),
+                            Err(_) => break,
+                        }
+                    }
+                    // Drop lines from a superseded source (an older file load / adb
+                    // session) so they never interleave into the current one.
+                    let cur = source_epoch.load(Ordering::Acquire);
+                    // Refresh hint on epoch change (new file or adb command).
+                    if cur != hint_epoch {
+                        hint = *source_format_hint.lock_recover();
+                        hint_epoch = cur;
+                    }
+                    let mut appended = false;
+                    {
+                        let mut m = model.write_recover();
+                        for (ep, line) in batch.drain(..) {
+                            if ep != cur {
+                                continue;
+                            }
+                            let (entry, fmt) = parse_line_hinted(line, hint);
+                            // Lock in the format on the first matched line so subsequent
+                            // lines skip the full scan entirely.
+                            if hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
+                                hint = fmt;
+                            }
+                            m.append(entry);
+                            appended = true;
+                        }
+                    }
+                    if appended {
+                        // Wake the filter thread for an append-only pass. Deliberately
+                        // do NOT bump `gen` — that's reserved for filter-spec changes,
+                        // which force a full recompute (see spawn_filter_thread).
+                        let (lock, cvar) = &*wake;
+                        *lock.lock_recover() = true;
+                        cvar.notify_one();
+                        ctx.request_repaint();
                     }
                 }
-                if appended {
-                    // Wake the filter thread for an append-only pass. Deliberately
-                    // do NOT bump `gen` — that's reserved for filter-spec changes,
-                    // which force a full recompute (see spawn_filter_thread).
-                    let (lock, cvar) = &*wake;
-                    *lock.lock_recover() = true;
-                    cvar.notify_one();
-                    ctx.request_repaint();
-                }
-            }
-        }).expect("spawn ingest thread");
+            })
+            .expect("spawn ingest thread");
     }
 }
 
 /// Infer the expected log format from an adb command string.
 /// The `-v <fmt>` flag selects the format; `/kmsg` path means kernel format.
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
-    if cmd.contains("/kmsg") { return LogFormat::Kernel; }
+    if cmd.contains("/kmsg") {
+        return LogFormat::Kernel;
+    }
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     for w in parts.windows(2) {
         if w[0] == "-v" {
             return match w[1] {
                 "threadtime" | "long" => LogFormat::ThreadTime,
-                "time"                => LogFormat::Time,
+                "time" => LogFormat::Time,
                 "brief" | "process" | "tag" => LogFormat::Brief,
-                _                     => LogFormat::Unknown,
+                _ => LogFormat::Unknown,
             };
         }
     }
@@ -519,7 +572,11 @@ impl App {
         self.reset_column_filters();
         self.notify_filter();
 
-        let device = if self.selected_device.is_empty() { None } else { Some(self.selected_device.as_str()) };
+        let device = if self.selected_device.is_empty() {
+            None
+        } else {
+            Some(self.selected_device.as_str())
+        };
         match adb::Session::start(
             self.cfg.adb.adb_path.as_deref(),
             device,
@@ -548,7 +605,11 @@ impl App {
         if let Some(s) = &self.adb_session {
             let new = !s.is_paused();
             s.set_paused(new);
-            self.status = if new { tr!("status_adb_paused") } else { tr!("status_adb_resumed") };
+            self.status = if new {
+                tr!("status_adb_paused")
+            } else {
+                tr!("status_adb_resumed")
+            };
         }
     }
 
@@ -580,14 +641,24 @@ impl App {
         let m = self.model.read_recover();
         let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
         rows.sort();
-        let texts: Vec<String> = rows.iter().filter_map(|&&r| {
-            let &ei = m.filtered.get(r)?;
-            let e = &m.entries[ei as usize];
-            Some(format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
-            ))
-        }).collect();
+        let texts: Vec<String> = rows
+            .iter()
+            .filter_map(|&&r| {
+                let &ei = m.filtered.get(r)?;
+                let e = &m.entries[ei as usize];
+                Some(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    e.line_no,
+                    e.date(),
+                    e.time(),
+                    e.level.as_char(),
+                    e.pid(),
+                    e.tid(),
+                    e.tag(),
+                    e.message()
+                ))
+            })
+            .collect();
         texts.join("\n")
     }
 
@@ -600,15 +671,20 @@ impl App {
     ) -> String {
         let mut rows: Vec<&usize> = selected_rows.iter().collect();
         rows.sort();
-        let texts: Vec<&str> = rows.iter().filter_map(|&&r| {
-            let &ei = filtered.get(r)?;
-            Some(col(&entries[ei as usize]))
-        }).collect();
+        let texts: Vec<&str> = rows
+            .iter()
+            .filter_map(|&&r| {
+                let &ei = filtered.get(r)?;
+                Some(col(&entries[ei as usize]))
+            })
+            .collect();
         texts.join("\n")
     }
 
     fn copy_selected_row(&mut self) {
-        if self.selected_rows.is_empty() { return; }
+        if self.selected_rows.is_empty() {
+            return;
+        }
         let text = self.copy_selected_rows_text();
         let n = text.lines().count();
         self.copy_text_to_clipboard(&text, n);
@@ -650,13 +726,21 @@ impl App {
         // Snapshot the filtered entries so the background thread doesn't need
         // to hold the model lock while writing (which could block the UI).
         type Row = (u64, String, String, char, String, String, String, String);
-        let rows: Vec<Row> = m.filtered
+        let rows: Vec<Row> = m
+            .filtered
             .iter()
             .map(|&ei| {
                 let e = &m.entries[ei as usize];
-                (e.line_no, e.date().to_string(), e.time().to_string(),
-                 e.level.as_char(), e.pid().to_string(), e.tid().to_string(),
-                 e.tag().to_string(), e.message().to_string())
+                (
+                    e.line_no,
+                    e.date().to_string(),
+                    e.time().to_string(),
+                    e.level.as_char(),
+                    e.pid().to_string(),
+                    e.tid().to_string(),
+                    e.tag().to_string(),
+                    e.message().to_string(),
+                )
             })
             .collect();
         drop(m);
@@ -664,28 +748,37 @@ impl App {
         let n = rows.len();
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.save_result_rx = Some(rx);
-        thread::Builder::new().name("save-filtered".into()).spawn(move || {
-            let res = (|| -> Result<(), std::io::Error> {
-                use std::io::{BufWriter, Write};
-                let f = std::fs::File::create(&dest)?;
-                let mut w = BufWriter::new(f);
-                for (line_no, date, time, lv, pid, tid, tag, msg) in &rows {
-                    writeln!(w, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", line_no, date, time, lv, pid, tid, tag, msg)?;
-                }
-                w.flush()?;
-                Ok(())
-            })();
-            let result = match res {
-                Ok(()) => Ok((n, dest)),
-                Err(e) => Err(format!("{e}")),
-            };
-            let _ = tx.send(result);
-        }).expect("spawn save thread");
+        thread::Builder::new()
+            .name("save-filtered".into())
+            .spawn(move || {
+                let res = (|| -> Result<(), std::io::Error> {
+                    use std::io::{BufWriter, Write};
+                    let f = std::fs::File::create(&dest)?;
+                    let mut w = BufWriter::new(f);
+                    for (line_no, date, time, lv, pid, tid, tag, msg) in &rows {
+                        writeln!(
+                            w,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            line_no, date, time, lv, pid, tid, tag, msg
+                        )?;
+                    }
+                    w.flush()?;
+                    Ok(())
+                })();
+                let result = match res {
+                    Ok(()) => Ok((n, dest)),
+                    Err(e) => Err(format!("{e}")),
+                };
+                let _ = tx.send(result);
+            })
+            .expect("spawn save thread");
     }
 
     /// Alt+left-click on a Tag cell → "only this tag".
     fn add_show_tag(&mut self, tag: &str) {
-        if tag.is_empty() { return; }
+        if tag.is_empty() {
+            return;
+        }
         let mut set = std::collections::HashSet::new();
         set.insert(tag.to_string());
         self.ui.allowed_tags = Some(set);
@@ -694,7 +787,9 @@ impl App {
 
     /// Alt+right-click on a Tag cell → exclude this tag.
     fn add_remove_tag(&mut self, tag: &str) {
-        if tag.is_empty() { return; }
+        if tag.is_empty() {
+            return;
+        }
         // Add to the blacklist; also remove from allowed_tags if it's an explicit
         // allowlist so the two sets stay consistent.
         self.ui.disallowed_tags.insert(tag.to_string());
@@ -735,96 +830,103 @@ impl App {
         let spec_lock = self.shared_filter.clone();
         let gen = self.gen.clone();
         let wake = self.wake.clone();
-        thread::Builder::new().name("filter".into()).spawn(move || {
-            let (lock, cvar) = &*wake;
-            // Incremental state carried across wakes:
-            //  * `last_spec_gen` — the `gen` the current `filtered` was built for.
-            //  * `processed_len` — how many entries are already reflected in it.
-            // A wake does a full recompute only when the spec changed or the log
-            // shrank (clear/reload); otherwise it just filters the appended tail
-            // and extends `filtered`, so streaming stays O(N) overall instead of
-            // O(N²) (which is what re-scanning from 0 every batch would cost).
-            let mut last_spec_gen: u64 = u64::MAX;
-            let mut processed_len: usize = 0;
-            loop {
-                let mut pending = lock.lock_recover();
-                while !*pending {
-                    // Recover the guard on poisoning rather than crashing the
-                    // filter thread if another thread panicked while holding it.
-                    let (p, _) = cvar
-                        .wait_timeout(pending, Duration::from_secs(60))
-                        .unwrap_or_else(|e| e.into_inner());
-                    pending = p;
-                }
-                *pending = false;
-                drop(pending);
-
-                let spec_gen = gen.load(Ordering::Acquire);
-                let spec = spec_lock.read_recover().clone();
-                let entries_len = model.read_recover().entries.len();
-
-                let full = spec_gen != last_spec_gen || entries_len < processed_len;
-                let start = if full { 0 } else { processed_len };
-
-                let cap = if full { entries_len / 4 } else { (entries_len - start) / 2 + 1 };
-                let mut out: Vec<u32> = Vec::with_capacity(cap);
-                let mut aborted = false;
-                // Process in chunks holding the read lock once per chunk instead
-                // of once per row: amortizes lock cost while still yielding to
-                // writers (ingest/clear) and checking abort between chunks.
-                const CHUNK: usize = 4096;
-                let mut i = start;
-                while i < entries_len {
-                    // Abort only on a *spec* change; data growth is picked up by
-                    // the next wake continuing from `processed_len`.
-                    if gen.load(Ordering::Acquire) != spec_gen {
-                        aborted = true;
-                        break;
+        thread::Builder::new()
+            .name("filter".into())
+            .spawn(move || {
+                let (lock, cvar) = &*wake;
+                // Incremental state carried across wakes:
+                //  * `last_spec_gen` — the `gen` the current `filtered` was built for.
+                //  * `processed_len` — how many entries are already reflected in it.
+                // A wake does a full recompute only when the spec changed or the log
+                // shrank (clear/reload); otherwise it just filters the appended tail
+                // and extends `filtered`, so streaming stays O(N) overall instead of
+                // O(N²) (which is what re-scanning from 0 every batch would cost).
+                let mut last_spec_gen: u64 = u64::MAX;
+                let mut processed_len: usize = 0;
+                loop {
+                    let mut pending = lock.lock_recover();
+                    while !*pending {
+                        // Recover the guard on poisoning rather than crashing the
+                        // filter thread if another thread panicked while holding it.
+                        let (p, _) = cvar
+                            .wait_timeout(pending, Duration::from_secs(60))
+                            .unwrap_or_else(|e| e.into_inner());
+                        pending = p;
                     }
-                    let end = (i + CHUNK).min(entries_len);
-                    let m = model.read_recover();
-                    let hi = end.min(m.entries.len());
-                    for j in i..hi {
-                        if spec.matches(&m.entries[j], j as u32, &m.bookmarks) {
-                            out.push(j as u32);
+                    *pending = false;
+                    drop(pending);
+
+                    let spec_gen = gen.load(Ordering::Acquire);
+                    let spec = spec_lock.read_recover().clone();
+                    let entries_len = model.read_recover().entries.len();
+
+                    let full = spec_gen != last_spec_gen || entries_len < processed_len;
+                    let start = if full { 0 } else { processed_len };
+
+                    let cap = if full {
+                        entries_len / 4
+                    } else {
+                        (entries_len - start) / 2 + 1
+                    };
+                    let mut out: Vec<u32> = Vec::with_capacity(cap);
+                    let mut aborted = false;
+                    // Process in chunks holding the read lock once per chunk instead
+                    // of once per row: amortizes lock cost while still yielding to
+                    // writers (ingest/clear) and checking abort between chunks.
+                    const CHUNK: usize = 4096;
+                    let mut i = start;
+                    while i < entries_len {
+                        // Abort only on a *spec* change; data growth is picked up by
+                        // the next wake continuing from `processed_len`.
+                        if gen.load(Ordering::Acquire) != spec_gen {
+                            aborted = true;
+                            break;
                         }
+                        let end = (i + CHUNK).min(entries_len);
+                        let m = model.read_recover();
+                        let hi = end.min(m.entries.len());
+                        for j in i..hi {
+                            if spec.matches(&m.entries[j], j as u32, &m.bookmarks) {
+                                out.push(j as u32);
+                            }
+                        }
+                        drop(m);
+                        if hi < end {
+                            aborted = true; // entries shrank (cleared) — stop early
+                            break;
+                        }
+                        i = end;
+                    }
+
+                    if aborted {
+                        // Discard the partial result and force a full redo next wake.
+                        processed_len = 0;
+                        last_spec_gen = u64::MAX;
+                        continue;
+                    }
+
+                    // Commit under the write lock, re-validating against a clear that
+                    // could have landed since we snapshotted `entries_len` — otherwise
+                    // `filtered` could hold indices past the end of a shrunk log.
+                    let mut m = model.write_recover();
+                    if gen.load(Ordering::Acquire) != spec_gen || m.entries.len() < entries_len {
+                        drop(m);
+                        processed_len = 0;
+                        last_spec_gen = u64::MAX;
+                        continue;
+                    }
+                    if full {
+                        m.filtered = out;
+                    } else {
+                        m.filtered.extend(out);
                     }
                     drop(m);
-                    if hi < end {
-                        aborted = true; // entries shrank (cleared) — stop early
-                        break;
-                    }
-                    i = end;
+                    processed_len = entries_len;
+                    last_spec_gen = spec_gen;
+                    ctx.request_repaint();
                 }
-
-                if aborted {
-                    // Discard the partial result and force a full redo next wake.
-                    processed_len = 0;
-                    last_spec_gen = u64::MAX;
-                    continue;
-                }
-
-                // Commit under the write lock, re-validating against a clear that
-                // could have landed since we snapshotted `entries_len` — otherwise
-                // `filtered` could hold indices past the end of a shrunk log.
-                let mut m = model.write_recover();
-                if gen.load(Ordering::Acquire) != spec_gen || m.entries.len() < entries_len {
-                    drop(m);
-                    processed_len = 0;
-                    last_spec_gen = u64::MAX;
-                    continue;
-                }
-                if full {
-                    m.filtered = out;
-                } else {
-                    m.filtered.extend(out);
-                }
-                drop(m);
-                processed_len = entries_len;
-                last_spec_gen = spec_gen;
-                ctx.request_repaint();
-            }
-        }).expect("spawn filter thread");
+            })
+            .expect("spawn filter thread");
     }
 
     fn toggle_bookmark(&mut self, entry_idx: u32) {
@@ -847,7 +949,10 @@ impl App {
     fn toggle_selected_bookmark(&mut self) {
         let entries: Vec<u32> = {
             let m = self.model.read_recover();
-            self.selected_rows.iter().filter_map(|&r| m.filtered.get(r).copied()).collect()
+            self.selected_rows
+                .iter()
+                .filter_map(|&r| m.filtered.get(r).copied())
+                .collect()
         };
         for entry_idx in entries {
             self.toggle_bookmark(entry_idx);
@@ -880,7 +985,10 @@ impl App {
         if len == 0 {
             return;
         }
-        let cur = self.selection_cursor.unwrap_or(0).min(len.saturating_sub(1));
+        let cur = self
+            .selection_cursor
+            .unwrap_or(0)
+            .min(len.saturating_sub(1));
         drop(m);
         let new = if delta < 0 {
             cur.saturating_sub(1)
@@ -901,17 +1009,27 @@ impl App {
         if len == 0 {
             return;
         }
-        let anchor = self.selection_anchor.unwrap_or(0).min(len.saturating_sub(1));
+        let anchor = self
+            .selection_anchor
+            .unwrap_or(0)
+            .min(len.saturating_sub(1));
         // Use the explicit cursor (moving end) rather than an arbitrary HashSet
         // element — HashSet iteration order is non-deterministic.
-        let cur = self.selection_cursor.unwrap_or(anchor).min(len.saturating_sub(1));
+        let cur = self
+            .selection_cursor
+            .unwrap_or(anchor)
+            .min(len.saturating_sub(1));
         drop(m);
         let new = if delta < 0 {
             cur.saturating_sub(1)
         } else {
             (cur + 1).min(len.saturating_sub(1))
         };
-        let (lo, hi) = if new < anchor { (new, anchor) } else { (anchor, new) };
+        let (lo, hi) = if new < anchor {
+            (new, anchor)
+        } else {
+            (anchor, new)
+        };
         self.selected_rows.clear();
         for i in lo..=hi {
             self.selected_rows.insert(i);
@@ -940,14 +1058,30 @@ impl App {
         }
 
         // Token caches: only invalidate when the raw filter text changes.
-        let hl_raw = if self.ui.highlight_on { self.ui.highlight.as_str() } else { "" };
-        let f_raw = if self.ui.find_on { self.ui.find.as_str() } else { "" };
+        let hl_raw = if self.ui.highlight_on {
+            self.ui.highlight.as_str()
+        } else {
+            ""
+        };
+        let f_raw = if self.ui.find_on {
+            self.ui.find.as_str()
+        } else {
+            ""
+        };
         if self.cached_highlight_raw.as_str() != hl_raw {
-            self.cached_highlight_tokens = if hl_raw.is_empty() { vec![] } else { FilterSpec::tokens(hl_raw) };
+            self.cached_highlight_tokens = if hl_raw.is_empty() {
+                vec![]
+            } else {
+                FilterSpec::tokens(hl_raw)
+            };
             self.cached_highlight_raw = hl_raw.to_string();
         }
         if self.cached_find_raw.as_str() != f_raw {
-            self.cached_find_tokens = if f_raw.is_empty() { vec![] } else { FilterSpec::tokens(f_raw) };
+            self.cached_find_tokens = if f_raw.is_empty() {
+                vec![]
+            } else {
+                FilterSpec::tokens(f_raw)
+            };
             self.cached_find_raw = f_raw.to_string();
         }
     }
@@ -1032,16 +1166,29 @@ impl App {
 
     fn jump_bookmark(&mut self, forward: bool) {
         let m = self.model.read_recover();
-        if m.filtered.is_empty() { return; }
+        if m.filtered.is_empty() {
+            return;
+        }
         let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
         let indices: Vec<usize> = (0..m.filtered.len())
             .filter(|&i| m.bookmarks.contains(&m.filtered[i]))
             .collect();
-        if indices.is_empty() { return; }
+        if indices.is_empty() {
+            return;
+        }
         let next = if forward {
-            indices.iter().find(|&&i| i > cur).copied().or_else(|| indices.first().copied())
+            indices
+                .iter()
+                .find(|&&i| i > cur)
+                .copied()
+                .or_else(|| indices.first().copied())
         } else {
-            indices.iter().rev().find(|&&i| i < cur).copied().or_else(|| indices.last().copied())
+            indices
+                .iter()
+                .rev()
+                .find(|&&i| i < cur)
+                .copied()
+                .or_else(|| indices.last().copied())
         };
         if let Some(n) = next {
             self.selected_rows.clear();
@@ -1056,12 +1203,26 @@ impl App {
     /// Called only when the cached list is stale, not per frame.
     fn build_sorted_options(model: &Model, col: PickerCol) -> Vec<(String, usize)> {
         let mut v = match col {
-            PickerCol::Pid => model.pid_counts.iter().map(|(k, &c)| (k.clone(), c)).collect::<Vec<_>>(),
-            PickerCol::Tid => model.tid_counts.iter().map(|(k, &c)| (k.clone(), c)).collect(),
-            PickerCol::Tag => model.tag_counts.iter().map(|(k, &c)| (k.clone(), c)).collect(),
+            PickerCol::Pid => model
+                .pid_counts
+                .iter()
+                .map(|(k, &c)| (k.clone(), c))
+                .collect::<Vec<_>>(),
+            PickerCol::Tid => model
+                .tid_counts
+                .iter()
+                .map(|(k, &c)| (k.clone(), c))
+                .collect(),
+            PickerCol::Tag => model
+                .tag_counts
+                .iter()
+                .map(|(k, &c)| (k.clone(), c))
+                .collect(),
             PickerCol::Level => {
                 let labels = ['V', 'D', 'I', 'W', 'E', 'F'];
-                labels.iter().enumerate()
+                labels
+                    .iter()
+                    .enumerate()
                     .filter(|&(i, _)| model.level_counts[i] > 0)
                     .map(|(i, &lb)| (lb.to_string(), model.level_counts[i]))
                     .collect()
@@ -1072,7 +1233,9 @@ impl App {
     }
 
     fn render_picker(&mut self, ctx: &egui::Context) {
-        let Some(picker) = self.ui.picker.clone() else { return; };
+        let Some(picker) = self.ui.picker.clone() else {
+            return;
+        };
 
         // Build/reuse cached option list (sorted by count desc, then key).
         // The sorted list invalidates only when the picker column changes or new
@@ -1081,7 +1244,9 @@ impl App {
         {
             let m = self.model.read_recover();
             let entries_len = m.entries.len();
-            if self.cached_picker_col != Some(picker.col) || self.cached_picker_entries_len != entries_len {
+            if self.cached_picker_col != Some(picker.col)
+                || self.cached_picker_entries_len != entries_len
+            {
                 self.cached_picker_options = Self::build_sorted_options(&m, picker.col);
                 self.cached_picker_col = Some(picker.col);
                 self.cached_picker_entries_len = entries_len;
@@ -1089,35 +1254,42 @@ impl App {
         }
         let options: Vec<(String, usize)> = self.cached_picker_options.clone();
 
-        let (title, current_selected) = {
-            match picker.col {
-                PickerCol::Pid => {
-                    let sel = self.ui.allowed_pids.clone()
-                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_pid"), sel)
+        let (title, current_selected) =
+            {
+                match picker.col {
+                    PickerCol::Pid => {
+                        let sel =
+                            self.ui.allowed_pids.clone().unwrap_or_else(|| {
+                                options.iter().map(|(k, _)| k.clone()).collect()
+                            });
+                        (tr!("filter_pid"), sel)
+                    }
+                    PickerCol::Tid => {
+                        let sel =
+                            self.ui.allowed_tids.clone().unwrap_or_else(|| {
+                                options.iter().map(|(k, _)| k.clone()).collect()
+                            });
+                        (tr!("filter_thread"), sel)
+                    }
+                    PickerCol::Tag => {
+                        let sel =
+                            self.ui.allowed_tags.clone().unwrap_or_else(|| {
+                                options.iter().map(|(k, _)| k.clone()).collect()
+                            });
+                        (tr!("filter_tag"), sel)
+                    }
+                    PickerCol::Level => {
+                        let masks = crate::model::LEVEL_MASKS;
+                        let labels = ['V', 'D', 'I', 'W', 'E', 'F'];
+                        let current_mask = self.ui.allowed_levels.unwrap_or(LevelMask::ALL);
+                        let sel: std::collections::HashSet<String> = (0..6)
+                            .filter(|&i| current_mask.contains(masks[i]))
+                            .map(|i| labels[i].to_string())
+                            .collect();
+                        (tr!("filter_lv"), sel)
+                    }
                 }
-                PickerCol::Tid => {
-                    let sel = self.ui.allowed_tids.clone()
-                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_thread"), sel)
-                }
-                PickerCol::Tag => {
-                    let sel = self.ui.allowed_tags.clone()
-                        .unwrap_or_else(|| options.iter().map(|(k, _)| k.clone()).collect());
-                    (tr!("filter_tag"), sel)
-                }
-                PickerCol::Level => {
-                    let masks = crate::model::LEVEL_MASKS;
-                    let labels = ['V','D','I','W','E','F'];
-                    let current_mask = self.ui.allowed_levels.unwrap_or(LevelMask::ALL);
-                    let sel: std::collections::HashSet<String> = (0..6)
-                        .filter(|&i| current_mask.contains(masks[i]))
-                        .map(|i| labels[i].to_string())
-                        .collect();
-                    (tr!("filter_lv"), sel)
-                }
-            }
-        };
+            };
 
         // Draw the popup as a floating Area.
         let mut selected = current_selected;
@@ -1144,9 +1316,11 @@ impl App {
 
                     ui.horizontal(|ui| {
                         ui.label("🔍");
-                        ui.add(egui::TextEdit::singleline(&mut search)
-                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                            .desired_width(f32::INFINITY));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut search)
+                                .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                                .desired_width(f32::INFINITY),
+                        );
                     });
 
                     ui.horizontal(|ui| {
@@ -1158,11 +1332,18 @@ impl App {
                             selected.clear();
                             changed = true;
                         }
-                        if ui.small_button(tr!("reset")).on_hover_text(tr!("reset_hover")).clicked() {
+                        if ui
+                            .small_button(tr!("reset"))
+                            .on_hover_text(tr!("reset_hover"))
+                            .clicked()
+                        {
                             match picker.col {
-                                PickerCol::Pid   => self.ui.allowed_pids = None,
-                                PickerCol::Tid   => self.ui.allowed_tids = None,
-                                PickerCol::Tag   => { self.ui.allowed_tags = None; self.ui.disallowed_tags.clear(); },
+                                PickerCol::Pid => self.ui.allowed_pids = None,
+                                PickerCol::Tid => self.ui.allowed_tids = None,
+                                PickerCol::Tag => {
+                                    self.ui.allowed_tags = None;
+                                    self.ui.disallowed_tags.clear();
+                                }
                                 PickerCol::Level => self.ui.allowed_levels = None,
                             }
                             close = true;
@@ -1176,13 +1357,19 @@ impl App {
                         .show(ui, |ui| {
                             let search_lower = search.to_lowercase();
                             for (val, cnt) in &options {
-                                if !search_lower.is_empty() && !val.to_lowercase().contains(&search_lower) {
+                                if !search_lower.is_empty()
+                                    && !val.to_lowercase().contains(&search_lower)
+                                {
                                     continue;
                                 }
                                 let mut on = selected.contains(val);
                                 let label = format!("{val}    ({cnt})");
                                 if ui.checkbox(&mut on, label).changed() {
-                                    if on { selected.insert(val.clone()); } else { selected.remove(val); }
+                                    if on {
+                                        selected.insert(val.clone());
+                                    } else {
+                                        selected.remove(val);
+                                    }
                                     changed = true;
                                 }
                             }
@@ -1201,7 +1388,10 @@ impl App {
         // frame it opened (the opening click itself lands outside the panel).
         let clicked_outside = !picker.just_opened
             && ctx.input(|i| i.pointer.any_click())
-            && !area_resp.response.rect.contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO)));
+            && !area_resp
+                .response
+                .rect
+                .contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO)));
         if clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             close = true;
         }
@@ -1214,15 +1404,16 @@ impl App {
                 PickerCol::Tag => {
                     // Keep disallowed_tags in sync: anything visible in the picker
                     // but not selected is explicitly excluded.
-                    self.ui.disallowed_tags = options.iter()
+                    self.ui.disallowed_tags = options
+                        .iter()
                         .map(|(k, _)| k.clone())
                         .filter(|k| !selected.contains(k))
                         .collect();
                     self.ui.allowed_tags = Some(selected.clone());
-                },
+                }
                 PickerCol::Level => {
                     let masks = crate::model::LEVEL_MASKS;
-                    let labels = ['V','D','I','W','E','F'];
+                    let labels = ['V', 'D', 'I', 'W', 'E', 'F'];
                     let mut mask = LevelMask::empty();
                     for (i, lb) in labels.iter().enumerate() {
                         if selected.contains(&lb.to_string()) {
@@ -1261,8 +1452,14 @@ fn resolve_startup_lang(stored: &str) {
         "zh" => "zh-CN",
         "en" => "en-US",
         _ => {
-            let loc = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase();
-            if loc.starts_with("zh") { "zh-CN" } else { "en-US" }
+            let loc = sys_locale::get_locale()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if loc.starts_with("zh") {
+                "zh-CN"
+            } else {
+                "en-US"
+            }
         }
     };
     egui_i18n::set_language(code);
@@ -1281,9 +1478,14 @@ fn open_dir(path: &std::path::Path) {
 fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let width = |t: &str| -> f32 {
-        ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x
+        ui.painter()
+            .layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
     };
-    if width(s) <= max_width { return s.to_string(); }
+    if width(s) <= max_width {
+        return s.to_string();
+    }
     let chars: Vec<char> = s.chars().collect();
     let join = |keep: usize| -> String {
         let head_len = keep.div_ceil(2);
@@ -1296,9 +1498,14 @@ fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     while lo <= hi {
         let mid = (lo + hi) / 2;
         let cand = join(mid);
-        if width(&cand) <= max_width { best = cand; lo = mid + 1; }
-        else if mid == 0 { break; }
-        else { hi = mid - 1; }
+        if width(&cand) <= max_width {
+            best = cand;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
     }
     best
 }
@@ -1312,8 +1519,12 @@ fn level_color(lv: LevelMask, colors: &[Color32; 6]) -> Color32 {
 fn parse_level_colors(cfg: &Config) -> [Color32; 6] {
     let masks = crate::model::LEVEL_MASKS;
     let strings: [&str; 6] = [
-        &cfg.colors.level_v, &cfg.colors.level_d, &cfg.colors.level_i,
-        &cfg.colors.level_w, &cfg.colors.level_e, &cfg.colors.level_f,
+        &cfg.colors.level_v,
+        &cfg.colors.level_d,
+        &cfg.colors.level_i,
+        &cfg.colors.level_w,
+        &cfg.colors.level_e,
+        &cfg.colors.level_f,
     ];
     let mut colors = [Color32::BLACK; 6];
     for (i, s) in strings.iter().enumerate() {
@@ -1333,16 +1544,50 @@ struct EmptyShortcutRow {
 
 fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
     let rows = [
-        (tr!("shortcut_file"), format!("Ctrl/Cmd+S - {}", tr!("sh_save"))),
-        (tr!("shortcut_bookmarks"), format!("Ctrl/Cmd+F2 - {}", tr!("sh_toggle_bookmark"))),
-        (tr!("shortcut_bookmarks"), format!("F2 - {}", tr!("sh_prev_bookmark"))),
-        (tr!("shortcut_bookmarks"), format!("F3 - {}", tr!("sh_next_bookmark"))),
-        (tr!("shortcut_line"), format!("Ctrl/Cmd+C - {}", tr!("sh_copy_selected"))),
-        (tr!("shortcut_line"), format!("PageUp / PageDown - {}", tr!("sh_page_up_down"))),
-        (tr!("shortcut_line"), format!("{} - {}", tr!("sh_double_click_lbl"), tr!("sh_double_click"))),
-        (tr!("shortcut_line"), format!("{} - {}", tr!("sh_alt_click_lbl"), tr!("sh_alt_click"))),
-        (tr!("shortcut_font"), format!("Ctrl/Cmd+Plus / Ctrl/Cmd+Minus - {}", tr!("sh_font_size"))),
-        (tr!("shortcut_font"), format!("Ctrl/Cmd+0 - {}", tr!("sh_reset_font"))),
+        (
+            tr!("shortcut_file"),
+            format!("Ctrl/Cmd+S - {}", tr!("sh_save")),
+        ),
+        (
+            tr!("shortcut_bookmarks"),
+            format!("Ctrl/Cmd+F2 - {}", tr!("sh_toggle_bookmark")),
+        ),
+        (
+            tr!("shortcut_bookmarks"),
+            format!("F2 - {}", tr!("sh_prev_bookmark")),
+        ),
+        (
+            tr!("shortcut_bookmarks"),
+            format!("F3 - {}", tr!("sh_next_bookmark")),
+        ),
+        (
+            tr!("shortcut_line"),
+            format!("Ctrl/Cmd+C - {}", tr!("sh_copy_selected")),
+        ),
+        (
+            tr!("shortcut_line"),
+            format!("PageUp / PageDown - {}", tr!("sh_page_up_down")),
+        ),
+        (
+            tr!("shortcut_line"),
+            format!(
+                "{} - {}",
+                tr!("sh_double_click_lbl"),
+                tr!("sh_double_click")
+            ),
+        ),
+        (
+            tr!("shortcut_line"),
+            format!("{} - {}", tr!("sh_alt_click_lbl"), tr!("sh_alt_click")),
+        ),
+        (
+            tr!("shortcut_font"),
+            format!("Ctrl/Cmd+Plus / Ctrl/Cmd+Minus - {}", tr!("sh_font_size")),
+        ),
+        (
+            tr!("shortcut_font"),
+            format!("Ctrl/Cmd+0 - {}", tr!("sh_reset_font")),
+        ),
     ];
     rows.into_iter()
         .map(|(tag, message)| EmptyShortcutRow { tag, message })
@@ -1361,7 +1606,12 @@ fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
     }
 }
 
-fn page_row(selected: Option<usize>, len: usize, visible_rows: usize, forward: bool) -> Option<usize> {
+fn page_row(
+    selected: Option<usize>,
+    len: usize,
+    visible_rows: usize,
+    forward: bool,
+) -> Option<usize> {
     if len == 0 {
         return None;
     }
@@ -1385,10 +1635,20 @@ fn build_highlighted(
     highlight_palette: &[Color32],
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
-    if text.is_empty() { return job; }
+    if text.is_empty() {
+        return job;
+    }
     // Fast path: no tokens → plain text, skip to_lowercase allocation.
     if highlights.is_empty() && finds.is_empty() {
-        job.append(text, 0.0, TextFormat { color: fg, font_id: font, ..Default::default() });
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                color: fg,
+                font_id: font,
+                ..Default::default()
+            },
+        );
         return job;
     }
 
@@ -1404,9 +1664,13 @@ fn build_highlighted(
     if all_ascii {
         let hay = text.as_bytes();
         for (ti, tok) in highlights.iter().enumerate() {
-            if tok.is_empty() { continue; }
+            if tok.is_empty() {
+                continue;
+            }
             let nee = tok.as_bytes();
-            if nee.len() > hay.len() { continue; }
+            if nee.len() > hay.len() {
+                continue;
+            }
             'outer: for start in 0..=hay.len() - nee.len() {
                 for (j, &nb) in nee.iter().enumerate() {
                     if hay[start + j].to_ascii_lowercase() != nb {
@@ -1417,9 +1681,13 @@ fn build_highlighted(
             }
         }
         for tok in finds {
-            if tok.is_empty() { continue; }
+            if tok.is_empty() {
+                continue;
+            }
             let nee = tok.as_bytes();
-            if nee.len() > hay.len() { continue; }
+            if nee.len() > hay.len() {
+                continue;
+            }
             'outer: for start in 0..=hay.len() - nee.len() {
                 for (j, &nb) in nee.iter().enumerate() {
                     if hay[start + j].to_ascii_lowercase() != nb {
@@ -1436,14 +1704,17 @@ fn build_highlighted(
         // `text.to_lowercase()` copy, which can change byte lengths for
         // characters such as ẞ (3 bytes) → ß (2 bytes), making offsets from the
         // lowercased copy invalid when applied back to `text`.
-        let all_tokens: Vec<(Option<usize>, &str)> = highlights.iter()
+        let all_tokens: Vec<(Option<usize>, &str)> = highlights
+            .iter()
             .enumerate()
             .map(|(i, t)| (Some(i), t.as_str()))
             .chain(finds.iter().map(|t| (None, t.as_str())))
             .collect();
 
         for (kind, tok) in &all_tokens {
-            if tok.is_empty() { continue; }
+            if tok.is_empty() {
+                continue;
+            }
             // Collect the token's chars lowercased once.
             let tok_chars: Vec<char> = tok.chars().collect();
             let tok_char_count = tok_chars.len();
@@ -1451,7 +1722,9 @@ fn build_highlighted(
             // Use char_indices so we always have valid byte positions.
             let char_positions: Vec<(usize, char)> = text.char_indices().collect();
             let n = char_positions.len();
-            if tok_char_count > n { continue; }
+            if tok_char_count > n {
+                continue;
+            }
             let mut i = 0;
             while i + tok_char_count <= n {
                 let matches = char_positions[i..i + tok_char_count]
@@ -1482,14 +1755,20 @@ fn build_highlighted(
     for h in hits {
         if let Some(last) = merged.last_mut() {
             if h.0 < last.1 {
-                if h.1 > last.1 { last.1 = h.1; }
+                if h.1 > last.1 {
+                    last.1 = h.1;
+                }
                 continue;
             }
         }
         merged.push(h);
     }
 
-    let base = TextFormat { color: fg, font_id: font.clone(), ..Default::default() };
+    let base = TextFormat {
+        color: fg,
+        font_id: font.clone(),
+        ..Default::default()
+    };
     let mut cursor = 0;
     for (s, e, kind) in merged {
         if s > cursor {
@@ -1637,7 +1916,6 @@ impl App {
                 });
 
                 ui.menu_button(tr!("m_format"), |ui| {
-
                     // ── Font submenu: lists imported fonts ────────────────
                     ui.menu_button(tr!("font"), |ui| {
                         ui.set_min_width(220.0);
@@ -1663,7 +1941,11 @@ impl App {
                                         let resp = ui.selectable_label(sel, label);
                                         if resp.clicked() && !sel {
                                             self.cfg.view.font = stem.clone();
-                                            install_ui_font(&ctx, &self.cfg.view.font, &self.user_font_stems);
+                                            install_ui_font(
+                                                &ctx,
+                                                &self.cfg.view.font,
+                                                &self.user_font_stems,
+                                            );
                                             ui.close();
                                         }
                                     }
@@ -1701,7 +1983,8 @@ impl App {
 
                 ui.menu_button(tr!("m_view"), |ui| {
                     ui.menu_button(tr!("columns"), |ui| {
-                        ui.checkbox(&mut self.ui.col_bookmark, tr!("col_mark")).on_hover_text(tr!("col_mark_hover"));
+                        ui.checkbox(&mut self.ui.col_bookmark, tr!("col_mark"))
+                            .on_hover_text(tr!("col_mark_hover"));
                         ui.checkbox(&mut self.ui.col_line, tr!("col_line"));
                         ui.checkbox(&mut self.ui.col_date, tr!("col_date"));
                         ui.checkbox(&mut self.ui.col_time, tr!("col_time"));
@@ -1738,14 +2021,11 @@ impl App {
                             }
                         }
                     });
-
                 });
 
                 ui.menu_button(tr!("m_encoding"), |ui| {
-                    for (label, value) in [
-                        (tr!("local"), "local"),
-                        ("UTF-8".to_string(), "utf-8"),
-                    ] {
+                    for (label, value) in [(tr!("local"), "local"), ("UTF-8".to_string(), "utf-8")]
+                    {
                         let selected = self.ui.encoding == value;
                         if ui.selectable_label(selected, label).clicked() {
                             self.ui.encoding = value.into();
@@ -1785,10 +2065,12 @@ impl App {
             ui.horizontal(|ui| {
                 dirty |= ui.checkbox(&mut self.ui.find_on, tr!("find")).changed();
                 let w = (ui.available_width() - 8.0).max(200.0);
-                let r = ui.add(egui::TextEdit::singleline(&mut self.ui.find)
-                    .id(egui::Id::new("filter_find_edit"))
-                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                    .desired_width(w));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.ui.find)
+                        .id(egui::Id::new("filter_find_edit"))
+                        .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                        .desired_width(w),
+                );
                 dirty |= r.changed();
             });
 
@@ -1797,17 +2079,31 @@ impl App {
                 let avail = ui.available_width();
                 let text_w = (avail / 2.0 - 100.0).max(120.0);
                 dirty |= ui.checkbox(&mut self.ui.remove_on, tr!("remove")).changed();
-                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.remove)
-                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                    .desired_width(text_w)).changed();
+                dirty |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.ui.remove)
+                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                            .desired_width(text_w),
+                    )
+                    .changed();
                 ui.separator();
-                dirty |= ui.checkbox(&mut self.ui.highlight_on, tr!("highlight")).changed();
-                dirty |= ui.add(egui::TextEdit::singleline(&mut self.ui.highlight)
-                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                    .desired_width(text_w)).changed();
+                dirty |= ui
+                    .checkbox(&mut self.ui.highlight_on, tr!("highlight"))
+                    .changed();
+                dirty |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.ui.highlight)
+                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                            .desired_width(text_w),
+                    )
+                    .changed();
                 ui.separator();
-                dirty |= ui.checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only")).changed();
-                dirty |= ui.checkbox(&mut self.ui.errors_only, tr!("errors_only")).changed();
+                dirty |= ui
+                    .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut self.ui.errors_only, tr!("errors_only"))
+                    .changed();
             });
 
             // Row 3: adb toolbar + Goto + Auto-scroll
@@ -1826,26 +2122,57 @@ impl App {
                 ui.label(tr!("device"));
                 let devices = self.adb_devices.clone();
                 egui::ComboBox::from_id_salt("device")
-                    .selected_text(if self.selected_device.is_empty() { tr!("device_any") } else { self.selected_device.clone() })
+                    .selected_text(if self.selected_device.is_empty() {
+                        tr!("device_any")
+                    } else {
+                        self.selected_device.clone()
+                    })
                     .width(160.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected_device, String::new(), tr!("device_any"));
+                        ui.selectable_value(
+                            &mut self.selected_device,
+                            String::new(),
+                            tr!("device_any"),
+                        );
                         for d in &devices {
                             ui.selectable_value(&mut self.selected_device, d.clone(), d);
                         }
                     });
-                if ui.button("↻").on_hover_text(tr!("refresh_devices")).clicked() {
+                if ui
+                    .button("↻")
+                    .on_hover_text(tr!("refresh_devices"))
+                    .clicked()
+                {
                     self.refresh_devices();
                 }
                 ui.separator();
-                if ui.button(if running { tr!("restart") } else { tr!("run") }).clicked() {
+                if ui
+                    .button(if running { tr!("restart") } else { tr!("run") })
+                    .clicked()
+                {
                     self.adb_run();
                 }
-                let pause_label = self.adb_session.as_ref().map(|s| if s.is_paused() { tr!("resume") } else { tr!("pause") }).unwrap_or(tr!("pause"));
-                if ui.add_enabled(running, egui::Button::new(pause_label)).clicked() {
+                let pause_label = self
+                    .adb_session
+                    .as_ref()
+                    .map(|s| {
+                        if s.is_paused() {
+                            tr!("resume")
+                        } else {
+                            tr!("pause")
+                        }
+                    })
+                    .unwrap_or(tr!("pause"));
+                if ui
+                    .add_enabled(running, egui::Button::new(pause_label))
+                    .clicked()
+                {
                     self.adb_pause_toggle();
                 }
-                if ui.add_enabled(running, egui::Button::new(tr!("stop"))).clicked() {
+                if ui
+                    .add_enabled(running, egui::Button::new(tr!("stop")))
+                    .clicked()
+                {
                     self.adb_stop();
                 }
                 if ui.button(tr!("clear")).clicked() {
@@ -1853,16 +2180,21 @@ impl App {
                 }
                 ui.separator();
                 ui.label(tr!("goto"));
-                let goto_resp = ui.add(egui::TextEdit::singleline(&mut self.ui.goto_line).desired_width(90.0));
+                let goto_resp =
+                    ui.add(egui::TextEdit::singleline(&mut self.ui.goto_line).desired_width(90.0));
                 if goto_resp.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(n) = self.ui.goto_line.trim().parse::<usize>() {
-                        if n > 0 { goto_target = Some(n - 1); }
+                        if n > 0 {
+                            goto_target = Some(n - 1);
+                        }
                     }
                 }
                 ui.checkbox(&mut self.auto_scroll, tr!("auto_scroll"));
             });
         });
-        if dirty { self.notify_filter(); }
+        if dirty {
+            self.notify_filter();
+        }
         if let Some(row) = goto_target {
             let m = self.model.read_recover();
             if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
@@ -1926,57 +2258,61 @@ impl App {
 
     fn ui_indicator(&mut self, ui: &mut egui::Ui) {
         // Indicator panel (mini-scrollbar)
-        egui::Panel::right("indicator").exact_size(24.0).resizable(false).show(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, Color32::from_gray(30));
-            let model = self.model.read_recover();
-            let total = model.filtered.len();
-            if total > 0 {
-                let h = rect.height();
-                let left_col = egui::Rect::from_min_max(
-                    rect.min,
-                    egui::pos2(rect.min.x + rect.width() * 0.5, rect.max.y),
-                );
-                let right_col = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x + rect.width() * 0.5, rect.min.y),
-                    rect.max,
-                );
-                let paint_mark = |fi: usize, col: egui::Rect, color: Color32| {
-                    let y = col.min.y + h * (fi as f32) / (total as f32);
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(col.min.x, y),
-                            egui::vec2(col.width(), 2.0),
-                        ),
-                        0.0,
-                        color,
+        egui::Panel::right("indicator")
+            .exact_size(24.0)
+            .resizable(false)
+            .show(ui, |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, Color32::from_gray(30));
+                let model = self.model.read_recover();
+                let total = model.filtered.len();
+                if total > 0 {
+                    let h = rect.height();
+                    let left_col = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.min.x + rect.width() * 0.5, rect.max.y),
                     );
-                };
-                for &ei in &model.bookmarks {
-                    // `filtered` is built by scanning entries in ascending order.
-                    if let Ok(fi) = model.filtered.binary_search(&ei) {
-                        paint_mark(fi, left_col, Color32::from_rgb(80, 140, 255));
+                    let right_col = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + rect.width() * 0.5, rect.min.y),
+                        rect.max,
+                    );
+                    let paint_mark = |fi: usize, col: egui::Rect, color: Color32| {
+                        let y = col.min.y + h * (fi as f32) / (total as f32);
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(col.min.x, y),
+                                egui::vec2(col.width(), 2.0),
+                            ),
+                            0.0,
+                            color,
+                        );
+                    };
+                    for &ei in &model.bookmarks {
+                        // `filtered` is built by scanning entries in ascending order.
+                        if let Ok(fi) = model.filtered.binary_search(&ei) {
+                            paint_mark(fi, left_col, Color32::from_rgb(80, 140, 255));
+                        }
+                    }
+                    for &ei in &model.error_lines {
+                        // `filtered` is built by scanning entries in ascending order.
+                        if let Ok(fi) = model.filtered.binary_search(&ei) {
+                            paint_mark(fi, right_col, Color32::from_rgb(255, 80, 80));
+                        }
+                    }
+                    // Handle click to jump
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let frac = ((pos.y - rect.min.y) / h).clamp(0.0, 1.0);
+                        let target = (frac * total as f32) as usize;
+                        self.pending_scroll = Some(target.min(total.saturating_sub(1)));
+                        self.selected_rows.clear();
+                        self.selected_rows.insert(self.pending_scroll.unwrap_or(0));
+                        self.selection_anchor = self.pending_scroll;
+                        self.selection_cursor = self.pending_scroll;
                     }
                 }
-                for &ei in &model.error_lines {
-                    // `filtered` is built by scanning entries in ascending order.
-                    if let Ok(fi) = model.filtered.binary_search(&ei) {
-                        paint_mark(fi, right_col, Color32::from_rgb(255, 80, 80));
-                    }
-                }
-                // Handle click to jump
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let frac = ((pos.y - rect.min.y) / h).clamp(0.0, 1.0);
-                    let target = (frac * total as f32) as usize;
-                    self.pending_scroll = Some(target.min(total.saturating_sub(1)));
-                    self.selected_rows.clear();
-                    self.selected_rows.insert(self.pending_scroll.unwrap_or(0));
-                    self.selection_anchor = self.pending_scroll;
-                    self.selection_cursor = self.pending_scroll;
-                }
-            }
-        });
+            });
     }
 
     fn ui_table(&mut self, ui: &mut egui::Ui) {
@@ -1990,20 +2326,26 @@ impl App {
             let find_tokens: &[String] = &self.cached_find_tokens;
 
             let (cl, cd, ct, clv, cpi, cth, cta, cmk, cms) = (
-                tr!("col_line"), tr!("col_date"), tr!("col_time"), tr!("col_lv"),
-                tr!("col_pid"), tr!("col_thread"), tr!("col_tag"), tr!("col_mark"),
+                tr!("col_line"),
+                tr!("col_date"),
+                tr!("col_time"),
+                tr!("col_lv"),
+                tr!("col_pid"),
+                tr!("col_thread"),
+                tr!("col_tag"),
+                tr!("col_mark"),
                 tr!("col_message"),
             );
             let cols_show: [(bool, &str, f32); 9] = [
-                (self.ui.col_line,     &cl,    self.cached_col_widths[0]),
-                (self.ui.col_date,     &cd,    self.cached_col_widths[1]),
-                (self.ui.col_time,     &ct,    self.cached_col_widths[2]),
-                (self.ui.col_loglv,    &clv,   self.cached_col_widths[3]),
-                (self.ui.col_pid,      &cpi,   self.cached_col_widths[4]),
-                (self.ui.col_thread,   &cth,   self.cached_col_widths[5]),
-                (self.ui.col_tag,      &cta,   self.cached_col_widths[6]),
-                (self.ui.col_bookmark, &cmk,   self.cached_col_widths[7]),
-                (self.ui.col_message,  &cms,   self.cached_col_widths[8]),
+                (self.ui.col_line, &cl, self.cached_col_widths[0]),
+                (self.ui.col_date, &cd, self.cached_col_widths[1]),
+                (self.ui.col_time, &ct, self.cached_col_widths[2]),
+                (self.ui.col_loglv, &clv, self.cached_col_widths[3]),
+                (self.ui.col_pid, &cpi, self.cached_col_widths[4]),
+                (self.ui.col_thread, &cth, self.cached_col_widths[5]),
+                (self.ui.col_tag, &cta, self.cached_col_widths[6]),
+                (self.ui.col_bookmark, &cmk, self.cached_col_widths[7]),
+                (self.ui.col_message, &cms, self.cached_col_widths[8]),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
             let table_available_height = ui.available_height();
@@ -2021,7 +2363,9 @@ impl App {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .sense(egui::Sense::click());
             for (i, (visible, _, w)) in cols_show.iter().enumerate() {
-                if !*visible { continue; }
+                if !*visible {
+                    continue;
+                }
                 if Some(i) == last_visible {
                     table = table.column(Column::remainder().at_least(*w));
                 } else {
@@ -2054,10 +2398,27 @@ impl App {
 
             // Column meta for header interactions
             #[derive(Clone, Copy)]
-            enum ColKind { Line, Date, Time, Lv, Pid, Thread, Tag, Bookmark, Message }
+            enum ColKind {
+                Line,
+                Date,
+                Time,
+                Lv,
+                Pid,
+                Thread,
+                Tag,
+                Bookmark,
+                Message,
+            }
             let col_kinds: [ColKind; 9] = [
-                ColKind::Line, ColKind::Date, ColKind::Time, ColKind::Lv,
-                ColKind::Pid, ColKind::Thread, ColKind::Tag, ColKind::Bookmark, ColKind::Message,
+                ColKind::Line,
+                ColKind::Date,
+                ColKind::Time,
+                ColKind::Lv,
+                ColKind::Pid,
+                ColKind::Thread,
+                ColKind::Tag,
+                ColKind::Bookmark,
+                ColKind::Message,
             ];
             let picker_of = |k: ColKind| -> Option<PickerCol> {
                 match k {
@@ -2080,7 +2441,9 @@ impl App {
             table
                 .header(header_h, |mut h| {
                     for (i, (visible, name, _)) in cols_show.iter().enumerate() {
-                        if !*visible { continue; }
+                        if !*visible {
+                            continue;
+                        }
                         let kind = col_kinds[i];
                         let pk = picker_of(kind);
                         // Dropdown marker: use ▼ (U+25BC) — a universally recognized
@@ -2094,9 +2457,7 @@ impl App {
                         h.col(|ui| {
                             let resp = ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&label)
-                                        .font(font.clone())
-                                        .strong(),
+                                    egui::RichText::new(&label).font(font.clone()).strong(),
                                 )
                                 .sense(egui::Sense::click()),
                             );
@@ -2107,7 +2468,10 @@ impl App {
                             }
                             resp.context_menu(|ui| {
                                 let can_filter = pk.is_some();
-                                if ui.add_enabled(can_filter, egui::Button::new(tr!("filter_this"))).clicked() {
+                                if ui
+                                    .add_enabled(can_filter, egui::Button::new(tr!("filter_this")))
+                                    .clicked()
+                                {
                                     if let Some(p) = pk {
                                         open_picker = Some((p, resp.rect.left_bottom()));
                                     }
@@ -2138,7 +2502,8 @@ impl App {
                                 }
                                 return;
                             }
-                            let shortcut = &shortcut_rows[row.index() - EMPTY_SHORTCUT_TOP_PADDING_ROWS];
+                            let shortcut =
+                                &shortcut_rows[row.index() - EMPTY_SHORTCUT_TOP_PADDING_ROWS];
                             let text = |s: &str| {
                                 egui::RichText::new(s)
                                     .font(font.clone())
@@ -2193,17 +2558,44 @@ impl App {
                         // View → Font size affects *every* column, not just Tag/Message.
                         // truncate() keeps every cell on a single line (… on overflow).
                         let render = |ui: &mut egui::Ui, s: &str| {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(s).font(font.clone()).color(col),
-                            ).truncate());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(s).font(font.clone()).color(col),
+                                )
+                                .truncate(),
+                            );
                         };
 
-                        if self.ui.col_line     { row.col(|ui| { render(ui, &e.line_no.to_string()); }); }
-                        if self.ui.col_date     { row.col(|ui| { render(ui, e.date()); }); }
-                        if self.ui.col_time     { row.col(|ui| { render(ui, e.time()); }); }
-                        if self.ui.col_loglv    { row.col(|ui| { render(ui, &e.level.as_char().to_string()); }); }
-                        if self.ui.col_pid      { row.col(|ui| { render(ui, e.pid()); }); }
-                        if self.ui.col_thread   { row.col(|ui| { render(ui, e.tid()); }); }
+                        if self.ui.col_line {
+                            row.col(|ui| {
+                                render(ui, &e.line_no.to_string());
+                            });
+                        }
+                        if self.ui.col_date {
+                            row.col(|ui| {
+                                render(ui, e.date());
+                            });
+                        }
+                        if self.ui.col_time {
+                            row.col(|ui| {
+                                render(ui, e.time());
+                            });
+                        }
+                        if self.ui.col_loglv {
+                            row.col(|ui| {
+                                render(ui, &e.level.as_char().to_string());
+                            });
+                        }
+                        if self.ui.col_pid {
+                            row.col(|ui| {
+                                render(ui, e.pid());
+                            });
+                        }
+                        if self.ui.col_thread {
+                            row.col(|ui| {
+                                render(ui, e.tid());
+                            });
+                        }
                         if self.ui.col_tag {
                             // Render a plain (non-interactive) label so the *cell*
                             // keeps the pointer hover — an inner Sense::click label
@@ -2211,8 +2603,12 @@ impl App {
                             let (_, resp) = row.col(|ui| {
                                 if use_highlight {
                                     let job = build_highlighted(
-                                        e.tag(), highlight_tokens, find_tokens,
-                                        col, font.clone(), highlight_palette,
+                                        e.tag(),
+                                        highlight_tokens,
+                                        find_tokens,
+                                        col,
+                                        font.clone(),
+                                        highlight_palette,
                                     );
                                     ui.add(egui::Label::new(job).truncate());
                                 } else {
@@ -2247,8 +2643,12 @@ impl App {
                             let (_, resp) = row.col(|ui| {
                                 if use_highlight {
                                     let job = build_highlighted(
-                                        e.message(), highlight_tokens, find_tokens,
-                                        col, font.clone(), highlight_palette,
+                                        e.message(),
+                                        highlight_tokens,
+                                        find_tokens,
+                                        col,
+                                        font.clone(),
+                                        highlight_palette,
                                     );
                                     ui.add(egui::Label::new(job).truncate());
                                 } else {
@@ -2267,7 +2667,10 @@ impl App {
                                 if ui.button(tr!("copy_message")).clicked() {
                                     if self.selected_rows.len() > 1 {
                                         copy_cell_text = Some(Self::copy_selected_column_text(
-                                            entries, filtered, &self.selected_rows, |e| e.message()
+                                            entries,
+                                            filtered,
+                                            &self.selected_rows,
+                                            |e| e.message(),
                                         ));
                                     } else {
                                         copy_cell_text = Some(e.message().to_string());
@@ -2280,8 +2683,14 @@ impl App {
                                     } else {
                                         copy_cell_text = Some(format!(
                                             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                            e.line_no, e.date(), e.time(), e.level.as_char(),
-                                            e.pid(), e.tid(), e.tag(), e.message()
+                                            e.line_no,
+                                            e.date(),
+                                            e.time(),
+                                            e.level.as_char(),
+                                            e.pid(),
+                                            e.tid(),
+                                            e.tag(),
+                                            e.message()
                                         ));
                                     }
                                     ui.close();
@@ -2325,7 +2734,8 @@ impl App {
                     } else {
                         self.selected_rows.insert(r);
                     }
-                    self.status = tr!("status_ctrl_click", { n: &self.selected_rows.len().to_string() });
+                    self.status =
+                        tr!("status_ctrl_click", { n: &self.selected_rows.len().to_string() });
                 } else if shift {
                     // Use the stored anchor (fixed end), not an arbitrary HashSet
                     // element. Clamp it to the current filtered length so a stale
@@ -2336,9 +2746,12 @@ impl App {
                     let anchor = self.selection_anchor.unwrap_or(r).min(max);
                     let r = r.min(max);
                     let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
-                    for i in lo..=hi { self.selected_rows.insert(i); }
+                    for i in lo..=hi {
+                        self.selected_rows.insert(i);
+                    }
                     self.selection_cursor = Some(r);
-                    self.status = tr!("status_shift_click", { n: &self.selected_rows.len().to_string() });
+                    self.status =
+                        tr!("status_shift_click", { n: &self.selected_rows.len().to_string() });
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
@@ -2348,14 +2761,20 @@ impl App {
             }
             if let Some(r) = double_clicked_row {
                 let entry_idx = self.model.read_recover().filtered.get(r).copied();
-                if let Some(i) = entry_idx { self.toggle_bookmark(i); }
+                if let Some(i) = entry_idx {
+                    self.toggle_bookmark(i);
+                }
                 self.selected_rows.clear();
                 self.selected_rows.insert(r);
                 self.selection_anchor = Some(r);
                 self.selection_cursor = Some(r);
             }
-            if let Some(t) = alt_left_tag { self.add_show_tag(&t); }
-            if let Some(t) = alt_right_tag { self.add_remove_tag(&t); }
+            if let Some(t) = alt_left_tag {
+                self.add_show_tag(&t);
+            }
+            if let Some(t) = alt_right_tag {
+                self.add_remove_tag(&t);
+            }
             if let Some(txt) = copy_cell_text {
                 let n = txt.lines().count();
                 self.copy_text_to_clipboard(&txt, n);
@@ -2378,11 +2797,15 @@ impl App {
             }
             // Open picker requested from column-header click or context menu.
             if let Some((col, anchor)) = open_picker {
-                self.ui.picker = Some(PickerState { col, search: String::new(), anchor, just_opened: true });
+                self.ui.picker = Some(PickerState {
+                    col,
+                    search: String::new(),
+                    anchor,
+                    just_opened: true,
+                });
             }
         });
     }
-
 }
 
 #[cfg(test)]
@@ -2442,13 +2865,19 @@ mod tests {
 
         app.cfg.colors.highlights = vec!["0xFF0000".into()];
         app.refresh_highlight_caches();
-        assert_eq!(app.cached_highlight_palette, vec![Color32::from_rgb(255, 0, 0)]);
+        assert_eq!(
+            app.cached_highlight_palette,
+            vec![Color32::from_rgb(255, 0, 0)]
+        );
 
         // Regression: changing a color without changing the number of palette
         // entries must invalidate the parsed-color cache.
         app.cfg.colors.highlights = vec!["0x0000FF".into()];
         app.refresh_highlight_caches();
-        assert_eq!(app.cached_highlight_palette, vec![Color32::from_rgb(0, 0, 255)]);
+        assert_eq!(
+            app.cached_highlight_palette,
+            vec![Color32::from_rgb(0, 0, 255)]
+        );
         assert_eq!(app.cached_highlight_palette_raw, vec!["0x0000FF"]);
     }
 
@@ -2475,9 +2904,33 @@ mod tests {
         use crate::model::LevelMask;
         let model = Model {
             entries: vec![
-                LogEntry::from_fields("07-10", "10:00:00.000", LevelMask::I, "100", "200", "Tag1", "msg one"),
-                LogEntry::from_fields("07-10", "10:00:01.000", LevelMask::E, "101", "201", "Tag2", "msg two"),
-                LogEntry::from_fields("07-10", "10:00:02.000", LevelMask::W, "102", "202", "Tag3", "msg three"),
+                LogEntry::from_fields(
+                    "07-10",
+                    "10:00:00.000",
+                    LevelMask::I,
+                    "100",
+                    "200",
+                    "Tag1",
+                    "msg one",
+                ),
+                LogEntry::from_fields(
+                    "07-10",
+                    "10:00:01.000",
+                    LevelMask::E,
+                    "101",
+                    "201",
+                    "Tag2",
+                    "msg two",
+                ),
+                LogEntry::from_fields(
+                    "07-10",
+                    "10:00:02.000",
+                    LevelMask::W,
+                    "102",
+                    "202",
+                    "Tag3",
+                    "msg three",
+                ),
             ],
             filtered: vec![0, 1, 2],
             ..Model::default()
@@ -2493,33 +2946,68 @@ mod tests {
             let m = model.read_recover();
             let mut rows: Vec<&usize> = selected_rows.iter().collect();
             rows.sort();
-            let texts: Vec<String> = rows.iter().filter_map(|&&r| {
-                let &ei = m.filtered.get(r)?;
-                let e = &m.entries[ei as usize];
-                Some(format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    e.line_no, e.date(), e.time(), e.level.as_char(), e.pid(), e.tid(), e.tag(), e.message()
-                ))
-            }).collect();
+            let texts: Vec<String> = rows
+                .iter()
+                .filter_map(|&&r| {
+                    let &ei = m.filtered.get(r)?;
+                    let e = &m.entries[ei as usize];
+                    Some(format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        e.line_no,
+                        e.date(),
+                        e.time(),
+                        e.level.as_char(),
+                        e.pid(),
+                        e.tid(),
+                        e.tag(),
+                        e.message()
+                    ))
+                })
+                .collect();
             texts.join("\n")
         };
         let lines: Vec<&str> = text.split('\n').collect();
-        assert_eq!(lines.len(), 2, "should have 2 lines (rows 0 and 2), got: {lines:?}");
-        assert!(lines[0].contains("msg one"), "first line should contain msg one: {lines:?}");
-        assert!(lines[1].contains("msg three"), "second line should contain msg three: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "should have 2 lines (rows 0 and 2), got: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("msg one"),
+            "first line should contain msg one: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("msg three"),
+            "second line should contain msg three: {lines:?}"
+        );
     }
 
     #[test]
     fn detect_format_from_cmd_variants() {
-        assert_eq!(detect_format_from_cmd("logcat -v threadtime"), LogFormat::ThreadTime);
-        assert_eq!(detect_format_from_cmd("logcat -v long"), LogFormat::ThreadTime);
+        assert_eq!(
+            detect_format_from_cmd("logcat -v threadtime"),
+            LogFormat::ThreadTime
+        );
+        assert_eq!(
+            detect_format_from_cmd("logcat -v long"),
+            LogFormat::ThreadTime
+        );
         assert_eq!(detect_format_from_cmd("logcat -v time"), LogFormat::Time);
         assert_eq!(detect_format_from_cmd("logcat -v brief"), LogFormat::Brief);
-        assert_eq!(detect_format_from_cmd("logcat -v process"), LogFormat::Brief);
+        assert_eq!(
+            detect_format_from_cmd("logcat -v process"),
+            LogFormat::Brief
+        );
         assert_eq!(detect_format_from_cmd("logcat -v tag"), LogFormat::Brief);
-        assert_eq!(detect_format_from_cmd("shell cat /proc/kmsg"), LogFormat::Kernel);
+        assert_eq!(
+            detect_format_from_cmd("shell cat /proc/kmsg"),
+            LogFormat::Kernel
+        );
         assert_eq!(detect_format_from_cmd("logcat"), LogFormat::Unknown);
-        assert_eq!(detect_format_from_cmd("logcat -v nonsense"), LogFormat::Unknown);
+        assert_eq!(
+            detect_format_from_cmd("logcat -v nonsense"),
+            LogFormat::Unknown
+        );
     }
 }
 
@@ -2544,10 +3032,20 @@ mod ui_tests {
         use crate::model::LevelMask;
         let mut m = app.model.write().unwrap();
         for i in 0..n {
-            let lv = if i % 5 == 0 { LevelMask::E } else { LevelMask::I };
+            let lv = if i % 5 == 0 {
+                LevelMask::E
+            } else {
+                LevelMask::I
+            };
             let tag = format!("Tag{}", i % 3);
             m.append(LogEntry::from_fields(
-                "07-20", "12:00:00.000", lv, "100", "200", &tag, &format!("msg {i}"),
+                "07-20",
+                "12:00:00.000",
+                lv,
+                "100",
+                "200",
+                &tag,
+                &format!("msg {i}"),
             ));
         }
         m.filtered = (0..n as u32).collect();
@@ -2571,7 +3069,8 @@ mod ui_tests {
 
         assert!(
             h.state().selected_rows.contains(&1),
-            "ArrowDown from row 0 should select row 1, got {:?}", h.state().selected_rows
+            "ArrowDown from row 0 should select row 1, got {:?}",
+            h.state().selected_rows
         );
         assert_eq!(h.state().selection_cursor, Some(1));
     }
@@ -2609,7 +3108,9 @@ mod ui_tests {
         // Should have 4 rows selected: 5,6,7,8
         let sel = &h.state().selected_rows;
         assert_eq!(sel.len(), 4, "expected 4 selected rows, got {}", sel.len());
-        for r in 5..=8 { assert!(sel.contains(&r), "row {r} should be selected"); }
+        for r in 5..=8 {
+            assert!(sel.contains(&r), "row {r} should be selected");
+        }
         assert_eq!(h.state().selection_anchor, Some(5));
         assert_eq!(h.state().selection_cursor, Some(8));
     }
@@ -2629,7 +3130,9 @@ mod ui_tests {
 
         let sel = &h.state().selected_rows;
         assert_eq!(sel.len(), 3); // 8,9,10
-        for r in 8..=10 { assert!(sel.contains(&r)); }
+        for r in 8..=10 {
+            assert!(sel.contains(&r));
+        }
     }
 
     #[test]
@@ -2669,11 +3172,17 @@ mod ui_tests {
         // F3 = next bookmark
         h.key_press(egui::Key::F3);
         h.run();
-        assert!(h.state().selected_rows.contains(&10), "F3 should jump to bookmark at 10");
+        assert!(
+            h.state().selected_rows.contains(&10),
+            "F3 should jump to bookmark at 10"
+        );
 
         h.key_press(egui::Key::F3);
         h.run();
-        assert!(h.state().selected_rows.contains(&20), "F3 again should jump to bookmark at 20");
+        assert!(
+            h.state().selected_rows.contains(&20),
+            "F3 again should jump to bookmark at 20"
+        );
     }
 
     // ─── Button clicks (real egui hit-test) ──────────────────────────────
@@ -2783,11 +3292,17 @@ mod ui_tests {
         // F2 = previous bookmark
         h.key_press(egui::Key::F2);
         h.run();
-        assert!(h.state().selected_rows.contains(&20), "F2 should jump back to bookmark 20");
+        assert!(
+            h.state().selected_rows.contains(&20),
+            "F2 should jump back to bookmark 20"
+        );
 
         h.key_press(egui::Key::F2);
         h.run();
-        assert!(h.state().selected_rows.contains(&5), "F2 again should jump back to bookmark 5");
+        assert!(
+            h.state().selected_rows.contains(&5),
+            "F2 again should jump back to bookmark 5"
+        );
     }
 
     #[test]
@@ -2859,7 +3374,8 @@ mod ui_tests {
         h.run();
 
         assert_eq!(
-            h.state().cfg.view.font_size, 13.0,
+            h.state().cfg.view.font_size,
+            13.0,
             "Ctrl+0 should reset to default 13.0"
         );
     }
@@ -2965,21 +3481,34 @@ mod ui_tests {
 
         // Write a small threadtime logcat file
         let tmp = std::env::temp_dir().join(format!("lf_open_{}.log", std::process::id()));
-        std::fs::write(&tmp, "\
+        std::fs::write(
+            &tmp,
+            "\
 01-01 10:00:00.000  100  200 I Tag1: first line\n\
 01-01 10:00:01.000  100  200 W Tag2: second line\n\
 01-01 10:00:02.000  100  200 E Tag1: third line\n\
-").unwrap();
+",
+        )
+        .unwrap();
 
         let result = h.state_mut().open_file(&tmp);
-        assert!(result.is_ok(), "open_file should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "open_file should succeed: {:?}",
+            result.err()
+        );
 
         // Give the ingest thread time to process
         std::thread::sleep(std::time::Duration::from_millis(100));
         h.run();
 
         let m = h.state().model.read().unwrap();
-        assert_eq!(m.entries.len(), 3, "should have 3 entries, got {}", m.entries.len());
+        assert_eq!(
+            m.entries.len(),
+            3,
+            "should have 3 entries, got {}",
+            m.entries.len()
+        );
         assert_eq!(m.file_path.as_ref().unwrap(), &tmp);
         assert_eq!(m.entries[0].tag(), "Tag1");
         assert_eq!(m.entries[1].tag(), "Tag2");
@@ -2994,7 +3523,9 @@ mod ui_tests {
         let mut h = harness();
         h.run();
 
-        let result = h.state_mut().open_file(std::path::Path::new("/tmp/nonexistent_logfilter_test_xyz.log"));
+        let result = h.state_mut().open_file(std::path::Path::new(
+            "/tmp/nonexistent_logfilter_test_xyz.log",
+        ));
         assert!(result.is_err(), "open_file on nonexistent path should fail");
     }
 

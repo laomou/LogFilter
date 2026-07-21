@@ -1,4 +1,7 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod adb;
 mod app;
@@ -38,7 +41,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "LogFilter",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg.clone(), initial_file.clone())))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                cfg.clone(),
+                initial_file.clone(),
+            )))
+        }),
     )
 }
 
@@ -64,7 +73,11 @@ fn load_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../assets/icon.ico");
     let image = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
-    Some(egui::IconData { rgba: image.into_raw(), width, height })
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 use crate::model::{LevelMask, LogEntry};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FilterSpec {
     /// None = every level passes; Some(mask) = only levels in mask pass.
     pub allowed_levels: Option<LevelMask>,
@@ -21,7 +20,6 @@ pub struct FilterSpec {
     pub bookmarks_only: bool,
     pub errors_only: bool,
 }
-
 
 impl FilterSpec {
     /// Split a raw text field on `|` into lowercased trimmed tokens.
@@ -59,7 +57,9 @@ impl FilterSpec {
         if self.bookmarks_only && !bookmarks.contains(&entry_idx) {
             return false;
         }
-        if self.errors_only && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F)) {
+        if self.errors_only
+            && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F))
+        {
             return false;
         }
         if !self.find.is_empty() && !any_contains(entry.message(), &self.find) {
@@ -121,7 +121,10 @@ mod tests {
 
     #[test]
     fn level_mask_filters() {
-        let spec = FilterSpec { allowed_levels: Some(LevelMask::E), ..FilterSpec::default() };
+        let spec = FilterSpec {
+            allowed_levels: Some(LevelMask::E),
+            ..FilterSpec::default()
+        };
         let hs = HashSet::new();
         assert!(spec.matches(&e("x", "T", LevelMask::E), 0, &hs));
         assert!(!spec.matches(&e("x", "T", LevelMask::D), 0, &hs));
@@ -129,12 +132,18 @@ mod tests {
 
     #[test]
     fn find_or_remove() {
-        let spec = FilterSpec { find: vec!["hello".into()], ..FilterSpec::default() };
+        let spec = FilterSpec {
+            find: vec!["hello".into()],
+            ..FilterSpec::default()
+        };
         let hs = HashSet::new();
         assert!(spec.matches(&e("Hello world", "T", LevelMask::I), 0, &hs));
         assert!(!spec.matches(&e("bye", "T", LevelMask::I), 0, &hs));
 
-        let spec = FilterSpec { remove: vec!["spam".into()], ..FilterSpec::default() };
+        let spec = FilterSpec {
+            remove: vec!["spam".into()],
+            ..FilterSpec::default()
+        };
         assert!(!spec.matches(&e("spam here", "T", LevelMask::I), 0, &hs));
         assert!(spec.matches(&e("clean", "T", LevelMask::I), 0, &hs));
     }
@@ -148,7 +157,7 @@ mod tests {
         assert!(!contains_ci("abc", "xyz"));
         assert!(!contains_ci("ab", "abc")); // needle longer than hay
         assert!(contains_ci("anything", "")); // empty needle matches
-        // Multibyte haystack must not corrupt the byte scan
+                                              // Multibyte haystack must not corrupt the byte scan
         assert!(contains_ci("日志Error信息", "error"));
         assert!(!contains_ci("日志信息", "error"));
         // Non-ASCII needle falls back to Unicode lowercasing
@@ -216,7 +225,10 @@ mod tests {
 
     #[test]
     fn bookmarks_only_filters() {
-        let spec = FilterSpec { bookmarks_only: true, ..Default::default() };
+        let spec = FilterSpec {
+            bookmarks_only: true,
+            ..Default::default()
+        };
         let mut bm = HashSet::new();
         bm.insert(5u32);
         assert!(spec.matches(&e("m", "T", LevelMask::I), 5, &bm));
@@ -225,7 +237,10 @@ mod tests {
 
     #[test]
     fn errors_only_filters() {
-        let spec = FilterSpec { errors_only: true, ..Default::default() };
+        let spec = FilterSpec {
+            errors_only: true,
+            ..Default::default()
+        };
         let hs = HashSet::new();
         assert!(spec.matches(&e("m", "T", LevelMask::E), 0, &hs));
         assert!(spec.matches(&e("m", "T", LevelMask::F), 0, &hs));
@@ -235,7 +250,10 @@ mod tests {
 
     #[test]
     fn multiple_find_tokens_or_semantics() {
-        let spec = FilterSpec { find: vec!["foo".into(), "bar".into()], ..Default::default() };
+        let spec = FilterSpec {
+            find: vec!["foo".into(), "bar".into()],
+            ..Default::default()
+        };
         let hs = HashSet::new();
         assert!(spec.matches(&e("contains foo here", "T", LevelMask::I), 0, &hs));
         assert!(spec.matches(&e("has bar inside", "T", LevelMask::I), 0, &hs));
@@ -244,7 +262,10 @@ mod tests {
 
     #[test]
     fn multiple_remove_tokens_or_semantics() {
-        let spec = FilterSpec { remove: vec!["spam".into(), "ads".into()], ..Default::default() };
+        let spec = FilterSpec {
+            remove: vec!["spam".into(), "ads".into()],
+            ..Default::default()
+        };
         let hs = HashSet::new();
         assert!(!spec.matches(&e("spam message", "T", LevelMask::I), 0, &hs));
         assert!(!spec.matches(&e("has ads", "T", LevelMask::I), 0, &hs));

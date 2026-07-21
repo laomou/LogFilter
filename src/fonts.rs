@@ -1,13 +1,20 @@
 use crate::config;
 pub fn list_user_font_stems() -> Vec<(String, String)> {
-    let Some(dir) = config::fonts_dir() else { return vec![] };
-    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    let Some(dir) = config::fonts_dir() else {
+        return vec![];
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
     let mut entries: Vec<_> = rd
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
             matches!(
-                p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .as_deref(),
                 Some("ttf") | Some("otf") | Some("ttc") | Some("otc"),
             )
         })
@@ -56,10 +63,9 @@ pub fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, Str
                     name.clone(),
                     std::sync::Arc::new(egui::FontData::from_owned(bytes)),
                 );
-                fonts.families.insert(
-                    egui::FontFamily::Name(name.clone().into()),
-                    vec![name],
-                );
+                fonts
+                    .families
+                    .insert(egui::FontFamily::Name(name.clone().into()), vec![name]);
                 loaded = true;
             }
         }
@@ -81,7 +87,10 @@ pub fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, Str
 }
 
 /// Find a font's path on disk given its file stem and the stems list.
-pub fn find_font_file(stems: &[(String, String)], stem: &str) -> Option<(usize, std::path::PathBuf)> {
+pub fn find_font_file(
+    stems: &[(String, String)],
+    stem: &str,
+) -> Option<(usize, std::path::PathBuf)> {
     let dir = config::fonts_dir()?;
     let pos = stems.iter().position(|(s, _)| s == stem)?;
     // Reconstruct the path from the stored display name.

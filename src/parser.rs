@@ -25,10 +25,8 @@ fn re_time() -> &'static Regex {
 fn re_brief() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(
-            r"^(?P<lv>[VDIWEFA])/(?P<tag>[^()]+?)\(\s*(?P<pid>\d+)\s*\):\s?(?P<msg>.*)$",
-        )
-        .unwrap()
+        Regex::new(r"^(?P<lv>[VDIWEFA])/(?P<tag>[^()]+?)\(\s*(?P<pid>\d+)\s*\):\s?(?P<msg>.*)$")
+            .unwrap()
     })
 }
 
@@ -76,41 +74,94 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
         let s = line.as_str();
 
         // Helper closures — called at most once each.
-        let try_threadtime = |s: &str| re_threadtime().captures(s).map(|c| {
-            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            (LogFormat::ThreadTime, lv, [
-                span(&c, "date"), span(&c, "time"), span(&c, "pid"),
-                span(&c, "tid"), trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ])
-        });
-        let try_time = |s: &str| re_time().captures(s).map(|c| {
-            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            (LogFormat::Time, lv, [
-                span(&c, "date"), span(&c, "time"), span(&c, "pid"),
-                EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ])
-        });
-        let try_brief = |s: &str| re_brief().captures(s).map(|c| {
-            let lv = c["lv"].chars().next().and_then(LevelMask::from_char).unwrap_or(LevelMask::V);
-            (LogFormat::Brief, lv, [
-                EMPTY, EMPTY, span(&c, "pid"),
-                EMPTY, trim_span(s, span(&c, "tag")), span(&c, "msg"),
-            ])
-        });
-        let try_kernel = |s: &str| re_kernel().captures(s).map(|c| {
-            let digit: u8 = c["lv"].parse().unwrap_or(7);
-            (LogFormat::Kernel, LevelMask::from_kernel_digit(digit), [
-                EMPTY, span(&c, "time"), EMPTY, EMPTY, EMPTY, span(&c, "msg"),
-            ])
-        });
+        let try_threadtime = |s: &str| {
+            re_threadtime().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::ThreadTime,
+                    lv,
+                    [
+                        span(&c, "date"),
+                        span(&c, "time"),
+                        span(&c, "pid"),
+                        span(&c, "tid"),
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
+        let try_time = |s: &str| {
+            re_time().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::Time,
+                    lv,
+                    [
+                        span(&c, "date"),
+                        span(&c, "time"),
+                        span(&c, "pid"),
+                        EMPTY,
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
+        let try_brief = |s: &str| {
+            re_brief().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::Brief,
+                    lv,
+                    [
+                        EMPTY,
+                        EMPTY,
+                        span(&c, "pid"),
+                        EMPTY,
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
+        let try_kernel = |s: &str| {
+            re_kernel().captures(s).map(|c| {
+                let digit: u8 = c["lv"].parse().unwrap_or(7);
+                (
+                    LogFormat::Kernel,
+                    LevelMask::from_kernel_digit(digit),
+                    [
+                        EMPTY,
+                        span(&c, "time"),
+                        EMPTY,
+                        EMPTY,
+                        EMPTY,
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
 
         // Try the hinted format first; fall back to the full scan only on a miss.
         let hinted = match hint {
             LogFormat::ThreadTime => try_threadtime(s),
-            LogFormat::Time       => try_time(s),
-            LogFormat::Brief      => try_brief(s),
-            LogFormat::Kernel     => try_kernel(s),
-            LogFormat::Unknown    => None,
+            LogFormat::Time => try_time(s),
+            LogFormat::Brief => try_brief(s),
+            LogFormat::Kernel => try_kernel(s),
+            LogFormat::Unknown => None,
         };
 
         if hinted.is_some() {
@@ -119,16 +170,22 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             // Full scan in priority order (ThreadTime → Time → Brief → Kernel),
             // skipping whichever format the hint already tried.
             match hint {
-                LogFormat::ThreadTime =>
-                    try_time(s).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
-                LogFormat::Time =>
-                    try_threadtime(s).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
-                LogFormat::Brief =>
-                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_kernel(s)),
-                LogFormat::Kernel =>
-                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_brief(s)),
-                LogFormat::Unknown =>
-                    try_threadtime(s).or_else(|| try_time(s)).or_else(|| try_brief(s)).or_else(|| try_kernel(s)),
+                LogFormat::ThreadTime => try_time(s)
+                    .or_else(|| try_brief(s))
+                    .or_else(|| try_kernel(s)),
+                LogFormat::Time => try_threadtime(s)
+                    .or_else(|| try_brief(s))
+                    .or_else(|| try_kernel(s)),
+                LogFormat::Brief => try_threadtime(s)
+                    .or_else(|| try_time(s))
+                    .or_else(|| try_kernel(s)),
+                LogFormat::Kernel => try_threadtime(s)
+                    .or_else(|| try_time(s))
+                    .or_else(|| try_brief(s)),
+                LogFormat::Unknown => try_threadtime(s)
+                    .or_else(|| try_time(s))
+                    .or_else(|| try_brief(s))
+                    .or_else(|| try_kernel(s)),
             }
         }
     };
@@ -142,7 +199,16 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             // Unknown format: the whole line is the message.
             let end = line.len() as u32;
             (
-                LogEntry::new(line.into_boxed_str(), LevelMask::V, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, (0, end)),
+                LogEntry::new(
+                    line.into_boxed_str(),
+                    LevelMask::V,
+                    EMPTY,
+                    EMPTY,
+                    EMPTY,
+                    EMPTY,
+                    EMPTY,
+                    (0, end),
+                ),
                 LogFormat::Unknown,
             )
         }

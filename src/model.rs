@@ -93,7 +93,17 @@ impl LogEntry {
         tag: Span,
         message: Span,
     ) -> Self {
-        Self { raw, line_no: 0u64, level, date, time, pid, tid, tag, message }
+        Self {
+            raw,
+            line_no: 0u64,
+            level,
+            date,
+            time,
+            pid,
+            tid,
+            tag,
+            message,
+        }
     }
 
     #[inline]
@@ -101,20 +111,43 @@ impl LogEntry {
         &self.raw[s.0 as usize..s.1 as usize]
     }
 
-    #[inline] pub fn date(&self) -> &str { self.slice(self.date) }
-    #[inline] pub fn time(&self) -> &str { self.slice(self.time) }
-    #[inline] pub fn pid(&self) -> &str { self.slice(self.pid) }
-    #[inline] pub fn tid(&self) -> &str { self.slice(self.tid) }
-    #[inline] pub fn tag(&self) -> &str { self.slice(self.tag) }
-    #[inline] pub fn message(&self) -> &str { self.slice(self.message) }
+    #[inline]
+    pub fn date(&self) -> &str {
+        self.slice(self.date)
+    }
+    #[inline]
+    pub fn time(&self) -> &str {
+        self.slice(self.time)
+    }
+    #[inline]
+    pub fn pid(&self) -> &str {
+        self.slice(self.pid)
+    }
+    #[inline]
+    pub fn tid(&self) -> &str {
+        self.slice(self.tid)
+    }
+    #[inline]
+    pub fn tag(&self) -> &str {
+        self.slice(self.tag)
+    }
+    #[inline]
+    pub fn message(&self) -> &str {
+        self.slice(self.message)
+    }
 
     /// Build an entry from separate field strings (tests / synthetic data):
     /// concatenates the fields into one backing buffer and records their spans.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_fields(
-        date: &str, time: &str, level: LevelMask,
-        pid: &str, tid: &str, tag: &str, message: &str,
+        date: &str,
+        time: &str,
+        level: LevelMask,
+        pid: &str,
+        tid: &str,
+        tag: &str,
+        message: &str,
     ) -> Self {
         let mut raw = String::new();
         let push = |raw: &mut String, s: &str| {
@@ -128,7 +161,17 @@ impl LogEntry {
         let i = push(&mut raw, tid);
         let g = push(&mut raw, tag);
         let m = push(&mut raw, message);
-        Self { raw: raw.into_boxed_str(), line_no: 1u64, level, date: d, time: t, pid: p, tid: i, tag: g, message: m }
+        Self {
+            raw: raw.into_boxed_str(),
+            line_no: 1u64,
+            level,
+            date: d,
+            time: t,
+            pid: p,
+            tid: i,
+            tag: g,
+            message: m,
+        }
     }
 }
 
@@ -197,17 +240,30 @@ fn bump_count(map: &mut HashMap<String, usize>, key: &str) {
 }
 
 pub fn level_index(lv: LevelMask) -> Option<usize> {
-    if lv.contains(LevelMask::V) { Some(0) }
-    else if lv.contains(LevelMask::D) { Some(1) }
-    else if lv.contains(LevelMask::I) { Some(2) }
-    else if lv.contains(LevelMask::W) { Some(3) }
-    else if lv.contains(LevelMask::E) { Some(4) }
-    else if lv.contains(LevelMask::F) { Some(5) }
-    else { None }
+    if lv.contains(LevelMask::V) {
+        Some(0)
+    } else if lv.contains(LevelMask::D) {
+        Some(1)
+    } else if lv.contains(LevelMask::I) {
+        Some(2)
+    } else if lv.contains(LevelMask::W) {
+        Some(3)
+    } else if lv.contains(LevelMask::E) {
+        Some(4)
+    } else if lv.contains(LevelMask::F) {
+        Some(5)
+    } else {
+        None
+    }
 }
 
 pub const LEVEL_MASKS: [LevelMask; 6] = [
-    LevelMask::V, LevelMask::D, LevelMask::I, LevelMask::W, LevelMask::E, LevelMask::F,
+    LevelMask::V,
+    LevelMask::D,
+    LevelMask::I,
+    LevelMask::W,
+    LevelMask::E,
+    LevelMask::F,
 ];
 
 #[cfg(test)]
@@ -218,7 +274,15 @@ mod tests {
     fn append_sets_line_no_sequentially() {
         let mut m = Model::default();
         for _ in 0..3 {
-            m.append(LogEntry::from_fields("", "", LevelMask::I, "1", "1", "T", "x"));
+            m.append(LogEntry::from_fields(
+                "",
+                "",
+                LevelMask::I,
+                "1",
+                "1",
+                "T",
+                "x",
+            ));
         }
         assert_eq!(m.entries[0].line_no, 1);
         assert_eq!(m.entries[1].line_no, 2);
@@ -228,10 +292,42 @@ mod tests {
     #[test]
     fn append_tracks_error_lines() {
         let mut m = Model::default();
-        m.append(LogEntry::from_fields("", "", LevelMask::I, "1", "1", "T", "info"));
-        m.append(LogEntry::from_fields("", "", LevelMask::E, "1", "1", "T", "err"));
-        m.append(LogEntry::from_fields("", "", LevelMask::W, "1", "1", "T", "warn"));
-        m.append(LogEntry::from_fields("", "", LevelMask::F, "1", "1", "T", "fatal"));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "1",
+            "1",
+            "T",
+            "info",
+        ));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::E,
+            "1",
+            "1",
+            "T",
+            "err",
+        ));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::W,
+            "1",
+            "1",
+            "T",
+            "warn",
+        ));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::F,
+            "1",
+            "1",
+            "T",
+            "fatal",
+        ));
         // error_lines stores entry indices of E/F entries
         assert_eq!(m.error_lines, vec![1, 3]);
     }
@@ -239,9 +335,33 @@ mod tests {
     #[test]
     fn append_bumps_counts() {
         let mut m = Model::default();
-        m.append(LogEntry::from_fields("", "", LevelMask::I, "100", "200", "TagA", "x"));
-        m.append(LogEntry::from_fields("", "", LevelMask::I, "100", "200", "TagA", "x"));
-        m.append(LogEntry::from_fields("", "", LevelMask::E, "100", "300", "TagB", "x"));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "100",
+            "200",
+            "TagA",
+            "x",
+        ));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "100",
+            "200",
+            "TagA",
+            "x",
+        ));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::E,
+            "100",
+            "300",
+            "TagB",
+            "x",
+        ));
         assert_eq!(m.pid_counts["100"], 3);
         assert_eq!(m.tid_counts["200"], 2);
         assert_eq!(m.tid_counts["300"], 1);
@@ -254,7 +374,15 @@ mod tests {
     #[test]
     fn clear_resets_everything() {
         let mut m = Model::default();
-        m.append(LogEntry::from_fields("", "", LevelMask::E, "1", "1", "T", "x"));
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::E,
+            "1",
+            "1",
+            "T",
+            "x",
+        ));
         m.bookmarks.insert(0);
         m.filtered.push(0);
         m.clear();

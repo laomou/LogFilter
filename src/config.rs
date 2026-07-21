@@ -15,7 +15,6 @@ pub struct Config {
     pub recent: RecentConfig,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
@@ -25,7 +24,10 @@ pub struct WindowConfig {
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self { width: 1100.0, height: 732.0 }
+        Self {
+            width: 1100.0,
+            height: 732.0,
+        }
     }
 }
 
@@ -140,7 +142,10 @@ pub fn load() -> Config {
         if let Ok(text) = std::fs::read_to_string(&path) {
             match toml::from_str(&text) {
                 Ok(cfg) => return cfg,
-                Err(e) => eprintln!("logfilter: failed to parse config at {}: {e}", path.display()),
+                Err(e) => eprintln!(
+                    "logfilter: failed to parse config at {}: {e}",
+                    path.display()
+                ),
             }
         }
     }
@@ -155,7 +160,9 @@ pub fn load() -> Config {
 }
 
 pub fn save(cfg: &Config) -> Result<()> {
-    let Some(path) = config_path() else { return Ok(()); };
+    let Some(path) = config_path() else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -165,7 +172,11 @@ pub fn save(cfg: &Config) -> Result<()> {
 }
 
 pub fn parse_color(s: &str) -> egui::Color32 {
-    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X").trim_start_matches('#');
+    let s = s
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .trim_start_matches('#');
     let n = u32::from_str_radix(s, 16).unwrap_or(0);
     let r = ((n >> 16) & 0xFF) as u8;
     let g = ((n >> 8) & 0xFF) as u8;
@@ -179,18 +190,28 @@ fn parse_properties(text: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for raw in text.lines() {
         let line = raw.trim_start();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') { continue; }
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
         // Find first unescaped '=' or ':'
         let mut split_at = None;
         let bytes = line.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             let c = bytes[i];
-            if c == b'\\' { i += 2; continue; }
-            if c == b'=' || c == b':' { split_at = Some(i); break; }
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'=' || c == b':' {
+                split_at = Some(i);
+                break;
+            }
             i += 1;
         }
-        let Some(idx) = split_at else { continue; };
+        let Some(idx) = split_at else {
+            continue;
+        };
         let key = line[..idx].trim().to_string();
         let value_raw = line[idx + 1..].trim_start();
         let mut value = String::with_capacity(value_raw.len());
@@ -217,15 +238,24 @@ fn parse_properties(text: &str) -> std::collections::HashMap<String, String> {
 /// mirroring the Java Properties values. Missing keys keep Config defaults.
 pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
     let main = dir.join("LogFilter.ini");
-    if !main.exists() { return None; }
+    if !main.exists() {
+        return None;
+    }
     let mut cfg = Config::default();
 
     if let Ok(text) = std::fs::read_to_string(&main) {
         let p = parse_properties(&text);
-        if let Some(v) = p.get("INI_WIDTH").and_then(|s| s.parse().ok()) { cfg.window.width = v; }
-        if let Some(v) = p.get("INI_HEIGHT").and_then(|s| s.parse().ok()) { cfg.window.height = v; }
+        if let Some(v) = p.get("INI_WIDTH").and_then(|s| s.parse().ok()) {
+            cfg.window.width = v;
+        }
+        if let Some(v) = p.get("INI_HEIGHT").and_then(|s| s.parse().ok()) {
+            cfg.window.height = v;
+        }
         for i in 0..9 {
-            if let Some(v) = p.get(&format!("INI_COMUMN_{i}")).and_then(|s| s.parse().ok()) {
+            if let Some(v) = p
+                .get(&format!("INI_COMUMN_{i}"))
+                .and_then(|s| s.parse().ok())
+            {
                 cfg.view.columns[i] = v;
             }
         }
@@ -234,7 +264,9 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
             ("WORD_REMOVE", &mut cfg.filters.remove),
             ("HIGHLIGHT", &mut cfg.filters.highlight),
         ] {
-            if let Some(v) = p.get(java_key) { *dst = v.clone(); }
+            if let Some(v) = p.get(java_key) {
+                *dst = v.clone();
+            }
         }
     }
 
@@ -248,9 +280,14 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
             ("INI_COLOR_3(E)", &mut cfg.colors.level_e),
             ("INI_COLOR_8(F)", &mut cfg.colors.level_f),
         ] {
-            if let Some(v) = p.get(java_key) { *dst = v.clone(); }
+            if let Some(v) = p.get(java_key) {
+                *dst = v.clone();
+            }
         }
-        let count: usize = p.get("INI_HIGILIGHT_COUNT").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let count: usize = p
+            .get("INI_HIGILIGHT_COUNT")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         if count > 0 {
             let mut hls = Vec::with_capacity(count);
             for i in 0..count {
@@ -258,7 +295,9 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
                     hls.push(v.clone());
                 }
             }
-            if !hls.is_empty() { cfg.colors.highlights = hls; }
+            if !hls.is_empty() {
+                cfg.colors.highlights = hls;
+            }
         }
     }
 
@@ -272,7 +311,9 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
                     cmds.push(v.clone());
                 }
             }
-            if !cmds.is_empty() { cfg.adb.commands = cmds; }
+            if !cmds.is_empty() {
+                cfg.adb.commands = cmds;
+            }
         }
     }
 
@@ -313,7 +354,8 @@ mod tests {
         std::fs::write(
             dir.join("LogFilter.ini"),
             "INI_WIDTH=1200\nINI_HEIGHT=800\nWORD_FIND=hello\nINI_COMUMN_0=42\n",
-        ).unwrap();
+        )
+        .unwrap();
         let cfg = import_from_ini(&dir).expect("main ini present");
         assert_eq!(cfg.window.width, 1200.0);
         assert_eq!(cfg.window.height, 800.0);

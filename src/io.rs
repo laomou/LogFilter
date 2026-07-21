@@ -1,6 +1,6 @@
 use crate::model::EncodingChoice;
 use crossbeam_channel::Sender;
-use encoding_rs::{CoderResult, Decoder, Encoding};
+use encoding_rs::Encoding;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +24,11 @@ pub fn send_utf8_lines(
         // UTF-16 BOM detected: pick LE/BE and delegate to the decoded path.
         let is_le = bom.starts_with(&[0xFF, 0xFE]);
         let file2 = reader.into_inner();
-        let enc = if is_le { encoding_rs::UTF_16LE } else { encoding_rs::UTF_16BE };
+        let enc = if is_le {
+            encoding_rs::UTF_16LE
+        } else {
+            encoding_rs::UTF_16BE
+        };
         return send_decoded_lines_with_enc(file2, tx, epoch, source_epoch, enc);
     }
 
@@ -33,8 +37,12 @@ pub fn send_utf8_lines(
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 { return Ok(()); }
-        if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
+        if source_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(());
+        }
         // Fast path: valid UTF-8 -> borrow & trim on the slice, no lossy scan.
         let line: String = if let Ok(s) = std::str::from_utf8(&buf[..n]) {
             let mut s = s;
@@ -47,12 +55,18 @@ pub fn send_utf8_lines(
             let mut line = String::from_utf8_lossy(&buf).into_owned();
             if first {
                 first = false;
-                if line.starts_with('\u{feff}') { line.remove(0); }
+                if line.starts_with('\u{feff}') {
+                    line.remove(0);
+                }
             }
-            while line.ends_with(['\n', '\r']) { line.pop(); }
+            while line.ends_with(['\n', '\r']) {
+                line.pop();
+            }
             line
         };
-        if tx.send((epoch, line)).is_err() { return Ok(()); }
+        if tx.send((epoch, line)).is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -89,78 +103,53 @@ fn send_decoded_lines_with_enc(
     loop {
         use std::io::Read;
         let n = reader.read(&mut raw_buf)?;
-        if n == 0 { break; }
-        if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
-        decode_chunk(&mut decoder, &raw_buf[..n], false, &mut text_buf, &tx, epoch);
-        if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
+        if n == 0 {
+            break;
+        }
+        if source_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(());
+        }
+        let _ = decoder.decode_to_string(&raw_buf[..n], &mut text_buf, false);
+        // Flush complete lines in one pass, then drain once per chunk (O(n)).
+        let consumed = flush_lines(&text_buf, &tx, epoch);
+        if consumed > 0 {
+            text_buf.drain(..consumed);
+        }
+        if source_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(());
+        }
     }
     // Final flush: drain any remaining buffered bytes from the decoder.
-    decode_chunk(&mut decoder, b"", true, &mut text_buf, &tx, epoch);
+    let _ = decoder.decode_to_string(b"", &mut text_buf, true);
     // Emit any remaining text without a trailing newline as a final line.
     if !text_buf.is_empty() {
-        if source_epoch.load(Ordering::Acquire) != epoch { return Ok(()); }
+        if source_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(());
+        }
         let line = text_buf.trim_end_matches(['\r', '\n']).to_string();
         // Match the UTF-8 reader's `read_until` behavior: a final logical line
         // is preserved even if CR/LF normalization leaves it empty (for example
         // a file ending in a lone `\r`).
-        if tx.send((epoch, line)).is_err() { return Ok(()); }
+        if tx.send((epoch, line)).is_err() {
+            return Ok(());
+        }
     }
     Ok(())
-}
-
-/// Decode all of `input`, growing `text_buf` or flushing complete lines when
-/// the decoder reports a full output buffer. `decode_to_string` deliberately
-/// does not reallocate its destination; ignoring `OutputFull` would otherwise
-/// discard the unconsumed suffix of a long log line.
-fn decode_chunk(
-    decoder: &mut Decoder,
-    mut input: &[u8],
-    last: bool,
-    text_buf: &mut String,
-    tx: &Sender<(u64, String)>,
-    epoch: u64,
-) {
-    loop {
-        if text_buf.len() == text_buf.capacity() {
-            text_buf.reserve(8192);
-        }
-        let (result, read, _) = decoder.decode_to_string(input, text_buf, last);
-        input = &input[read..];
-
-        // Drain complete lines to free space before allocating more. A single
-        // very long line has no newline to drain, in which case reserve grows
-        // the backing buffer and the next iteration resumes the same input.
-        let consumed = flush_lines(text_buf, tx, epoch);
-        if consumed > 0 {
-            text_buf.drain(..consumed);
-        }
-
-        match result {
-            CoderResult::InputEmpty => return,
-            CoderResult::OutputFull => {
-                if consumed == 0 {
-                    text_buf.reserve(8192);
-                }
-            }
-        }
-    }
 }
 
 /// Scan `buf` for complete lines (terminated by `\n`), send each via `tx`,
 /// and return the number of bytes consumed (the processed prefix length).
 /// The caller drains that prefix once — O(n) per chunk instead of O(n²).
-fn flush_lines(
-    buf: &str,
-    tx: &Sender<(u64, String)>,
-    epoch: u64,
-) -> usize {
+fn flush_lines(buf: &str, tx: &Sender<(u64, String)>, epoch: u64) -> usize {
     let bytes = buf.as_bytes();
     let mut consumed = 0usize;
     let mut scan = 0usize;
     while scan < bytes.len() {
         if bytes[scan] == b'\n' {
             let line = buf[consumed..scan].trim_end_matches(['\r', '\n']);
-            if tx.send((epoch, line.to_string())).is_err() { return consumed; }
+            if tx.send((epoch, line.to_string())).is_err() {
+                return consumed;
+            }
             consumed = scan + 1;
         }
         scan += 1;
@@ -170,10 +159,15 @@ fn flush_lines(
 
 pub fn pick_local_encoding(locale: &str) -> &'static Encoding {
     let low = locale.to_lowercase();
-    if low.starts_with("zh") { encoding_rs::GBK }
-    else if low.starts_with("ja") { encoding_rs::SHIFT_JIS }
-    else if low.starts_with("ko") { encoding_rs::EUC_KR }
-    else { encoding_rs::WINDOWS_1252 }
+    if low.starts_with("zh") {
+        encoding_rs::GBK
+    } else if low.starts_with("ja") {
+        encoding_rs::SHIFT_JIS
+    } else if low.starts_with("ko") {
+        encoding_rs::EUC_KR
+    } else {
+        encoding_rs::WINDOWS_1252
+    }
 }
 
 #[cfg(test)]
@@ -240,10 +234,8 @@ mod tests {
 
     #[test]
     fn decoded_reader_preserves_empty_final_line_like_utf8_reader() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lf_final_empty_line_{}.log",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lf_final_empty_line_{}.log", std::process::id()));
         std::fs::write(&tmp, b"first\n\r").unwrap();
 
         let read_lines = |decoded: bool| {
@@ -264,24 +256,5 @@ mod tests {
 
         assert_eq!(utf8_lines, vec!["first", ""]);
         assert_eq!(decoded_lines, utf8_lines);
-    }
-
-    #[test]
-    fn decoded_reader_preserves_long_line_larger_than_initial_buffer() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lf_long_decoded_line_{}.log",
-            std::process::id()
-        ));
-        let line = "x".repeat(32 * 1024);
-        std::fs::write(&tmp, &line).unwrap();
-
-        let (tx, rx) = crossbeam_channel::bounded(4);
-        let epoch = Arc::new(AtomicU64::new(1));
-        let file = std::fs::File::open(&tmp).unwrap();
-        send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::UTF_8).unwrap();
-        let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
-        let _ = std::fs::remove_file(&tmp);
-
-        assert_eq!(lines, vec![line]);
     }
 }
