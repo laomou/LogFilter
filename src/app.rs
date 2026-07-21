@@ -61,6 +61,10 @@ pub struct App {
 
     // Per-frame caches: recomputed lazily when source data changes.
     cached_highlight_palette: Vec<Color32>,
+    /// Raw palette values used to build `cached_highlight_palette`. Keeping this
+    /// alongside the parsed colors lets us invalidate on a color-value change,
+    /// not merely when the number of configured colors changes.
+    cached_highlight_palette_raw: Vec<String>,
     cached_highlight_tokens: Vec<String>,
     cached_find_tokens: Vec<String>,
     /// Raw highlight/find strings that were used to produce the token caches above.
@@ -241,6 +245,7 @@ impl App {
         let init_hl_raw = if ui.highlight_on { ui.highlight.clone() } else { String::new() };
         let init_find_raw = if ui.find_on { ui.find.clone() } else { String::new() };
         let init_palette: Vec<Color32> = cfg.colors.highlights.iter().map(|s| parse_color(s)).collect();
+        let init_palette_raw = cfg.colors.highlights.clone();
         let init_level_colors = parse_level_colors(&cfg);
         let init_col_widths = cfg.view.columns;
         let mut app = Self {
@@ -267,6 +272,7 @@ impl App {
             selected_cmd,
             auto_scroll: true,
             cached_highlight_palette: init_palette,
+            cached_highlight_palette_raw: init_palette_raw,
             cached_highlight_tokens: if init_hl_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_hl_raw) },
             cached_find_tokens: if init_find_raw.is_empty() { vec![] } else { FilterSpec::tokens(&init_find_raw) },
             cached_highlight_raw: init_hl_raw,
@@ -919,12 +925,13 @@ impl App {
 
     /// Recompute caches for highlight palette & tokens only when source data changed.
     fn refresh_highlight_caches(&mut self) {
-        // Palette: rare change (user edits config), but a simple pointer eq is cheap
-        // enough to guard the parse loop.
+        // Palette changes are rare, but comparing the raw configuration is
+        // necessary: a user may replace one color with another while keeping
+        // the same number of palette entries.
         let palette_raw = &self.cfg.colors.highlights;
-        let palette_changed = self.cached_highlight_palette.len() != palette_raw.len();
-        if palette_changed {
+        if self.cached_highlight_palette_raw != *palette_raw {
             self.cached_highlight_palette = palette_raw.iter().map(|s| parse_color(s)).collect();
+            self.cached_highlight_palette_raw = palette_raw.clone();
         }
 
         // Token caches: only invalidate when the raw filter text changes.
@@ -2421,6 +2428,23 @@ mod tests {
     #[test]
     fn reset_table_font_size_uses_config_default() {
         assert_eq!(Config::default().view.font_size, 13.0);
+    }
+
+    #[test]
+    fn highlight_palette_cache_refreshes_when_same_length_colors_change() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+
+        app.cfg.colors.highlights = vec!["0xFF0000".into()];
+        app.refresh_highlight_caches();
+        assert_eq!(app.cached_highlight_palette, vec![Color32::from_rgb(255, 0, 0)]);
+
+        // Regression: changing a color without changing the number of palette
+        // entries must invalidate the parsed-color cache.
+        app.cfg.colors.highlights = vec!["0x0000FF".into()];
+        app.refresh_highlight_caches();
+        assert_eq!(app.cached_highlight_palette, vec![Color32::from_rgb(0, 0, 255)]);
+        assert_eq!(app.cached_highlight_palette_raw, vec!["0x0000FF"]);
     }
 
     #[test]
