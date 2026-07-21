@@ -259,11 +259,10 @@ impl Drop for Session {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn stop_reaps_stdout_and_stderr_workers() {
         let (tx, rx) = crossbeam_channel::bounded(4);
