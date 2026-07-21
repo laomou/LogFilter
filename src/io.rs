@@ -175,7 +175,7 @@ mod tests {
         let file = std::fs::File::open(&tmp).unwrap();
         // send_utf8_lines detects UTF-16 BOM and delegates to decoded path.
         // Just confirm it doesn't panic; correct decoding tested after PR #21 merge.
-        send_utf8_lines(file, tx, 1, epoch);
+        let _ = send_utf8_lines(file, tx, 1, epoch);
         let _lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         let _ = std::fs::remove_file(&tmp);
     }
@@ -195,7 +195,7 @@ mod tests {
         // Immediately bump epoch so the reader sees a mismatch after first line
         epoch.store(2, std::sync::atomic::Ordering::Release);
         let file = std::fs::File::open(&tmp).unwrap();
-        send_utf8_lines(file, tx, 1, epoch);
+        let _ = send_utf8_lines(file, tx, 1, epoch);
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         let _ = std::fs::remove_file(&tmp);
         // Should have stopped early (at most 1 line read before epoch check)
