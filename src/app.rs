@@ -58,6 +58,10 @@ pub struct App {
     pub selected_device: String,
     pub selected_cmd: String,
     pub auto_scroll: bool,
+    /// Result channel for an in-flight `adb devices` probe. Keeping the probe
+    /// off the UI thread prevents startup and the refresh button from freezing
+    /// the window when adb is slow or unavailable.
+    device_refresh_rx: Option<Receiver<Result<Vec<String>, String>>>,
 
     // Per-frame caches: recomputed lazily when source data changes.
     cached_highlight_palette: Vec<Color32>,
@@ -226,7 +230,7 @@ impl App {
         // Pre-populate the device combo on startup so the user doesn't have to
         // click ↻ once before they can pick a device. Skipped in the test-only
         // constructor since it shells out to adb.
-        app.refresh_devices();
+        app.refresh_devices(cc.egui_ctx.clone());
         app
     }
 
@@ -302,6 +306,7 @@ impl App {
             selected_device: String::new(),
             selected_cmd,
             auto_scroll: true,
+            device_refresh_rx: None,
             cached_highlight_palette: init_palette,
             cached_highlight_palette_raw: init_palette_raw,
             cached_highlight_tokens: if init_hl_raw.is_empty() {
@@ -799,8 +804,31 @@ impl App {
         self.notify_filter();
     }
 
-    fn refresh_devices(&mut self) {
-        match adb::list_devices(self.cfg.adb.adb_path.as_deref()) {
+    /// Begin an asynchronous `adb devices` probe unless one is already active.
+    fn refresh_devices(&mut self, ctx: egui::Context) {
+        if self.device_refresh_rx.is_some() {
+            return;
+        }
+        let adb_path = self.cfg.adb.adb_path.clone();
+        let (tx, rx) = bounded(1);
+        self.device_refresh_rx = Some(rx);
+        if let Err(e) = thread::Builder::new()
+            .name("adb-devices".into())
+            .spawn(move || {
+                let result = adb::list_devices(adb_path.as_deref()).map_err(|e| e.to_string());
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            })
+        {
+            self.device_refresh_rx = None;
+            self.status = tr!("status_adb_devices_failed", { e: &format!("{e}") });
+        }
+    }
+
+    /// Apply a completed device probe without disturbing a still-valid explicit
+    /// selection. Called only from the UI thread.
+    fn apply_devices_result(&mut self, result: Result<Vec<String>, String>) {
+        match result {
             Ok(list) => {
                 let n = list.len();
                 self.adb_devices = list;
@@ -820,7 +848,29 @@ impl App {
             }
             Err(e) => {
                 self.adb_devices.clear();
-                self.status = tr!("status_adb_devices_failed", { e: &format!("{}", e) });
+                self.status = tr!("status_adb_devices_failed", { e: &e });
+            }
+        }
+    }
+
+    /// Poll the background device probe, if any. A disconnected channel means
+    /// the worker failed before reporting, so clear the busy state and surface
+    /// a diagnostic rather than leaving the refresh control disabled forever.
+    fn poll_device_refresh(&mut self) {
+        let Some(rx) = &self.device_refresh_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.device_refresh_rx = None;
+                self.apply_devices_result(result);
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.device_refresh_rx = None;
+                self.status = tr!("status_adb_devices_failed", {
+                    e: &"device probe terminated unexpectedly".to_string()
+                });
             }
         }
     }
@@ -1822,6 +1872,8 @@ impl eframe::App for App {
             }
         }
 
+        self.poll_device_refresh();
+
         // Surface a truncated file load (mid-stream read error) once.
         if let Some(msg) = self.load_error.lock_recover().take() {
             self.status = tr!("status_load_truncated", { e: &msg });
@@ -2138,12 +2190,13 @@ impl App {
                             ui.selectable_value(&mut self.selected_device, d.clone(), d);
                         }
                     });
+                let refreshing_devices = self.device_refresh_rx.is_some();
                 if ui
-                    .button("↻")
+                    .add_enabled(!refreshing_devices, egui::Button::new("↻"))
                     .on_hover_text(tr!("refresh_devices"))
                     .clicked()
                 {
-                    self.refresh_devices();
+                    self.refresh_devices(ctx.clone());
                 }
                 ui.separator();
                 if ui
@@ -3008,6 +3061,32 @@ mod tests {
             detect_format_from_cmd("logcat -v nonsense"),
             LogFormat::Unknown
         );
+    }
+
+    #[test]
+    fn device_refresh_result_preserves_existing_selection_when_present() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.selected_device = "keep".into();
+
+        app.apply_devices_result(Ok(vec!["other".into(), "keep".into()]));
+
+        assert_eq!(app.adb_devices, vec!["other", "keep"]);
+        assert_eq!(app.selected_device, "keep");
+    }
+
+    #[test]
+    fn poll_device_refresh_applies_completed_result() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        let (tx, rx) = bounded(1);
+        tx.send(Ok(vec!["serial-1".into()])).unwrap();
+        app.device_refresh_rx = Some(rx);
+
+        app.poll_device_refresh();
+
+        assert_eq!(app.adb_devices, vec!["serial-1"]);
+        assert!(app.device_refresh_rx.is_none());
     }
 }
 
