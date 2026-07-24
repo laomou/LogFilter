@@ -44,6 +44,8 @@ pub struct ViewConfig {
     pub font: String,
     /// UI language: "auto" (detect from system locale), "en", or "zh".
     pub lang: String,
+    /// Color theme: "light" or "dark".
+    pub theme: String,
 }
 
 impl Default for ViewConfig {
@@ -54,6 +56,7 @@ impl Default for ViewConfig {
             encoding: "utf-8".into(),
             font: String::new(),
             lang: "auto".into(),
+            theme: "light".into(),
         }
     }
 }
@@ -80,6 +83,12 @@ pub struct ColorsConfig {
 
 impl Default for ColorsConfig {
     fn default() -> Self {
+        Self::light_defaults()
+    }
+}
+
+impl ColorsConfig {
+    pub fn light_defaults() -> Self {
         Self {
             level_v: "0x000000".into(),
             level_d: "0x0000AA".into(),
@@ -88,6 +97,18 @@ impl Default for ColorsConfig {
             level_e: "0xFF0000".into(),
             level_f: "0xFF0000".into(),
             highlights: vec!["0xFFFF00".into()],
+        }
+    }
+
+    pub fn dark_defaults() -> Self {
+        Self {
+            level_v: "0x888888".into(),
+            level_d: "0x5599FF".into(),
+            level_i: "0x48B048".into(),
+            level_w: "0xFFBB33".into(),
+            level_e: "0xFF5555".into(),
+            level_f: "0xFF55FF".into(),
+            highlights: vec!["0x665500".into()],
         }
     }
 }

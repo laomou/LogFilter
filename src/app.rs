@@ -239,6 +239,7 @@ impl App {
     /// already-loaded `Config` so tests can inject a default config without
     /// touching the user's real config file or spawning an adb probe.
     fn from_ctx(ctx: &egui::Context, cfg: Config, initial_file: Option<PathBuf>) -> Self {
+        apply_theme(ctx, &cfg.view.theme);
         tune_table_visuals(ctx);
         init_i18n();
         // Apply the stored language (or auto-detect) at startup.
@@ -462,6 +463,51 @@ impl App {
         egui_i18n::set_language(code);
         // Rebuild: shortcut-row strings embed translated labels.
         self.cached_shortcut_rows = empty_shortcut_rows();
+    }
+
+    fn switch_theme(&mut self, ctx: &egui::Context, theme: &str) {
+        let old_defaults = if self.cfg.view.theme == "dark" {
+            config::ColorsConfig::dark_defaults()
+        } else {
+            config::ColorsConfig::light_defaults()
+        };
+        let new_defaults = if theme == "dark" {
+            config::ColorsConfig::dark_defaults()
+        } else {
+            config::ColorsConfig::light_defaults()
+        };
+        if self.cfg.colors.level_v == old_defaults.level_v {
+            self.cfg.colors.level_v = new_defaults.level_v;
+        }
+        if self.cfg.colors.level_d == old_defaults.level_d {
+            self.cfg.colors.level_d = new_defaults.level_d;
+        }
+        if self.cfg.colors.level_i == old_defaults.level_i {
+            self.cfg.colors.level_i = new_defaults.level_i;
+        }
+        if self.cfg.colors.level_w == old_defaults.level_w {
+            self.cfg.colors.level_w = new_defaults.level_w;
+        }
+        if self.cfg.colors.level_e == old_defaults.level_e {
+            self.cfg.colors.level_e = new_defaults.level_e;
+        }
+        if self.cfg.colors.level_f == old_defaults.level_f {
+            self.cfg.colors.level_f = new_defaults.level_f;
+        }
+        if self.cfg.colors.highlights == old_defaults.highlights {
+            self.cfg.colors.highlights = new_defaults.highlights;
+        }
+        self.cached_level_colors = parse_level_colors(&self.cfg);
+        self.cached_highlight_palette = self
+            .cfg
+            .colors
+            .highlights
+            .iter()
+            .map(|s| parse_color(s))
+            .collect();
+        self.cached_highlight_palette_raw = self.cfg.colors.highlights.clone();
+        self.cfg.view.theme = theme.into();
+        apply_theme(ctx, theme);
     }
     fn spawn_ingest_thread(&self, ctx: egui::Context, rx: Receiver<(u64, String)>) {
         let model = self.model.clone();
@@ -1482,6 +1528,14 @@ impl App {
     }
 }
 
+fn apply_theme(ctx: &egui::Context, theme: &str) {
+    if theme == "dark" {
+        ctx.set_theme(egui::Theme::Dark);
+    } else {
+        ctx.set_theme(egui::Theme::Light);
+    }
+}
+
 fn tune_table_visuals(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.visuals.widgets.hovered.expansion = 0.0;
@@ -1827,8 +1881,14 @@ fn build_highlighted(
         let mut fmt = base.clone();
         match kind {
             Some(hi) if !highlight_palette.is_empty() => {
-                fmt.background = highlight_palette[hi % highlight_palette.len()];
-                fmt.color = Color32::BLACK;
+                let bg = highlight_palette[hi % highlight_palette.len()];
+                fmt.background = bg;
+                let lum = bg.r() as u32 * 299 + bg.g() as u32 * 587 + bg.b() as u32 * 114;
+                fmt.color = if lum > 128_000 {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                };
             }
             // Find matches get a thin underline to mark the matched substring.
             _ => {
@@ -2069,6 +2129,22 @@ impl App {
                         for (label, code) in &opts {
                             if ui.selectable_label(cur == *code, label.as_str()).clicked() {
                                 self.set_lang(code);
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button(tr!("theme"), |ui| {
+                        let cur = self.cfg.view.theme.clone();
+                        let opts: [(&str, &str); 2] = [
+                            ("theme_light", "light"),
+                            ("theme_dark", "dark"),
+                        ];
+                        for (label_key, value) in &opts {
+                            if ui
+                                .selectable_label(cur == *value, tr!(label_key))
+                                .clicked()
+                            {
+                                self.switch_theme(&ctx, value);
                                 ui.close();
                             }
                         }
