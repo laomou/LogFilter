@@ -100,6 +100,24 @@ impl ColorsConfig {
         }
     }
 
+    pub fn migrate(&mut self, old: &Self, new: &Self) {
+        for (cur, o, n) in [
+            (&mut self.level_v, &old.level_v, &new.level_v),
+            (&mut self.level_d, &old.level_d, &new.level_d),
+            (&mut self.level_i, &old.level_i, &new.level_i),
+            (&mut self.level_w, &old.level_w, &new.level_w),
+            (&mut self.level_e, &old.level_e, &new.level_e),
+            (&mut self.level_f, &old.level_f, &new.level_f),
+        ] {
+            if *cur == *o {
+                *cur = n.clone();
+            }
+        }
+        if self.highlights == old.highlights {
+            self.highlights = new.highlights.clone();
+        }
+    }
+
     pub fn dark_defaults() -> Self {
         Self {
             level_v: "0x888888".into(),

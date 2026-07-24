@@ -476,27 +476,7 @@ impl App {
         } else {
             config::ColorsConfig::light_defaults()
         };
-        if self.cfg.colors.level_v == old_defaults.level_v {
-            self.cfg.colors.level_v = new_defaults.level_v;
-        }
-        if self.cfg.colors.level_d == old_defaults.level_d {
-            self.cfg.colors.level_d = new_defaults.level_d;
-        }
-        if self.cfg.colors.level_i == old_defaults.level_i {
-            self.cfg.colors.level_i = new_defaults.level_i;
-        }
-        if self.cfg.colors.level_w == old_defaults.level_w {
-            self.cfg.colors.level_w = new_defaults.level_w;
-        }
-        if self.cfg.colors.level_e == old_defaults.level_e {
-            self.cfg.colors.level_e = new_defaults.level_e;
-        }
-        if self.cfg.colors.level_f == old_defaults.level_f {
-            self.cfg.colors.level_f = new_defaults.level_f;
-        }
-        if self.cfg.colors.highlights == old_defaults.highlights {
-            self.cfg.colors.highlights = new_defaults.highlights;
-        }
+        self.cfg.colors.migrate(&old_defaults, &new_defaults);
         self.cached_level_colors = parse_level_colors(&self.cfg);
         self.cached_highlight_palette = self
             .cfg
