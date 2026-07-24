@@ -2135,15 +2135,10 @@ impl App {
                     });
                     ui.menu_button(tr!("theme"), |ui| {
                         let cur = self.cfg.view.theme.clone();
-                        let opts: [(&str, &str); 2] = [
-                            ("theme_light", "light"),
-                            ("theme_dark", "dark"),
-                        ];
+                        let opts: [(&str, &str); 2] =
+                            [("theme_light", "light"), ("theme_dark", "dark")];
                         for (label_key, value) in &opts {
-                            if ui
-                                .selectable_label(cur == *value, tr!(label_key))
-                                .clicked()
-                            {
+                            if ui.selectable_label(cur == *value, tr!(label_key)).clicked() {
                                 self.switch_theme(&ctx, value);
                                 ui.close();
                             }
