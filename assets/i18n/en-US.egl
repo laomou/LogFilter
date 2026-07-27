@@ -122,6 +122,10 @@ status_nothing_to_save = Nothing to save
 status_saved = Saved {n} lines → {path}
 status_save_failed = Save failed: {e}
 
+# goto status
+status_goto_out_of_range = Line {n} out of range (total {total})
+status_goto_filtered = Line {n} is hidden by the current filter
+
 # selection status
 status_ctrl_click = Ctrl+click, selected={n}
 status_shift_click = Shift+click, selected={n}
