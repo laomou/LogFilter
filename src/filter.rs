@@ -18,7 +18,6 @@ pub struct FilterSpec {
     pub remove: Vec<String>,
 
     pub bookmarks_only: bool,
-    pub errors_only: bool,
 }
 
 impl FilterSpec {
@@ -55,11 +54,6 @@ impl FilterSpec {
             return false;
         }
         if self.bookmarks_only && !bookmarks.contains(&entry_idx) {
-            return false;
-        }
-        if self.errors_only
-            && !(entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F))
-        {
             return false;
         }
         if !self.find.is_empty() && !any_contains(entry.message(), &self.find) {
@@ -233,19 +227,6 @@ mod tests {
         bm.insert(5u32);
         assert!(spec.matches(&e("m", "T", LevelMask::I), 5, &bm));
         assert!(!spec.matches(&e("m", "T", LevelMask::I), 3, &bm));
-    }
-
-    #[test]
-    fn errors_only_filters() {
-        let spec = FilterSpec {
-            errors_only: true,
-            ..Default::default()
-        };
-        let hs = HashSet::new();
-        assert!(spec.matches(&e("m", "T", LevelMask::E), 0, &hs));
-        assert!(spec.matches(&e("m", "T", LevelMask::F), 0, &hs));
-        assert!(!spec.matches(&e("m", "T", LevelMask::I), 0, &hs));
-        assert!(!spec.matches(&e("m", "T", LevelMask::W), 0, &hs));
     }
 
     #[test]
