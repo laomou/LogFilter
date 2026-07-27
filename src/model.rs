@@ -111,6 +111,14 @@ impl LogEntry {
         &self.raw[s.0 as usize..s.1 as usize]
     }
 
+    /// The complete original log line as ingested (from a file or the adb
+    /// stream), before it was split into fields. Used when saving so the output
+    /// preserves the source format instead of a re-joined table.
+    #[inline]
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
     #[inline]
     pub fn date(&self) -> &str {
         self.slice(self.date)

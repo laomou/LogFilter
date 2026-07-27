@@ -755,24 +755,14 @@ impl App {
         let Some(dest) = path else { return };
 
         // Snapshot the filtered entries so the background thread doesn't need
-        // to hold the model lock while writing (which could block the UI).
-        type Row = (u64, String, String, char, String, String, String, String);
-        let rows: Vec<Row> = m
+        // to hold the model lock while writing (which could block the UI). We
+        // save each entry's original line verbatim so the output preserves the
+        // source format (adb stream / original file) rather than a re-joined
+        // table.
+        let rows: Vec<String> = m
             .filtered
             .iter()
-            .map(|&ei| {
-                let e = &m.entries[ei as usize];
-                (
-                    e.line_no,
-                    e.date().to_string(),
-                    e.time().to_string(),
-                    e.level.as_char(),
-                    e.pid().to_string(),
-                    e.tid().to_string(),
-                    e.tag().to_string(),
-                    e.message().to_string(),
-                )
-            })
+            .map(|&ei| m.entries[ei as usize].raw().to_string())
             .collect();
         drop(m);
 
@@ -786,12 +776,8 @@ impl App {
                     use std::io::{BufWriter, Write};
                     let f = std::fs::File::create(&dest)?;
                     let mut w = BufWriter::new(f);
-                    for (line_no, date, time, lv, pid, tid, tag, msg) in &rows {
-                        writeln!(
-                            w,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            line_no, date, time, lv, pid, tid, tag, msg
-                        )?;
+                    for line in &rows {
+                        writeln!(w, "{}", line)?;
                     }
                     w.flush()?;
                     Ok(())
