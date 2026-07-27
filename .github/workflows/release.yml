@@ -53,3 +53,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.name }}
+          # Auto-generate release notes from merged PRs since the previous tag.
+          # The matrix runs 4 jobs against the same release; the first to arrive
+          # creates it with notes, the rest just attach their binary.
+          generate_release_notes: true
