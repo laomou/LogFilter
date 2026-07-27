@@ -2,7 +2,7 @@ use crate::model::EncodingChoice;
 use crossbeam_channel::Sender;
 use encoding_rs::{CoderResult, Decoder, Encoding};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ pub fn send_utf8_lines(
 }
 
 pub fn send_decoded_lines(
-    file: File,
+    mut file: File,
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
@@ -80,11 +80,49 @@ pub fn send_decoded_lines(
     let enc = match choice {
         EncodingChoice::Utf8 => encoding_rs::UTF_8,
         EncodingChoice::Local => {
-            let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
-            pick_local_encoding(&locale)
+            // UTF-8 is self-validating: a legacy-encoded (GBK/Shift_JIS/…) file's
+            // multibyte sequences almost never form valid UTF-8, while real UTF-8
+            // virtually never validates by accident. So sniff a prefix first —
+            // decode modern UTF-8 logs correctly and only fall back to the
+            // locale's legacy codepage when the bytes are clearly not UTF-8. This
+            // stops "Local" from mojibaking a UTF-8 file (the common case today).
+            if looks_like_utf8(&mut file)? {
+                encoding_rs::UTF_8
+            } else {
+                let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+                pick_local_encoding(&locale)
+            }
         }
     };
     send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc)
+}
+
+/// Peek up to 64 KiB from the start of `file` and report whether it is valid
+/// UTF-8, then rewind so the caller reads from the beginning. A truncated
+/// multibyte sequence at the sniff boundary is tolerated: if the only error is
+/// an incomplete tail, the prefix is still treated as UTF-8.
+fn looks_like_utf8(file: &mut File) -> std::io::Result<bool> {
+    const SNIFF: usize = 64 * 1024;
+    let mut buf = vec![0u8; SNIFF];
+    let mut read = 0;
+    // A single read() may return a short count; loop until the buffer is full or
+    // EOF so a large file is actually sniffed on its first 64 KiB, not ~8 KiB.
+    while read < buf.len() {
+        let n = file.read(&mut buf[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let bytes = &buf[..read];
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Ok(true),
+        // `valid_up_to` bytes decoded cleanly; if the remaining error is only a
+        // multibyte char cut off by the 64 KiB boundary (no explicit error_len),
+        // the content is still UTF-8 — the cut is our artifact, not the file's.
+        Err(e) => Ok(e.error_len().is_none() && e.valid_up_to() > 0),
+    }
 }
 
 fn send_decoded_lines_with_enc(
@@ -101,7 +139,6 @@ fn send_decoded_lines_with_enc(
     let mut text_buf = String::with_capacity(8192);
     let mut raw_buf = vec![0u8; 8192];
     loop {
-        use std::io::Read;
         let n = reader.read(&mut raw_buf)?;
         if n == 0 {
             break;
@@ -311,5 +348,90 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         assert_eq!(lines, vec![line]);
+    }
+
+    // Helper: run the full `Local` path against a file's raw bytes.
+    fn decode_via_local(bytes: &[u8]) -> Vec<String> {
+        let tmp = std::env::temp_dir().join(format!(
+            "lf_local_path_{}_{}.log",
+            std::process::id(),
+            bytes.len()
+        ));
+        std::fs::write(&tmp, bytes).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local).unwrap();
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        let _ = std::fs::remove_file(&tmp);
+        lines
+    }
+
+    #[test]
+    fn local_sniffs_utf8_and_does_not_mojibake() {
+        // A real UTF-8 file must decode correctly via Local even on a zh/ja/ko
+        // locale (where the legacy guess would otherwise corrupt it).
+        let line = "中文日志 テスト 한국어 abc";
+        let lines = decode_via_local(line.as_bytes());
+        assert_eq!(lines, vec![line.to_string()]);
+    }
+
+    #[test]
+    fn local_falls_back_to_legacy_for_non_utf8() {
+        // GBK bytes are not valid UTF-8, so the sniff fails and Local uses the
+        // locale codepage. On CI the locale may not be zh; assert only that the
+        // GBK path is taken when it is, otherwise that we didn't crash/empty.
+        let line = "中文日志 abc";
+        let (gbk, _, _) = encoding_rs::GBK.encode(line);
+        let lines = decode_via_local(gbk.as_ref());
+        assert_eq!(lines.len(), 1);
+        let locale = sys_locale::get_locale().unwrap_or_default();
+        if locale.to_lowercase().starts_with("zh") {
+            assert_eq!(lines, vec![line.to_string()]);
+        }
+    }
+
+    #[test]
+    fn looks_like_utf8_true_for_ascii_and_utf8() {
+        let mk = |bytes: &[u8]| {
+            let tmp = std::env::temp_dir().join(format!(
+                "lf_sniff_{}_{}.bin",
+                std::process::id(),
+                bytes.len()
+            ));
+            std::fs::write(&tmp, bytes).unwrap();
+            let mut f = std::fs::File::open(&tmp).unwrap();
+            let r = looks_like_utf8(&mut f).unwrap();
+            // Sniff must rewind: a full read after it still sees all bytes.
+            let mut all = Vec::new();
+            f.read_to_end(&mut all).unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            (r, all.len())
+        };
+        let (ok, len) = mk("plain ascii\nsecond".as_bytes());
+        assert!(ok);
+        assert_eq!(len, "plain ascii\nsecond".len(), "must rewind after sniff");
+
+        let (ok, _) = mk("多字节 UTF-8 内容".as_bytes());
+        assert!(ok);
+
+        // GBK bytes → not valid UTF-8.
+        let (gbk, _, _) = encoding_rs::GBK.encode("中文");
+        let (ok, _) = mk(gbk.as_ref());
+        assert!(!ok);
+    }
+
+    #[test]
+    fn looks_like_utf8_tolerates_truncated_tail() {
+        // A valid multibyte char split by the sniff boundary must still count as
+        // UTF-8 (error_len is None → incomplete tail, not a real error).
+        let mut bytes = "ok ".as_bytes().to_vec();
+        let full = "中".as_bytes(); // 3 bytes: E4 B8 AD
+        bytes.extend_from_slice(&full[..2]); // drop the last continuation byte
+        let tmp = std::env::temp_dir().join(format!("lf_trunc_{}.bin", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+        let mut f = std::fs::File::open(&tmp).unwrap();
+        assert!(looks_like_utf8(&mut f).unwrap());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
