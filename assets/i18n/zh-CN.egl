@@ -122,6 +122,10 @@ status_nothing_to_save = 无内容可保存
 status_saved = 已保存 {n} 行 → {path}
 status_save_failed = 保存失败: {e}
 
+# goto status
+status_goto_out_of_range = 行号 {n} 超出范围（共 {total} 行）
+status_goto_filtered = 行号 {n} 已被当前过滤隐藏
+
 # selection status
 status_ctrl_click = Ctrl+点击，已选 {n} 行
 status_shift_click = Shift+点击，已选 {n} 行

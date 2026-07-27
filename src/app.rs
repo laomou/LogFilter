@@ -2286,17 +2286,50 @@ impl App {
             self.notify_filter();
         }
         if let Some(row) = goto_target {
-            let m = self.model.read_recover();
-            if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
-                self.pending_scroll = Some(pos);
-                self.selected_rows.clear();
-                self.selected_rows.insert(pos);
-                // Anchor/cursor must follow the jump too, or subsequent Arrow /
-                // Shift+Arrow navigation moves from the stale previous position
-                // instead of the row the user just jumped to.
-                self.selection_anchor = Some(pos);
-                self.selection_cursor = Some(pos);
+            self.goto_line(row);
+        }
+    }
+
+    /// Jump to the entry at zero-based index `row` (the user typed `row + 1`).
+    /// Three outcomes, each with explicit feedback instead of silently no-oping:
+    ///   * out of range          → status message, no scroll
+    ///   * visible in `filtered` → select + scroll to it
+    ///   * hidden by the filter  → status message + scroll to nearest visible row
+    fn goto_line(&mut self, row: usize) {
+        let m = self.model.read_recover();
+        let total = m.entries.len();
+        let line_no = row + 1;
+        if row >= total {
+            drop(m);
+            self.status = tr!("status_goto_out_of_range", {
+                n: &line_no.to_string(),
+                total: &total.to_string()
+            });
+        } else if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
+            drop(m);
+            self.pending_scroll = Some(pos);
+            self.selected_rows.clear();
+            self.selected_rows.insert(pos);
+            // Anchor/cursor must follow the jump too, or subsequent Arrow /
+            // Shift+Arrow navigation moves from the stale previous position
+            // instead of the row the user just jumped to.
+            self.selection_anchor = Some(pos);
+            self.selection_cursor = Some(pos);
+        } else {
+            // The line exists but is hidden by the active filter. Rather than
+            // silently doing nothing, tell the user and scroll to the nearest
+            // visible row so they still get spatial context. `filtered` is
+            // strictly ascending (built by scanning entries in order), so a
+            // partition point locates the neighbour without a linear scan.
+            if !m.filtered.is_empty() {
+                let nearest = m
+                    .filtered
+                    .partition_point(|&e| (e as usize) < row)
+                    .min(m.filtered.len() - 1);
+                self.pending_scroll = Some(nearest);
             }
+            drop(m);
+            self.status = tr!("status_goto_filtered", { n: &line_no.to_string() });
         }
     }
 
@@ -3693,5 +3726,81 @@ mod ui_tests {
         // Toggle again to remove
         h.state_mut().toggle_bookmark(5);
         assert!(!h.state().model.read().unwrap().bookmarks.contains(&5));
+    }
+
+    #[test]
+    fn goto_visible_row_selects_and_scrolls() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20); // filtered = 0..20, all visible
+        h.run();
+
+        h.state_mut().goto_line(7); // user typed line 8
+        assert!(h.state().selected_rows.contains(&7));
+        assert_eq!(h.state().pending_scroll, Some(7));
+        assert_eq!(h.state().selection_cursor, Some(7));
+        assert!(h.state().status.is_empty(), "no error status on a hit");
+    }
+
+    #[test]
+    fn goto_out_of_range_reports_and_does_not_select() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+
+        h.state_mut().goto_line(999);
+        assert!(
+            h.state().selected_rows.is_empty(),
+            "out-of-range goto must not select"
+        );
+        assert_eq!(h.state().pending_scroll, None);
+        assert!(!h.state().status.is_empty(), "should report out of range");
+    }
+
+    #[test]
+    fn goto_filtered_row_reports_and_scrolls_to_nearest() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        // Hide odd rows: filtered keeps only even entry indices (0,2,4,...,18).
+        {
+            let mut m = h.state().model.write().unwrap();
+            m.filtered = (0..20u32).filter(|i| i % 2 == 0).collect();
+        }
+        h.run();
+
+        // Line 10 (row index 9) is odd → hidden. Nearest visible by
+        // partition_point is entry 10, which sits at position 5 in `filtered`.
+        h.state_mut().goto_line(9);
+        assert!(
+            h.state().selected_rows.is_empty(),
+            "hidden goto must not select"
+        );
+        assert!(
+            !h.state().status.is_empty(),
+            "should report filtered-hidden"
+        );
+        assert_eq!(
+            h.state().pending_scroll,
+            Some(5),
+            "should scroll to nearest visible row"
+        );
+    }
+
+    #[test]
+    fn goto_filtered_with_empty_filtered_no_panic() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        {
+            let mut m = h.state().model.write().unwrap();
+            m.filtered.clear(); // nothing visible
+        }
+        h.run();
+
+        h.state_mut().goto_line(5); // exists but nothing is visible
+        assert_eq!(h.state().pending_scroll, None);
+        assert!(!h.state().status.is_empty());
     }
 }
