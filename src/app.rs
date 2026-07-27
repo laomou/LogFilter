@@ -70,6 +70,11 @@ pub struct App {
     /// grows under a reload-only encoding). The UI thread picks it up and does a
     /// full `open_file` reload. `None` = nothing pending.
     reload_request: Arc<Mutex<Option<PathBuf>>>,
+    /// Encoding actually used for the current file load, resolved by the loader
+    /// (notably "Local" → the sniffed UTF-8/legacy codepage). Shown in the status
+    /// bar so the user sees the real encoding, not just their menu choice.
+    /// `None` until the initial read finishes (or when the source is adb).
+    detected_encoding: Arc<Mutex<Option<String>>>,
 
     // Per-frame caches: recomputed lazily when source data changes.
     cached_highlight_palette: Vec<Color32>,
@@ -318,6 +323,7 @@ impl App {
             device_refresh_rx: None,
             ctx: ctx.clone(),
             reload_request: Arc::new(Mutex::new(None)),
+            detected_encoding: Arc::new(Mutex::new(None)),
             cached_highlight_palette: init_palette,
             cached_highlight_palette_raw: init_palette_raw,
             cached_highlight_tokens: if init_hl_raw.is_empty() {
@@ -399,11 +405,14 @@ impl App {
         let choice = self.encoding_choice();
         let load_error = self.load_error.clone();
         let reload_request = self.reload_request.clone();
+        let detected_encoding = self.detected_encoding.clone();
         let ctx = self.ctx.clone();
         let follow_path = path.to_path_buf();
         let src = path.display().to_string();
         // Clear any error from a previous load before starting this one.
         *self.load_error.lock_recover() = None;
+        // Clear the previous file's detected encoding until this load resolves it.
+        *self.detected_encoding.lock_recover() = None;
         thread::Builder::new()
             .name("file-load".into())
             .spawn(move || {
@@ -426,6 +435,10 @@ impl App {
                         return;
                     }
                 };
+                // Publish the encoding actually used (resolves "Local" to the
+                // sniffed codepage) so the status bar can show it.
+                *detected_encoding.lock_recover() = Some(tail.encoding_name().to_string());
+                ctx.request_repaint();
                 follow_file(
                     &follow_path,
                     tail,
@@ -634,7 +647,7 @@ fn follow_file(
                 Err(_) => {}
             }
         },
-        Tail::ReloadOnChange { len } => loop {
+        Tail::ReloadOnChange { len, .. } => loop {
             thread::sleep(POLL);
             if source_epoch.load(Ordering::Acquire) != epoch {
                 return;
@@ -2477,7 +2490,12 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                 ui.separator();
-                ui.label(self.ui.encoding.to_uppercase());
+                // Show the encoding actually used for the loaded file (resolves
+                // "Local" to the sniffed codepage). Falls back to the menu choice
+                // before the load resolves or when the source is adb (no file).
+                let detected = self.detected_encoding.lock_recover().clone();
+                let enc_label = detected.unwrap_or_else(|| self.ui.encoding.clone());
+                ui.label(enc_label.to_uppercase());
                 let n = self.selected_rows.len();
                 if !self.status.is_empty() {
                     ui.separator();
@@ -3775,6 +3793,24 @@ mod ui_tests {
         assert_eq!(m.entries[2].level, crate::model::LevelMask::E);
         drop(m);
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_file_populates_detected_encoding() {
+        let mut h = harness();
+        h.run();
+        let tmp = std::env::temp_dir().join(format!("lf_enc_disp_{}.log", std::process::id()));
+        std::fs::write(&tmp, "01-01 10:00:00.000  1  2 I T: 中文 abc\n").unwrap();
+        h.state_mut().open_file(&tmp).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        h.run();
+        let enc = h.state().detected_encoding.lock_recover().clone();
+        assert_eq!(
+            enc.as_deref(),
+            Some("UTF-8"),
+            "status bar should reflect the actually-used encoding"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 

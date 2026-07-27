@@ -19,7 +19,19 @@ pub enum Tail {
     /// UTF-16: `0x0A` also appears as the low byte of unrelated code units, so
     /// raw-newline splitting is unsafe. Fall back to reloading the whole file
     /// when its length changes. `len` is the size at initial load.
-    ReloadOnChange { len: u64 },
+    ReloadOnChange { len: u64, enc: &'static Encoding },
+}
+
+impl Tail {
+    /// Canonical name of the encoding actually used for this load (e.g. "UTF-8",
+    /// "GBK", "UTF-16LE"). Lets the UI show the detected encoding rather than the
+    /// user's menu choice — notably "Local" resolves to whatever was sniffed.
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            Tail::Append { enc, .. } => enc.name(),
+            Tail::ReloadOnChange { enc, .. } => enc.name(),
+        }
+    }
 }
 
 /// Result of reading data appended since a previous tail offset.
@@ -182,7 +194,7 @@ fn send_decoded_lines_with_enc(
     // Windows-1252) is byte-safe for `\n`.
     let tail_for = |bytes: u64| {
         if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
-            Tail::ReloadOnChange { len: bytes }
+            Tail::ReloadOnChange { len: bytes, enc }
         } else {
             Tail::Append { offset: bytes, enc }
         }
@@ -637,6 +649,40 @@ mod tests {
             }
             Tail::ReloadOnChange { .. } => panic!("UTF-8 should tail by append"),
         }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tail_encoding_name_reports_actual_encoding() {
+        assert_eq!(
+            Tail::Append {
+                offset: 0,
+                enc: encoding_rs::GBK
+            }
+            .encoding_name(),
+            "GBK"
+        );
+        assert_eq!(
+            Tail::ReloadOnChange {
+                len: 0,
+                enc: encoding_rs::UTF_16LE
+            }
+            .encoding_name(),
+            "UTF-16LE"
+        );
+    }
+
+    #[test]
+    fn local_load_reports_utf8_when_sniffed() {
+        // A UTF-8 file opened as Local must report UTF-8 (not "Local"), proving
+        // the status bar would show the sniffed encoding.
+        let tmp = unique_tmp("local_reports");
+        std::fs::write(&tmp, "中文 abc\n".as_bytes()).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        let tail = send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local).unwrap();
+        assert_eq!(tail.encoding_name(), "UTF-8");
         let _ = std::fs::remove_file(&tmp);
     }
 }
