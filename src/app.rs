@@ -2310,6 +2310,7 @@ impl App {
                 ui.separator();
                 dirty |= ui
                     .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
+                    .on_hover_text(tr!("bookmarks_only_hover"))
                     .changed();
             });
 
