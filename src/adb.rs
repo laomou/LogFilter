@@ -148,17 +148,14 @@ impl Session {
             .name("adb-reader".into())
             .spawn(move || {
                 let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(|r| r.ok()) {
+                stream_lossy_lines(reader, &tx, epoch, || {
                     // When paused, park the reader thread: it blocks here, neither
                     // burning CPU nor consuming/discarding stdout data. The data
                     // merely buffers in the kernel pipe until resumed.
                     while paused_thr.load(std::sync::atomic::Ordering::Relaxed) {
                         thread::park();
                     }
-                    if tx.send((epoch, line)).is_err() {
-                        break;
-                    }
-                }
+                });
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
                 ended_thr.store(true, Ordering::Release);
@@ -259,6 +256,39 @@ impl Drop for Session {
     }
 }
 
+/// Read `reader` line by line, decoding each line lossily (invalid UTF-8 bytes
+/// become U+FFFD) and sending it — sans trailing CR/LF — through `tx` tagged
+/// with `epoch`. `before_read` runs at the top of each iteration (used to park
+/// while paused). Returns when the stream ends, a read errors, or `tx` closes.
+///
+/// This deliberately avoids `BufRead::lines()`: that decoder yields `Err` on the
+/// first line with a non-UTF-8 byte, and the previous `map_while(Result::ok)`
+/// turned that single bad line into a premature end-of-stream — silently losing
+/// it and everything after. Lossy decoding keeps the line and the stream alive.
+fn stream_lossy_lines<R: BufRead>(
+    mut reader: R,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+    mut before_read: impl FnMut(),
+) {
+    let mut buf = Vec::new();
+    loop {
+        before_read();
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF: stdout closed.
+            Ok(_) => {}
+            Err(_) => break, // genuine I/O error: stop reading.
+        }
+        let line = String::from_utf8_lossy(&buf)
+            .trim_end_matches(['\n', '\r'])
+            .to_string();
+        if tx.send((epoch, line)).is_err() {
+            break;
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -291,5 +321,55 @@ mod tests {
         assert!(session.reader_handle.is_none());
         assert!(session.stderr_handle.is_none());
         assert!(session.reader_thread.is_none());
+    }
+
+    #[test]
+    fn stream_lossy_lines_keeps_all_lines_across_invalid_utf8() {
+        // A stray non-UTF-8 byte (0xFF) sits in the middle line. The old
+        // lines()+map_while(ok) path would drop that line AND every line after
+        // it. Lossy decoding must keep all three lines and replace the bad byte.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"first\n");
+        data.extend_from_slice(b"bad\xFFbyte\n");
+        data.extend_from_slice(b"third\n");
+
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        stream_lossy_lines(std::io::Cursor::new(data), &tx, 7, || {});
+        drop(tx);
+
+        let lines: Vec<(u64, String)> = rx.try_iter().collect();
+        assert_eq!(lines.len(), 3, "no line should be dropped");
+        assert_eq!(lines[0], (7, "first".to_string()));
+        assert_eq!(lines[1].0, 7);
+        assert!(
+            lines[1].1.starts_with("bad") && lines[1].1.ends_with("byte"),
+            "bad byte line kept with replacement char: {:?}",
+            lines[1].1
+        );
+        assert!(lines[1].1.contains('\u{FFFD}'), "0xFF → U+FFFD");
+        assert_eq!(lines[2], (7, "third".to_string()));
+    }
+
+    #[test]
+    fn stream_lossy_lines_trims_crlf_and_handles_no_final_newline() {
+        let data = b"has\r\nno-newline-tail".to_vec();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        stream_lossy_lines(std::io::Cursor::new(data), &tx, 1, || {});
+        drop(tx);
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(
+            lines,
+            vec!["has".to_string(), "no-newline-tail".to_string()]
+        );
+    }
+
+    #[test]
+    fn stream_lossy_lines_stops_when_receiver_dropped() {
+        // If the ingest side goes away, the reader must stop rather than spin.
+        let data = b"a\nb\nc\n".to_vec();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        drop(rx);
+        stream_lossy_lines(std::io::Cursor::new(data), &tx, 1, || {});
+        // Returning at all (no hang/panic) is the assertion.
     }
 }
