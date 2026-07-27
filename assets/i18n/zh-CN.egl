@@ -112,7 +112,6 @@ status_failed_open_dropped = 打开拖入文件失败: {e}
 
 # quick-filter toggles
 bookmarks_only = 仅书签
-errors_only = 仅错误
 
 # clipboard / save status
 status_clipboard_error = 剪贴板错误: {e}

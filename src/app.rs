@@ -144,7 +144,6 @@ pub struct UiState {
 
     // Quick-filter toggles
     pub bookmarks_only: bool,
-    pub errors_only: bool,
 
     // Picker panel state (open only when Some).
     pub picker: Option<PickerState>,
@@ -196,7 +195,6 @@ impl UiState {
             col_message: true,
             goto_line: String::new(),
             bookmarks_only: false,
-            errors_only: false,
             picker: None,
         }
     }
@@ -219,7 +217,6 @@ impl UiState {
                 vec![]
             },
             bookmarks_only: self.bookmarks_only,
-            errors_only: self.errors_only,
         }
     }
 
@@ -2314,9 +2311,6 @@ impl App {
                 dirty |= ui
                     .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
                     .changed();
-                dirty |= ui
-                    .checkbox(&mut self.ui.errors_only, tr!("errors_only"))
-                    .changed();
             });
 
             // Row 3: adb toolbar + Goto + Auto-scroll
@@ -3515,13 +3509,13 @@ mod ui_tests {
         app.ui.find_on = true;
         app.ui.remove = "spam".into();
         app.ui.remove_on = true;
-        app.ui.errors_only = true;
+        app.ui.bookmarks_only = true;
         app.notify_filter();
 
         let spec = app.shared_filter.read().unwrap();
         assert_eq!(spec.find, vec!["hello"]);
         assert_eq!(spec.remove, vec!["spam"]);
-        assert!(spec.errors_only);
+        assert!(spec.bookmarks_only);
     }
 
     #[test]
@@ -3549,7 +3543,6 @@ mod ui_tests {
         h.state_mut().ui.find_on = true;
         h.state_mut().ui.highlight = "Tag".into();
         h.state_mut().ui.highlight_on = true;
-        h.state_mut().ui.errors_only = true;
         h.state_mut().notify_filter();
         // Drive multiple frames with active filters + highlights
         h.run();
