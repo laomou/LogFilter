@@ -87,6 +87,26 @@ pub fn send_decoded_lines(
     send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc)
 }
 
+/// Resolve a WHATWG encoding label (e.g. "gbk", "shift_jis", "euc-kr",
+/// "utf-16le", "windows-1252") to its decoder. Returns `None` for an unknown
+/// label so the caller can fall back. Case-insensitive.
+pub fn encoding_for_label(label: &str) -> Option<&'static Encoding> {
+    Encoding::for_label(label.as_bytes())
+}
+
+/// Stream a file's lines decoded with an explicit named encoding. Used by the
+/// Encoding menu so the user can override auto-detection for a mis-decoded log.
+pub fn send_lines_with_label(
+    file: File,
+    tx: Sender<(u64, String)>,
+    epoch: u64,
+    source_epoch: Arc<AtomicU64>,
+    label: &str,
+) -> std::io::Result<()> {
+    let enc = encoding_for_label(label).unwrap_or(encoding_rs::UTF_8);
+    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc)
+}
+
 fn send_decoded_lines_with_enc(
     file: File,
     tx: Sender<(u64, String)>,
@@ -311,5 +331,53 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         assert_eq!(lines, vec![line]);
+    }
+
+    #[test]
+    fn encoding_for_label_resolves_common_labels() {
+        assert_eq!(encoding_for_label("gbk").unwrap().name(), "GBK");
+        assert_eq!(encoding_for_label("GBK").unwrap().name(), "GBK"); // case-insensitive
+        assert_eq!(encoding_for_label("shift_jis").unwrap().name(), "Shift_JIS");
+        assert_eq!(encoding_for_label("euc-kr").unwrap().name(), "EUC-KR");
+        assert_eq!(encoding_for_label("big5").unwrap().name(), "Big5");
+        assert_eq!(
+            encoding_for_label("windows-1252").unwrap().name(),
+            "windows-1252"
+        );
+        assert_eq!(encoding_for_label("utf-16le").unwrap().name(), "UTF-16LE");
+        assert!(encoding_for_label("not-a-real-encoding").is_none());
+    }
+
+    #[test]
+    fn send_lines_with_label_decodes_gbk() {
+        let tmp = std::env::temp_dir().join(format!("lf_label_gbk_{}.log", std::process::id()));
+        let line = "中文日志 test 42";
+        let (encoded, _, _) = encoding_rs::GBK.encode(line);
+        std::fs::write(&tmp, encoded.as_ref()).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        send_lines_with_label(file, tx, 1, epoch, "gbk").unwrap();
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(lines, vec![line.to_string()]);
+    }
+
+    #[test]
+    fn send_lines_with_unknown_label_falls_back_to_utf8() {
+        let tmp = std::env::temp_dir().join(format!("lf_label_bad_{}.log", std::process::id()));
+        std::fs::write(&tmp, b"plain ascii\n").unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        // An unknown label must not panic; it falls back to UTF-8.
+        send_lines_with_label(file, tx, 1, epoch, "bogus-label").unwrap();
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(lines, vec!["plain ascii".to_string()]);
     }
 }

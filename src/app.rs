@@ -2,7 +2,7 @@ use crate::adb;
 use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
-use crate::io::{send_decoded_lines, send_utf8_lines};
+use crate::io::{send_decoded_lines, send_lines_with_label, send_utf8_lines};
 use crate::lock::{MutexExt, RwLockExt};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
@@ -385,7 +385,7 @@ impl App {
         // reader bails out early if a newer load supersedes this epoch.
         let tx = self.line_tx.clone();
         let source_epoch = self.source_epoch.clone();
-        let choice = self.encoding_choice();
+        let encoding = self.ui.encoding.clone();
         let load_error = self.load_error.clone();
         let src = path.display().to_string();
         // Clear any error from a previous load before starting this one.
@@ -393,11 +393,15 @@ impl App {
         thread::Builder::new()
             .name("file-load".into())
             .spawn(move || {
-                let res = match choice {
-                    EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
-                    EncodingChoice::Local => {
-                        send_decoded_lines(file, tx, epoch, source_epoch, choice)
+                // "utf-8" keeps the UTF-16 BOM-sniffing fast path; "local" auto-
+                // picks by system locale; anything else is an explicit WHATWG
+                // encoding label chosen from the Encoding menu.
+                let res = match encoding.as_str() {
+                    "utf-8" => send_utf8_lines(file, tx, epoch, source_epoch),
+                    "local" => {
+                        send_decoded_lines(file, tx, epoch, source_epoch, EncodingChoice::Local)
                     }
+                    label => send_lines_with_label(file, tx, epoch, source_epoch, label),
                 };
                 if let Err(e) = res {
                     // A mid-stream read error truncated the load; record it so
@@ -408,13 +412,6 @@ impl App {
                 }
             })?;
         Ok(())
-    }
-
-    fn encoding_choice(&self) -> EncodingChoice {
-        match self.ui.encoding.as_str() {
-            "local" => EncodingChoice::Local,
-            _ => EncodingChoice::Utf8,
-        }
     }
 
     fn notify_filter(&mut self) {
@@ -1959,6 +1956,7 @@ impl App {
         let ctx = ui.ctx().clone();
         // Menu bar — File · Format · View · Encoding
         let mut recent_open: Option<PathBuf> = None;
+        let mut encoding_changed = false;
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(tr!("m_file"), |ui| {
@@ -2113,11 +2111,27 @@ impl App {
                 });
 
                 ui.menu_button(tr!("m_encoding"), |ui| {
-                    for (label, value) in [(tr!("local"), "local"), ("UTF-8".to_string(), "utf-8")]
-                    {
+                    // (menu label, encoding value). "local"/"utf-8" are special-
+                    // cased in the loader; the rest are WHATWG labels understood
+                    // by encoding_rs::Encoding::for_label.
+                    let options: [(String, &str); 9] = [
+                        (tr!("local"), "local"),
+                        ("UTF-8".into(), "utf-8"),
+                        ("GBK".into(), "gbk"),
+                        ("Big5".into(), "big5"),
+                        ("Shift_JIS".into(), "shift_jis"),
+                        ("EUC-KR".into(), "euc-kr"),
+                        ("UTF-16LE".into(), "utf-16le"),
+                        ("UTF-16BE".into(), "utf-16be"),
+                        ("Windows-1252".into(), "windows-1252"),
+                    ];
+                    for (label, value) in options {
                         let selected = self.ui.encoding == value;
                         if ui.selectable_label(selected, label).clicked() {
-                            self.ui.encoding = value.into();
+                            if self.ui.encoding != value {
+                                self.ui.encoding = value.into();
+                                encoding_changed = true;
+                            }
                             ui.close();
                         }
                     }
@@ -2137,6 +2151,18 @@ impl App {
         if let Some(p) = recent_open {
             if let Err(e) = self.open_file(&p) {
                 self.status = tr!("status_failed_open", { e: &format!("{}", e) });
+            }
+        }
+        // Changing the encoding only matters for an already-open file: re-load it
+        // so the new decoding takes effect immediately instead of on next open.
+        // (adb streams are UTF-8 and aren't affected.) The choice itself is
+        // persisted via UiState::write_back on exit.
+        if encoding_changed {
+            let path = self.model.read_recover().file_path.clone();
+            if let Some(p) = path {
+                if let Err(e) = self.open_file(&p) {
+                    self.status = tr!("status_failed_open", { e: &format!("{}", e) });
+                }
             }
         }
     }
