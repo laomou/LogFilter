@@ -112,6 +112,7 @@ status_failed_open_dropped = Failed to open dropped file: {e}
 
 # quick-filter toggles
 bookmarks_only = Bookmarks only
+bookmarks_only_hover = Show only bookmarked lines
 
 # clipboard / save status
 status_clipboard_error = Clipboard error: {e}
