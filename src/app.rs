@@ -2,7 +2,7 @@ use crate::adb;
 use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
-use crate::io::{send_decoded_lines, send_utf8_lines};
+use crate::io::{read_appended, send_decoded_lines, send_utf8_lines, Tail};
 use crate::lock::{MutexExt, RwLockExt};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
@@ -62,6 +62,14 @@ pub struct App {
     /// off the UI thread prevents startup and the refresh button from freezing
     /// the window when adb is slow or unavailable.
     device_refresh_rx: Option<Receiver<Result<Vec<String>, String>>>,
+
+    /// egui context, kept so background loaders/tail pollers can request a
+    /// repaint and hand reload requests back to the UI thread.
+    ctx: egui::Context,
+    /// Set by the tail poller when the followed file is rotated/truncated (or
+    /// grows under a reload-only encoding). The UI thread picks it up and does a
+    /// full `open_file` reload. `None` = nothing pending.
+    reload_request: Arc<Mutex<Option<PathBuf>>>,
 
     // Per-frame caches: recomputed lazily when source data changes.
     cached_highlight_palette: Vec<Color32>,
@@ -308,6 +316,8 @@ impl App {
             selected_cmd,
             auto_scroll: true,
             device_refresh_rx: None,
+            ctx: ctx.clone(),
+            reload_request: Arc::new(Mutex::new(None)),
             cached_highlight_palette: init_palette,
             cached_highlight_palette_raw: init_palette_raw,
             cached_highlight_tokens: if init_hl_raw.is_empty() {
@@ -382,11 +392,15 @@ impl App {
         // Background reader: read + decode, then feed lines through the existing
         // ingest channel so parsing/appending/repaint happen incrementally on
         // the ingest thread — the UI stays responsive for large files. The
-        // reader bails out early if a newer load supersedes this epoch.
+        // reader bails out early if a newer load supersedes this epoch. After the
+        // initial read it keeps the thread alive to follow (tail) appends.
         let tx = self.line_tx.clone();
         let source_epoch = self.source_epoch.clone();
         let choice = self.encoding_choice();
         let load_error = self.load_error.clone();
+        let reload_request = self.reload_request.clone();
+        let ctx = self.ctx.clone();
+        let follow_path = path.to_path_buf();
         let src = path.display().to_string();
         // Clear any error from a previous load before starting this one.
         *self.load_error.lock_recover() = None;
@@ -394,18 +408,33 @@ impl App {
             .name("file-load".into())
             .spawn(move || {
                 let res = match choice {
-                    EncodingChoice::Utf8 => send_utf8_lines(file, tx, epoch, source_epoch),
+                    EncodingChoice::Utf8 => {
+                        send_utf8_lines(file, tx.clone(), epoch, source_epoch.clone())
+                    }
                     EncodingChoice::Local => {
-                        send_decoded_lines(file, tx, epoch, source_epoch, choice)
+                        send_decoded_lines(file, tx.clone(), epoch, source_epoch.clone(), choice)
                     }
                 };
-                if let Err(e) = res {
-                    // A mid-stream read error truncated the load; record it so
-                    // the UI surfaces "partially loaded" rather than silence.
-                    if let Ok(mut slot) = load_error.lock() {
-                        *slot = Some(format!("{src}: {e}"));
+                let tail = match res {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // A mid-stream read error truncated the load; record it so
+                        // the UI surfaces "partially loaded" rather than silence.
+                        if let Ok(mut slot) = load_error.lock() {
+                            *slot = Some(format!("{src}: {e}"));
+                        }
+                        return;
                     }
-                }
+                };
+                follow_file(
+                    &follow_path,
+                    tail,
+                    &tx,
+                    epoch,
+                    &source_epoch,
+                    &reload_request,
+                    &ctx,
+                );
             })?;
         Ok(())
     }
@@ -562,6 +591,65 @@ impl App {
     }
 }
 
+/// Poll a followed file every 500 ms and stream appended lines through `tx`,
+/// keeping the current epoch. Runs on the file-load thread after the initial
+/// read. Exits when the epoch changes (a new file/adb load superseded this one)
+/// or the receiver is gone. On rotation/truncation (or growth under a
+/// reload-only encoding like UTF-16) it records a reload request and exits;
+/// the UI thread performs the actual `open_file` reload.
+#[allow(clippy::too_many_arguments)]
+fn follow_file(
+    path: &Path,
+    tail: Tail,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+    source_epoch: &Arc<AtomicU64>,
+    reload_request: &Arc<Mutex<Option<PathBuf>>>,
+    ctx: &egui::Context,
+) {
+    const POLL: Duration = Duration::from_millis(500);
+    let request_reload = || {
+        *reload_request.lock_recover() = Some(path.to_path_buf());
+        ctx.request_repaint();
+    };
+    match tail {
+        Tail::Append { mut offset, enc } => loop {
+            thread::sleep(POLL);
+            if source_epoch.load(Ordering::Acquire) != epoch {
+                return; // superseded by a newer load
+            }
+            match read_appended(path, offset, enc, tx, epoch) {
+                Ok(a) if a.truncated => {
+                    request_reload();
+                    return;
+                }
+                Ok(a) => {
+                    if a.offset != offset {
+                        offset = a.offset;
+                        ctx.request_repaint();
+                    }
+                }
+                // Transient read error (e.g. file briefly missing during
+                // rotation): keep polling rather than giving up.
+                Err(_) => {}
+            }
+        },
+        Tail::ReloadOnChange { len } => loop {
+            thread::sleep(POLL);
+            if source_epoch.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            // UTF-16: can't byte-tail safely, so reload whenever the size changes.
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() != len {
+                    request_reload();
+                    return;
+                }
+            }
+        },
+    }
+}
+
 /// Infer the expected log format from an adb command string.
 /// The `-v <fmt>` flag selects the format; `/kmsg` path means kernel format.
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
@@ -645,6 +733,10 @@ impl App {
     }
 
     fn clear(&mut self) {
+        // Bump the epoch so a running file-tail (or any queued lines) stops
+        // feeding this cleared view — otherwise the tail poller would keep
+        // appending new lines into a table the user just emptied.
+        self.source_epoch.fetch_add(1, Ordering::AcqRel);
         {
             let mut m = self.model.write_recover();
             m.clear();
@@ -1899,6 +1991,25 @@ impl eframe::App for App {
         }
 
         self.poll_device_refresh();
+
+        // A followed file was rotated/truncated: reload it from scratch. Taken
+        // before other work so the fresh epoch is in place for this frame.
+        let reload = self.reload_request.lock_recover().take();
+        if let Some(path) = reload {
+            // Only reload if it's still the file we're viewing (guards against a
+            // stale request landing after the user opened something else).
+            let still_current = self
+                .model
+                .read_recover()
+                .file_path
+                .as_ref()
+                .is_some_and(|p| p == &path);
+            if still_current {
+                if let Err(e) = self.open_file(&path) {
+                    self.status = tr!("status_failed_open", { e: &format!("{}", e) });
+                }
+            }
+        }
 
         // Surface a truncated file load (mid-stream read error) once.
         if let Some(msg) = self.load_error.lock_recover().take() {
@@ -3664,6 +3775,101 @@ mod ui_tests {
         assert_eq!(m.entries[2].level, crate::model::LevelMask::E);
         drop(m);
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_file_tails_appended_lines_without_moving_scroll() {
+        let mut h = harness();
+        h.run();
+
+        let tmp = std::env::temp_dir().join(format!("lf_tail_e2e_{}.log", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "01-01 10:00:00.000  100  200 I Tag1: first\n\
+             01-01 10:00:01.000  100  200 W Tag2: second\n",
+        )
+        .unwrap();
+
+        h.state_mut().open_file(&tmp).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h.run();
+        assert_eq!(h.state().model.read().unwrap().entries.len(), 2);
+        // Tailing must not hijack the viewport.
+        assert_eq!(
+            h.state().pending_scroll,
+            None,
+            "tail must not force a scroll"
+        );
+
+        // Append two more lines to the file on disk.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"01-01 10:00:02.000  100  200 E Tag1: third\n")
+                .unwrap();
+            f.write_all(b"01-01 10:00:03.000  100  200 I Tag3: fourth\n")
+                .unwrap();
+        }
+
+        // Wait past the 500 ms poll interval, then let ingest run.
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        h.run();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h.run();
+
+        let m = h.state().model.read().unwrap();
+        assert_eq!(
+            m.entries.len(),
+            4,
+            "appended lines should be tailed in, got {}",
+            m.entries.len()
+        );
+        assert_eq!(m.entries[3].tag(), "Tag3");
+        drop(m);
+        assert_eq!(
+            h.state().pending_scroll,
+            None,
+            "tail still must not move scroll"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_file_reloads_on_truncation() {
+        let mut h = harness();
+        h.run();
+
+        let tmp = std::env::temp_dir().join(format!("lf_tail_rot_{}.log", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "01-01 10:00:00.000  100  200 I Tag1: alpha\n\
+             01-01 10:00:01.000  100  200 I Tag1: beta\n\
+             01-01 10:00:02.000  100  200 I Tag1: gamma\n",
+        )
+        .unwrap();
+        h.state_mut().open_file(&tmp).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h.run();
+        assert_eq!(h.state().model.read().unwrap().entries.len(), 3);
+
+        // Rotate: replace with a shorter file (fewer bytes than already read).
+        std::fs::write(&tmp, "01-01 10:10:00.000  100  200 W Tag9: rotated\n").unwrap();
+
+        // Poll fires (500ms) → reload_request set → next update() reloads.
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        h.run(); // picks up reload_request, calls open_file
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h.run(); // ingest the reloaded content
+
+        let m = h.state().model.read().unwrap();
+        assert_eq!(
+            m.entries.len(),
+            1,
+            "after rotation the model reflects the new, shorter file"
+        );
+        assert_eq!(m.entries[0].tag(), "Tag9");
+        drop(m);
         let _ = std::fs::remove_file(&tmp);
     }
 

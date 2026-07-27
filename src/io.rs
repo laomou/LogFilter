@@ -3,21 +3,47 @@ use crossbeam_channel::Sender;
 use encoding_rs::{CoderResult, Decoder, Encoding};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// How the tail/follow poller should pick up data appended after the initial
+/// load, decided once from the encoding chosen for that load.
+pub enum Tail {
+    /// Byte-safe encodings (UTF-8 and every ASCII-superset legacy codepage:
+    /// GBK, Shift_JIS, EUC-KR, Big5, Windows-1252). `b'\n'` is an unambiguous
+    /// single byte in all of them, so appended data can be split on raw
+    /// newlines and each complete line decoded with `enc`. `offset` is the byte
+    /// position just past the end of the initial load.
+    Append { offset: u64, enc: &'static Encoding },
+    /// UTF-16: `0x0A` also appears as the low byte of unrelated code units, so
+    /// raw-newline splitting is unsafe. Fall back to reloading the whole file
+    /// when its length changes. `len` is the size at initial load.
+    ReloadOnChange { len: u64 },
+}
+
+/// Result of reading data appended since a previous tail offset.
+pub struct Appended {
+    /// New byte offset (just past the last complete line consumed).
+    pub offset: u64,
+    /// True if the file is now shorter than `offset` — rotated or truncated,
+    /// so the caller should reload from scratch rather than append.
+    pub truncated: bool,
+}
+
 /// Stream a UTF-8 (or BOM-detected UTF-16) file's lines into `tx`.
 ///
-/// Returns `Ok(())` on clean end-of-file or when a newer source epoch
-/// supersedes this load; returns `Err` only on a genuine mid-stream read
-/// failure, so the caller can distinguish "finished" from "truncated by an I/O
-/// error" and surface the latter instead of presenting a partial file as whole.
+/// Returns `Ok(Tail)` describing how to follow subsequent appends on clean EOF
+/// (or when a newer source epoch supersedes this load); returns `Err` only on a
+/// genuine mid-stream read failure, so the caller can distinguish "finished"
+/// from "truncated by an I/O error" and surface the latter instead of
+/// presenting a partial file as whole.
 pub fn send_utf8_lines(
     file: File,
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Tail> {
     let mut reader = BufReader::new(file);
     let bom = reader.fill_buf()?;
     if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
@@ -34,14 +60,22 @@ pub fn send_utf8_lines(
 
     let mut buf = Vec::new();
     let mut first = true;
+    let mut read_bytes: u64 = 0;
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
-            return Ok(());
+            return Ok(Tail::Append {
+                offset: read_bytes,
+                enc: encoding_rs::UTF_8,
+            });
         }
+        read_bytes += n as u64;
         if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(());
+            return Ok(Tail::Append {
+                offset: read_bytes,
+                enc: encoding_rs::UTF_8,
+            });
         }
         // Fast path: valid UTF-8 -> borrow & trim on the slice, no lossy scan.
         let line: String = if let Ok(s) = std::str::from_utf8(&buf[..n]) {
@@ -65,7 +99,10 @@ pub fn send_utf8_lines(
             line
         };
         if tx.send((epoch, line)).is_err() {
-            return Ok(());
+            return Ok(Tail::Append {
+                offset: read_bytes,
+                enc: encoding_rs::UTF_8,
+            });
         }
     }
 }
@@ -76,7 +113,7 @@ pub fn send_decoded_lines(
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
     choice: EncodingChoice,
-) -> std::io::Result<()> {
+) -> std::io::Result<Tail> {
     let enc = match choice {
         EncodingChoice::Utf8 => encoding_rs::UTF_8,
         EncodingChoice::Local => {
@@ -131,20 +168,33 @@ fn send_decoded_lines_with_enc(
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
     enc: &'static Encoding,
-) -> std::io::Result<()> {
+) -> std::io::Result<Tail> {
     let mut reader = BufReader::with_capacity(8192, file);
     let mut decoder = enc.new_decoder();
     // Accumulate decoded text across chunks so we can split into lines only when
     // a full line is available — avoids splitting a multibyte character mid-sequence.
     let mut text_buf = String::with_capacity(8192);
     let mut raw_buf = vec![0u8; 8192];
+    let mut read_bytes: u64 = 0;
+    // UTF-16 is not an ASCII superset (0x0A appears inside unrelated code
+    // units), so byte-newline tailing is unsafe — follow by reloading on size
+    // change. Every other encoding here (UTF-8, GBK, Shift_JIS, EUC-KR, Big5,
+    // Windows-1252) is byte-safe for `\n`.
+    let tail_for = |bytes: u64| {
+        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+            Tail::ReloadOnChange { len: bytes }
+        } else {
+            Tail::Append { offset: bytes, enc }
+        }
+    };
     loop {
         let n = reader.read(&mut raw_buf)?;
         if n == 0 {
             break;
         }
+        read_bytes += n as u64;
         if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(());
+            return Ok(tail_for(read_bytes));
         }
         decode_chunk(
             &mut decoder,
@@ -155,7 +205,7 @@ fn send_decoded_lines_with_enc(
             epoch,
         );
         if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(());
+            return Ok(tail_for(read_bytes));
         }
     }
     // Final flush: drain any remaining buffered bytes from the decoder.
@@ -163,17 +213,74 @@ fn send_decoded_lines_with_enc(
     // Emit any remaining text without a trailing newline as a final line.
     if !text_buf.is_empty() {
         if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(());
+            return Ok(tail_for(read_bytes));
         }
         let line = text_buf.trim_end_matches(['\r', '\n']).to_string();
         // Match the UTF-8 reader's `read_until` behavior: a final logical line
         // is preserved even if CR/LF normalization leaves it empty (for example
         // a file ending in a lone `\r`).
         if tx.send((epoch, line)).is_err() {
-            return Ok(());
+            return Ok(tail_for(read_bytes));
         }
     }
-    Ok(())
+    Ok(tail_for(read_bytes))
+}
+
+/// Read bytes appended to `path` since `offset` and send each COMPLETE line
+/// (terminated by `\n`) via `tx`, decoded with `enc`. A trailing partial line
+/// (no newline yet — a log entry mid-write) is intentionally left unread so it
+/// isn't shown truncated; it will be picked up once its newline arrives. This
+/// is the "strategy A" tailing behavior.
+///
+/// Returns the new offset (advanced only past complete lines) and whether the
+/// file is now shorter than `offset` (rotated/truncated → caller should reload).
+pub fn read_appended(
+    path: &Path,
+    offset: u64,
+    enc: &'static Encoding,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+) -> std::io::Result<Appended> {
+    let mut file = File::open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len < offset {
+        return Ok(Appended {
+            offset,
+            truncated: true,
+        });
+    }
+    if len == offset {
+        return Ok(Appended {
+            offset,
+            truncated: false,
+        });
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    // Read everything appended so far into memory (bounded by how much the log
+    // grew between 500 ms polls — small in practice).
+    let mut raw = Vec::with_capacity((len - offset) as usize);
+    file.read_to_end(&mut raw)?;
+    // Only consume up to the last newline; bytes after it are a partial line.
+    let last_nl = raw.iter().rposition(|&b| b == b'\n');
+    let Some(end) = last_nl else {
+        // No complete line yet — leave the offset untouched.
+        return Ok(Appended {
+            offset,
+            truncated: false,
+        });
+    };
+    let complete = &raw[..=end];
+    for chunk in complete.split_inclusive(|&b| b == b'\n') {
+        let (cow, _, _) = enc.decode(chunk);
+        let line = cow.trim_end_matches(['\r', '\n']).to_string();
+        if tx.send((epoch, line)).is_err() {
+            break;
+        }
+    }
+    Ok(Appended {
+        offset: offset + complete.len() as u64,
+        truncated: false,
+    })
 }
 
 /// Decode all of `input`, growing `text_buf` or flushing complete lines when
@@ -432,6 +539,104 @@ mod tests {
         std::fs::write(&tmp, &bytes).unwrap();
         let mut f = std::fs::File::open(&tmp).unwrap();
         assert!(looks_like_utf8(&mut f).unwrap());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lf_{}_{}.log", tag, std::process::id()))
+    }
+
+    #[test]
+    fn read_appended_streams_only_complete_lines() {
+        // Strategy A: a trailing partial line (no newline) is NOT emitted and
+        // the offset does not advance past it, so it's picked up once completed.
+        let tmp = unique_tmp("append");
+        std::fs::write(&tmp, b"one\ntwo\n").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        let a = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert!(!a.truncated);
+        assert_eq!(a.offset, 8);
+        let got: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(got, vec!["one".to_string(), "two".to_string()]);
+
+        // Append a complete line plus a partial one.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"three\npar").unwrap();
+        }
+        let a2 = read_appended(&tmp, a.offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+        let got2: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(got2, vec!["three".to_string()], "partial 'par' withheld");
+        assert_eq!(a2.offset, 8 + 6, "offset stops before the partial line");
+
+        // Completing the partial line emits it.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"tial\n").unwrap();
+        }
+        let a3 = read_appended(&tmp, a2.offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+        let got3: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(got3, vec!["partial".to_string()]);
+        assert!(!a3.truncated);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_appended_reports_truncation() {
+        let tmp = unique_tmp("trunc");
+        std::fs::write(&tmp, b"aaaa\nbbbb\n").unwrap(); // 10 bytes
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        // Pretend we'd already consumed 10 bytes, then the file shrinks.
+        std::fs::write(&tmp, b"x\n").unwrap(); // now 2 bytes < 10
+        let a = read_appended(&tmp, 10, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert!(a.truncated, "file shorter than offset ⇒ truncated");
+        assert_eq!(a.offset, 10, "offset unchanged on truncation");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_appended_no_growth_is_noop() {
+        let tmp = unique_tmp("nogrow");
+        std::fs::write(&tmp, b"a\nb\n").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let a = read_appended(&tmp, 4, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert!(!a.truncated);
+        assert_eq!(a.offset, 4);
+        assert!(rx.try_iter().next().is_none(), "no lines when unchanged");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_appended_decodes_gbk_lines() {
+        let tmp = unique_tmp("gbk_tail");
+        let (gbk, _, _) = encoding_rs::GBK.encode("日志\n");
+        std::fs::write(&tmp, gbk.as_ref()).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let a = read_appended(&tmp, 0, encoding_rs::GBK, &tx, 9).unwrap();
+        assert!(!a.truncated);
+        let got: Vec<(u64, String)> = rx.try_iter().collect();
+        assert_eq!(got, vec![(9, "日志".to_string())]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn send_utf8_lines_returns_append_tail_with_byte_offset() {
+        let tmp = unique_tmp("tail_utf8");
+        std::fs::write(&tmp, b"hello\nworld\n").unwrap(); // 12 bytes
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let file = std::fs::File::open(&tmp).unwrap();
+        let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
+        match tail {
+            Tail::Append { offset, enc } => {
+                assert_eq!(offset, 12);
+                assert_eq!(enc.name(), "UTF-8");
+            }
+            Tail::ReloadOnChange { .. } => panic!("UTF-8 should tail by append"),
+        }
         let _ = std::fs::remove_file(&tmp);
     }
 }
