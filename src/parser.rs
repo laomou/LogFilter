@@ -6,7 +6,7 @@ fn re_threadtime() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?:(?P<uid>\d+)\s+)?(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -70,7 +70,7 @@ pub fn parse_line(line: String) -> (LogEntry, LogFormat) {
 pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat) {
     // Extract spans + level in an inner scope so the regex captures (which
     // borrow `line`) are dropped before we move `line` into the entry's buffer.
-    let parsed: Option<(LogFormat, LevelMask, [Span; 6])> = {
+    let parsed: Option<(LogFormat, LevelMask, [Span; 7])> = {
         let s = line.as_str();
 
         // Helper closures — called at most once each.
@@ -89,6 +89,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                         span(&c, "time"),
                         span(&c, "pid"),
                         span(&c, "tid"),
+                        span(&c, "uid"),
                         trim_span(s, span(&c, "tag")),
                         span(&c, "msg"),
                     ],
@@ -109,6 +110,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                         span(&c, "date"),
                         span(&c, "time"),
                         span(&c, "pid"),
+                        EMPTY,
                         EMPTY,
                         trim_span(s, span(&c, "tag")),
                         span(&c, "msg"),
@@ -131,6 +133,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                         EMPTY,
                         span(&c, "pid"),
                         EMPTY,
+                        EMPTY,
                         trim_span(s, span(&c, "tag")),
                         span(&c, "msg"),
                     ],
@@ -146,6 +149,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                     [
                         EMPTY,
                         span(&c, "time"),
+                        EMPTY,
                         EMPTY,
                         EMPTY,
                         EMPTY,
@@ -191,8 +195,18 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
     };
 
     match parsed {
-        Some((fmt, level, [date, time, pid, tid, tag, msg])) => (
-            LogEntry::new(line.into_boxed_str(), level, date, time, pid, tid, tag, msg),
+        Some((fmt, level, [date, time, pid, tid, uid, tag, msg])) => (
+            LogEntry::new(
+                line.into_boxed_str(),
+                level,
+                date,
+                time,
+                pid,
+                tid,
+                uid,
+                tag,
+                msg,
+            ),
             fmt,
         ),
         None => {
@@ -202,6 +216,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                 LogEntry::new(
                     line.into_boxed_str(),
                     LevelMask::V,
+                    EMPTY,
                     EMPTY,
                     EMPTY,
                     EMPTY,
@@ -306,6 +321,20 @@ mod tests {
         assert_eq!(f, LogFormat::ThreadTime);
         assert_eq!(e.tag(), "Tag");
         assert_eq!(e.message(), "");
+    }
+
+    #[test]
+    fn parses_threadtime_with_uid() {
+        let line = "07-20 15:43:53.405  1047 17520 18175 I AncSDK  : key frame id: 0";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.date(), "07-20");
+        assert_eq!(e.time(), "15:43:53.405");
+        assert_eq!(e.pid(), "1047");
+        assert_eq!(e.tid(), "17520");
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.tag(), "AncSDK");
+        assert_eq!(e.message(), "key frame id: 0");
     }
 
     #[test]

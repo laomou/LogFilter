@@ -29,6 +29,7 @@ col_time = 时间
 col_lv = 级别
 col_pid = PID
 col_thread = 线程
+col_uid = UID
 col_tag = 标签
 col_mark = 标记
 col_msg = 消息

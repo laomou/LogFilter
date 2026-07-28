@@ -35,7 +35,7 @@ impl Default for WindowConfig {
 #[serde(default)]
 pub struct ViewConfig {
     pub font_size: f32,
-    pub columns: [f32; 9],
+    pub columns: [f32; 10],
     pub encoding: String,
     /// File stem of the user font to use as the *primary* face for both the
     /// Proportional and Monospace families (e.g. "SarasaMonoSC-Regular"). Empty
@@ -52,7 +52,7 @@ impl Default for ViewConfig {
     fn default() -> Self {
         Self {
             font_size: 13.0,
-            columns: [50.0, 50.0, 100.0, 20.0, 50.0, 50.0, 100.0, 0.0, 600.0],
+            columns: [50.0, 50.0, 100.0, 20.0, 50.0, 50.0, 50.0, 100.0, 0.0, 600.0],
             encoding: "utf-8".into(),
             font: String::new(),
             lang: "auto".into(),
@@ -290,7 +290,7 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
         if let Some(v) = p.get("INI_HEIGHT").and_then(|s| s.parse().ok()) {
             cfg.window.height = v;
         }
-        for i in 0..9 {
+        for i in 0..10 {
             if let Some(v) = p
                 .get(&format!("INI_COMUMN_{i}"))
                 .and_then(|s| s.parse().ok())

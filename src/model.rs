@@ -77,6 +77,7 @@ pub struct LogEntry {
     time: Span,
     pid: Span,
     tid: Span,
+    uid: Span,
     tag: Span,
     message: Span,
 }
@@ -90,6 +91,7 @@ impl LogEntry {
         time: Span,
         pid: Span,
         tid: Span,
+        uid: Span,
         tag: Span,
         message: Span,
     ) -> Self {
@@ -101,6 +103,7 @@ impl LogEntry {
             time,
             pid,
             tid,
+            uid,
             tag,
             message,
         }
@@ -134,6 +137,10 @@ impl LogEntry {
     #[inline]
     pub fn tid(&self) -> &str {
         self.slice(self.tid)
+    }
+    #[inline]
+    pub fn uid(&self) -> &str {
+        self.slice(self.uid)
     }
     #[inline]
     pub fn tag(&self) -> &str {
@@ -177,6 +184,7 @@ impl LogEntry {
             time: t,
             pid: p,
             tid: i,
+            uid: (0, 0),
             tag: g,
             message: m,
         }

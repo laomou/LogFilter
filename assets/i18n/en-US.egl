@@ -29,6 +29,7 @@ col_time = Time
 col_lv = Lv
 col_pid = Pid
 col_thread = Thread
+col_uid = Uid
 col_tag = Tag
 col_mark = Mark
 col_msg = Msg

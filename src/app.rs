@@ -98,7 +98,7 @@ pub struct App {
     /// Cached shortcut-rows for the empty-table view. Invalidated on language switch.
     cached_shortcut_rows: Vec<EmptyShortcutRow>,
     /// Column widths mirrored from the table each frame; persisted to config on exit.
-    cached_col_widths: [f32; 9],
+    cached_col_widths: [f32; 10],
     /// Pending result from a background save_filtered() operation.
     save_result_rx:
         Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
@@ -137,6 +137,7 @@ pub struct UiState {
     pub col_loglv: bool,
     pub col_pid: bool,
     pub col_thread: bool,
+    pub col_uid: bool,
     pub col_tag: bool,
     pub col_message: bool,
 
@@ -191,6 +192,7 @@ impl UiState {
             col_loglv: true,
             col_pid: true,
             col_thread: true,
+            col_uid: false,
             col_tag: true,
             col_message: true,
             goto_line: String::new(),
@@ -780,13 +782,14 @@ impl App {
                 let &ei = m.filtered.get(r)?;
                 let e = &m.entries[ei as usize];
                 Some(format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     e.line_no,
                     e.date(),
                     e.time(),
                     e.level.as_char(),
                     e.pid(),
                     e.tid(),
+                    e.uid(),
                     e.tag(),
                     e.message()
                 ))
@@ -2190,6 +2193,7 @@ impl App {
                         ui.checkbox(&mut self.ui.col_loglv, tr!("col_lv"));
                         ui.checkbox(&mut self.ui.col_pid, tr!("col_pid"));
                         ui.checkbox(&mut self.ui.col_thread, tr!("col_thread"));
+                        ui.checkbox(&mut self.ui.col_uid, tr!("col_uid"));
                         ui.checkbox(&mut self.ui.col_tag, tr!("col_tag"));
                         ui.checkbox(&mut self.ui.col_message, tr!("col_msg"));
                         ui.separator();
@@ -2201,6 +2205,7 @@ impl App {
                             self.ui.col_loglv = true;
                             self.ui.col_pid = true;
                             self.ui.col_thread = true;
+                            self.ui.col_uid = true;
                             self.ui.col_tag = true;
                             self.ui.col_message = true;
                             ui.close();
@@ -2572,27 +2577,29 @@ impl App {
             let highlight_tokens: &[String] = &self.cached_highlight_tokens;
             let find_tokens: &[String] = &self.cached_find_tokens;
 
-            let (cl, cd, ct, clv, cpi, cth, cta, cmk, cms) = (
+            let (cl, cd, ct, clv, cpi, cth, cui, cta, cmk, cms) = (
                 tr!("col_line"),
                 tr!("col_date"),
                 tr!("col_time"),
                 tr!("col_lv"),
                 tr!("col_pid"),
                 tr!("col_thread"),
+                tr!("col_uid"),
                 tr!("col_tag"),
                 tr!("col_mark"),
                 tr!("col_message"),
             );
-            let cols_show: [(bool, &str, f32); 9] = [
+            let cols_show: [(bool, &str, f32); 10] = [
                 (self.ui.col_line, &cl, self.cached_col_widths[0]),
                 (self.ui.col_date, &cd, self.cached_col_widths[1]),
                 (self.ui.col_time, &ct, self.cached_col_widths[2]),
                 (self.ui.col_loglv, &clv, self.cached_col_widths[3]),
                 (self.ui.col_pid, &cpi, self.cached_col_widths[4]),
                 (self.ui.col_thread, &cth, self.cached_col_widths[5]),
-                (self.ui.col_tag, &cta, self.cached_col_widths[6]),
-                (self.ui.col_bookmark, &cmk, self.cached_col_widths[7]),
-                (self.ui.col_message, &cms, self.cached_col_widths[8]),
+                (self.ui.col_uid, &cui, self.cached_col_widths[6]),
+                (self.ui.col_tag, &cta, self.cached_col_widths[7]),
+                (self.ui.col_bookmark, &cmk, self.cached_col_widths[8]),
+                (self.ui.col_message, &cms, self.cached_col_widths[9]),
             ];
             let last_visible = cols_show.iter().rposition(|(v, _, _)| *v);
             let table_available_height = ui.available_height();
@@ -2640,7 +2647,7 @@ impl App {
             let mut open_picker: Option<(PickerCol, egui::Pos2)> = None;
             let mut hide_col_idx: Option<usize> = None;
             // Widths captured from body.widths() this frame; mapped back to the
-            // 9-slot cached_col_widths array below (visible columns only).
+            // 10-slot cached_col_widths array below (visible columns only).
             let mut new_col_widths: Option<Vec<f32>> = None;
 
             // Column meta for header interactions
@@ -2652,17 +2659,19 @@ impl App {
                 Lv,
                 Pid,
                 Thread,
+                Uid,
                 Tag,
                 Bookmark,
                 Message,
             }
-            let col_kinds: [ColKind; 9] = [
+            let col_kinds: [ColKind; 10] = [
                 ColKind::Line,
                 ColKind::Date,
                 ColKind::Time,
                 ColKind::Lv,
                 ColKind::Pid,
                 ColKind::Thread,
+                ColKind::Uid,
                 ColKind::Tag,
                 ColKind::Bookmark,
                 ColKind::Message,
@@ -2776,6 +2785,9 @@ impl App {
                             if self.ui.col_thread {
                                 row.col(|_| {});
                             }
+                            if self.ui.col_uid {
+                                row.col(|_| {});
+                            }
                             if self.ui.col_tag {
                                 row.col(|ui| {
                                     ui.add(egui::Label::new(text(&shortcut.tag)).truncate());
@@ -2841,6 +2853,11 @@ impl App {
                         if self.ui.col_thread {
                             row.col(|ui| {
                                 render(ui, e.tid());
+                            });
+                        }
+                        if self.ui.col_uid {
+                            row.col(|ui| {
+                                render(ui, e.uid());
                             });
                         }
                         if self.ui.col_tag {
@@ -2929,13 +2946,14 @@ impl App {
                                         copy_cell_text = Some(self.copy_selected_rows_text());
                                     } else {
                                         copy_cell_text = Some(format!(
-                                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                             e.line_no,
                                             e.date(),
                                             e.time(),
                                             e.level.as_char(),
                                             e.pid(),
                                             e.tid(),
+                                            e.uid(),
                                             e.tag(),
                                             e.message()
                                         ));
@@ -2958,7 +2976,7 @@ impl App {
             let ctrl_or_cmd = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
             let shift = ctx.input(|i| i.modifiers.shift);
 
-            // Map visible-column widths back to the 9-slot array.
+            // Map visible-column widths back to the 10-slot array.
             if let Some(widths) = new_col_widths {
                 let mut wi = 0usize;
                 for (i, (visible, _, _)) in cols_show.iter().enumerate() {
@@ -3036,9 +3054,10 @@ impl App {
                     3 => self.ui.col_loglv = false,
                     4 => self.ui.col_pid = false,
                     5 => self.ui.col_thread = false,
-                    6 => self.ui.col_tag = false,
-                    7 => self.ui.col_bookmark = false,
-                    8 => self.ui.col_message = false,
+                    6 => self.ui.col_uid = false,
+                    7 => self.ui.col_tag = false,
+                    8 => self.ui.col_bookmark = false,
+                    9 => self.ui.col_message = false,
                     _ => {}
                 }
             }
@@ -3199,13 +3218,14 @@ mod tests {
                     let &ei = m.filtered.get(r)?;
                     let e = &m.entries[ei as usize];
                     Some(format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         e.line_no,
                         e.date(),
                         e.time(),
                         e.level.as_char(),
                         e.pid(),
                         e.tid(),
+                        e.uid(),
                         e.tag(),
                         e.message()
                     ))
