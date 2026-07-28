@@ -1395,7 +1395,10 @@ impl App {
                     .collect()
             }
         };
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        match col {
+            PickerCol::Level => {}
+            _ => v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0))),
+        }
         v
     }
 
