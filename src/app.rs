@@ -1261,15 +1261,19 @@ impl App {
         if len == 0 {
             return;
         }
-        let cur = self
-            .selection_cursor
-            .unwrap_or(0)
-            .min(len.saturating_sub(1));
         drop(m);
-        let new = if delta < 0 {
-            cur.saturating_sub(1)
-        } else {
-            (cur + 1).min(len.saturating_sub(1))
+        let new = match self.selection_cursor {
+            // No current row yet: the first Arrow (either direction) lands on row
+            // 0 — otherwise Down would skip past it to row 1.
+            None => 0,
+            Some(cur) => {
+                let cur = cur.min(len - 1);
+                if delta < 0 {
+                    cur.saturating_sub(1)
+                } else {
+                    (cur + 1).min(len - 1)
+                }
+            }
         };
         self.selected_rows.clear();
         self.selected_rows.insert(new);
@@ -2229,6 +2233,9 @@ impl App {
                         ui.close();
                     }
                     ui.menu_button(tr!("recent"), |ui| {
+                        // Prune entries whose file no longer exists so the list
+                        // doesn't accumulate dead links.
+                        config::prune_missing_recent(&mut self.cfg);
                         let recent = self.cfg.recent.files.clone();
                         if recent.is_empty() {
                             ui.label(tr!("recent_empty"));
@@ -3583,6 +3590,27 @@ mod ui_tests {
             h.state().selected_rows
         );
         assert_eq!(h.state().selection_cursor, Some(1));
+    }
+
+    #[test]
+    fn first_arrow_down_selects_row_zero() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+        // No selection yet (fresh load).
+        assert!(h.state().selected_rows.is_empty());
+        assert_eq!(h.state().selection_cursor, None);
+
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+
+        assert!(
+            h.state().selected_rows.contains(&0),
+            "first ArrowDown with no selection should land on row 0, got {:?}",
+            h.state().selected_rows
+        );
+        assert_eq!(h.state().selection_cursor, Some(0));
     }
 
     #[test]
