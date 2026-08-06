@@ -2654,6 +2654,11 @@ impl App {
             let show_empty_shortcuts = model.entries.is_empty();
             let entries = &model.entries;
             let filtered = &model.filtered;
+            // Entries are loaded but the active filters hide every one of them.
+            // Show an explicit hint rather than a blank table — a typo'd Find, a
+            // stale column filter, or "bookmarks only" with no bookmarks all
+            // otherwise produce an identical empty panel with no visible cause.
+            let show_no_matches = !show_empty_shortcuts && filtered.is_empty();
             let bookmarks = &model.bookmarks;
             let use_highlight = !highlight_tokens.is_empty() || !find_tokens.is_empty();
 
@@ -2819,6 +2824,34 @@ impl App {
                                 row.col(|ui| {
                                     ui.add(egui::Label::new(text(&shortcut.message)).truncate());
                                 });
+                            }
+                        });
+                        return;
+                    }
+                    if show_no_matches {
+                        // A few blank rows then a hint in the remainder column,
+                        // which always fills the width so the text isn't clipped.
+                        let msg = tr!("no_matches");
+                        body.rows(row_h, EMPTY_SHORTCUT_TOP_PADDING_ROWS + 1, |mut row| {
+                            let is_msg_row = row.index() == EMPTY_SHORTCUT_TOP_PADDING_ROWS;
+                            for (i, (visible, _, _)) in cols_show.iter().enumerate() {
+                                if !*visible {
+                                    continue;
+                                }
+                                if is_msg_row && Some(i) == last_visible {
+                                    row.col(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&msg)
+                                                    .font(font.clone())
+                                                    .color(Color32::DARK_GRAY),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                } else {
+                                    row.col(|_| {});
+                                }
                             }
                         });
                         return;
@@ -3588,6 +3621,28 @@ mod ui_tests {
         h.run();
         h.run();
         h.run();
+    }
+
+    #[test]
+    fn all_rows_filtered_out_renders_no_matches_hint_without_panic() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+        // A Find term that matches nothing hides every row.
+        h.state_mut().ui.find = "zzz_no_such_token_zzz".into();
+        h.state_mut().ui.find_on = true;
+        h.state_mut().notify_filter();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.run(); // renders the no-matches hint (must not panic)
+
+        let m = h.state().model.read().unwrap();
+        assert!(!m.entries.is_empty(), "entries stay loaded");
+        assert!(
+            m.filtered.is_empty(),
+            "a non-matching Find should hide every row, got {} visible",
+            m.filtered.len()
+        );
     }
 
     #[test]
