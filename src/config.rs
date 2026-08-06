@@ -415,6 +415,15 @@ pub fn add_recent(cfg: &mut Config, path: &std::path::Path) {
     cfg.recent.files.truncate(10);
 }
 
+/// Drop recent-files entries whose file no longer exists, so the list doesn't
+/// accumulate dead links that only error when clicked. Returns true if anything
+/// was removed.
+pub fn prune_missing_recent(cfg: &mut Config) -> bool {
+    let before = cfg.recent.files.len();
+    cfg.recent.files.retain(|p| p.exists());
+    cfg.recent.files.len() != before
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,8 +525,33 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("toml.bak"));
     }
 
+    #[test]
+    fn prune_missing_recent_drops_dead_entries() {
+        let dir = tempdir_new();
+        let alive = dir.join("alive.log");
+        std::fs::write(&alive, "x").unwrap();
+        let dead = dir.join("dead.log"); // never created
+
+        let mut cfg = Config::default();
+        cfg.recent.files = vec![alive.clone(), dead.clone()];
+        let removed = prune_missing_recent(&mut cfg);
+
+        assert!(removed, "a missing entry should be reported as removed");
+        assert_eq!(cfg.recent.files, vec![alive.clone()], "dead entry pruned");
+        // Nothing to remove the second time.
+        assert!(!prune_missing_recent(&mut cfg));
+
+        let _ = std::fs::remove_file(&alive);
+    }
+
     fn tempdir_new() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("lf_test_{}", std::process::id()));
+        // Unique per call so tests don't share a directory — ini_migration_reads_main_ini
+        // does remove_dir_all(), which would otherwise race the file-based tests
+        // running in parallel and wipe their files mid-test.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("lf_test_{}_{n}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     }
