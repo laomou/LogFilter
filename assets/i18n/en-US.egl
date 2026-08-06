@@ -130,3 +130,4 @@ status_goto_filtered = Line {n} is hidden by the current filter
 # selection status
 status_ctrl_click = Ctrl+click, selected={n}
 status_shift_click = Shift+click, selected={n}
+selected_n = Selected {n}

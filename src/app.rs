@@ -408,7 +408,8 @@ impl App {
         app.spawn_ingest_thread(ctx.clone(), line_rx);
         if let Some(path) = initial_file {
             if let Err(e) = app.open_file(&path) {
-                app.status = format!("Failed to open {}: {}", path.display(), e);
+                app.status =
+                    tr!("status_failed_open", { e: &format!("{}: {}", path.display(), e) });
             }
         }
         app.notify_filter();
@@ -2732,7 +2733,7 @@ impl App {
                     ui.label(&self.status);
                 } else if n > 0 {
                     ui.separator();
-                    ui.label(format!("Selected {n}"));
+                    ui.label(tr!("selected_n", { n: &n.to_string() }));
                 }
             });
         });
