@@ -115,9 +115,6 @@ status_failed_open_dropped = 打开拖入文件失败: {e}
 bookmarks_only = 仅书签
 bookmarks_only_hover = 只显示已加书签的行
 
-# empty states
-no_matches = 没有符合当前过滤条件的行
-
 # clipboard / save status
 status_clipboard_error = 剪贴板错误: {e}
 status_copied_row = 已复制 1 行

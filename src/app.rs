@@ -2617,7 +2617,20 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", tr!("total"), model.entries.len()));
                 ui.separator();
-                ui.label(format!("{} {}", tr!("filtered"), model.filtered.len()));
+                // When entries are loaded but the active filters hide every one of
+                // them, color the filtered count so the empty table has a visible
+                // cause (a typo'd Find, a stale column filter, or "bookmarks only"
+                // with no bookmarks all otherwise look identical).
+                let filtered_text = format!("{} {}", tr!("filtered"), model.filtered.len());
+                if !model.entries.is_empty() && model.filtered.is_empty() {
+                    ui.label(
+                        egui::RichText::new(filtered_text)
+                            .color(Color32::from_rgb(230, 126, 34))
+                            .strong(),
+                    );
+                } else {
+                    ui.label(filtered_text);
+                }
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                 // Encoding only applies to a loaded file (resolves "Local" to the
@@ -2769,11 +2782,6 @@ impl App {
             let show_empty_shortcuts = model.entries.is_empty();
             let entries = &model.entries;
             let filtered = &model.filtered;
-            // Entries are loaded but the active filters hide every one of them.
-            // Show an explicit hint rather than a blank table — a typo'd Find, a
-            // stale column filter, or "bookmarks only" with no bookmarks all
-            // otherwise produce an identical empty panel with no visible cause.
-            let show_no_matches = !show_empty_shortcuts && filtered.is_empty();
             let bookmarks = &model.bookmarks;
             let use_highlight = !highlight_tokens.is_empty() || !find_tokens.is_empty();
 
@@ -2946,34 +2954,6 @@ impl App {
                                 row.col(|ui| {
                                     ui.add(egui::Label::new(text(&shortcut.message)).truncate());
                                 });
-                            }
-                        });
-                        return;
-                    }
-                    if show_no_matches {
-                        // A few blank rows then a hint in the remainder column,
-                        // which always fills the width so the text isn't clipped.
-                        let msg = tr!("no_matches");
-                        body.rows(row_h, EMPTY_SHORTCUT_TOP_PADDING_ROWS + 1, |mut row| {
-                            let is_msg_row = row.index() == EMPTY_SHORTCUT_TOP_PADDING_ROWS;
-                            for (i, (visible, _, _)) in cols_show.iter().enumerate() {
-                                if !*visible {
-                                    continue;
-                                }
-                                if is_msg_row && Some(i) == last_visible {
-                                    row.col(|ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&msg)
-                                                    .font(font.clone())
-                                                    .color(Color32::DARK_GRAY),
-                                            )
-                                            .truncate(),
-                                        );
-                                    });
-                                } else {
-                                    row.col(|_| {});
-                                }
                             }
                         });
                         return;
