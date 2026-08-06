@@ -4334,8 +4334,14 @@ mod ui_tests {
         .unwrap();
 
         h.state_mut().open_file(&tmp).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        h.run();
+        // Poll for the initial 2 lines rather than a fixed sleep (flakes on CI).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while h.state().model.read().unwrap().entries.len() != 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.run();
+        }
         assert_eq!(h.state().model.read().unwrap().entries.len(), 2);
         // Tailing must not hijack the viewport.
         assert_eq!(
@@ -4354,11 +4360,14 @@ mod ui_tests {
                 .unwrap();
         }
 
-        // Wait past the 500 ms poll interval, then let ingest run.
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        h.run();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        h.run();
+        // Poll until the appended lines are tailed in (500ms poll + ingest).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while h.state().model.read().unwrap().entries.len() != 4
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.run();
+        }
 
         let m = h.state().model.read().unwrap();
         assert_eq!(
@@ -4391,18 +4400,44 @@ mod ui_tests {
         )
         .unwrap();
         h.state_mut().open_file(&tmp).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        h.run();
-        assert_eq!(h.state().model.read().unwrap().entries.len(), 3);
+
+        // Poll for the initial 3 lines to ingest rather than assuming a fixed
+        // delay — the tail poll (500ms) + ingest thread run at their own pace, so
+        // fixed sleeps flake on slow/loaded CI.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while h.state().model.read().unwrap().entries.len() != 3
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.run();
+        }
+        assert_eq!(
+            h.state().model.read().unwrap().entries.len(),
+            3,
+            "initial load should ingest 3 lines"
+        );
 
         // Rotate: replace with a shorter file (fewer bytes than already read).
         std::fs::write(&tmp, "01-01 10:10:00.000  100  200 W Tag9: rotated\n").unwrap();
 
-        // Poll fires (500ms) → reload_request set → next update() reloads.
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        h.run(); // picks up reload_request, calls open_file
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        h.run(); // ingest the reloaded content
+        // Poll until the rotation is picked up: tail poll → reload_request →
+        // reload → ingest the new, shorter file.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            {
+                let m = h.state().model.read().unwrap();
+                if m.entries.len() == 1 && m.entries[0].tag() == "Tag9" {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rotation was not reflected in time; entries = {}",
+                h.state().model.read().unwrap().entries.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.run();
+        }
 
         let m = h.state().model.read().unwrap();
         assert_eq!(
