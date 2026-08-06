@@ -63,34 +63,43 @@ pub fn list_devices(adb_override: Option<&str>) -> Result<Vec<String>> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_device_lines(&text))
+}
+
+/// Parse `adb devices` output into display entries. A ready device is just its
+/// serial; any other state (unauthorized, offline, no permissions, recovery…) is
+/// labeled `"SERIAL (state)"` so the user *sees* the device and why it may not
+/// work — rather than it vanishing (a freshly plugged-in phone is "unauthorized"
+/// until the user taps "allow", and hiding it looks like "no devices / broken").
+/// Use [`device_serial`] to recover the bare serial for `adb -s`.
+fn parse_device_lines(text: &str) -> Vec<String> {
     let mut devices = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with("List of devices") || line.starts_with('*') {
             continue;
         }
-        // Skip informational lines that adb sometimes prints alongside real entries.
-        if line.starts_with("List of devices") {
-            continue;
-        }
-        if line.starts_with('*') {
-            continue;
-        }
-        // Real entries look like "SERIAL\tdevice" or "SERIAL\toffline".
+        // Real entries look like "SERIAL\tdevice" or "SERIAL\tunauthorized".
         if let Some((serial, state)) = line.split_once(|c: char| c.is_whitespace()) {
             let state = state.trim();
             if serial.is_empty() {
                 continue;
             }
-            // Keep all reachable entries; offline devices can still be shown so
-            // the user knows about them, but drop unauthorized/permission ones.
-            if state == "unauthorized" || state == "no permissions" {
-                continue;
+            if state == "device" {
+                devices.push(serial.to_string());
+            } else {
+                devices.push(format!("{serial} ({state})"));
             }
-            devices.push(serial.to_string());
         }
     }
-    Ok(devices)
+    devices
+}
+
+/// Recover the bare serial from a (possibly labeled) device entry, e.g.
+/// `"emulator-5554 (unauthorized)"` → `"emulator-5554"`. adb serials never
+/// contain a space, so splitting on `" ("` is safe.
+pub fn device_serial(entry: &str) -> &str {
+    entry.split(" (").next().unwrap_or(entry)
 }
 
 pub struct Session {
@@ -308,6 +317,34 @@ fn stream_lossy_lines<R: BufRead>(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_device_lines_labels_non_ready_states() {
+        let out = "List of devices attached\n\
+                   emulator-5554\tdevice\n\
+                   ABC123\tunauthorized\n\
+                   DEF456\toffline\n\
+                   GHI789\tno permissions\n\
+                   * daemon started successfully *\n";
+        let devices = parse_device_lines(out);
+        assert_eq!(
+            devices,
+            vec![
+                "emulator-5554".to_string(),
+                "ABC123 (unauthorized)".to_string(),
+                "DEF456 (offline)".to_string(),
+                "GHI789 (no permissions)".to_string(),
+            ],
+            "a ready device is bare; others are labeled and none are dropped"
+        );
+    }
+
+    #[test]
+    fn device_serial_strips_state_label() {
+        assert_eq!(device_serial("emulator-5554"), "emulator-5554");
+        assert_eq!(device_serial("ABC123 (unauthorized)"), "ABC123");
+        assert_eq!(device_serial("DEF456 (offline)"), "DEF456");
+    }
 
     #[test]
     fn stop_reaps_stdout_and_stderr_workers() {
