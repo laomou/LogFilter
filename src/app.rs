@@ -2753,6 +2753,12 @@ impl App {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
+                // Follow new rows as they stream in (adb / file tailing) while
+                // "Auto-scroll" is on. egui only pins to the bottom while the view
+                // is already there, releases the moment the user scrolls up, and
+                // defers to an explicit scroll_to_row (goto/arrows) — so it never
+                // fights manual navigation.
+                .stick_to_bottom(self.auto_scroll)
                 // Fill all available vertical space instead of egui_extras'
                 // default 800px cap / content-shrink, so the table uses the whole
                 // available window.
