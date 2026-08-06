@@ -780,7 +780,15 @@ impl App {
         // Bump the epoch so a running file-tail (or any queued lines) stops
         // feeding this cleared view — otherwise the tail poller would keep
         // appending new lines into a table the user just emptied.
-        self.source_epoch.fetch_add(1, Ordering::AcqRel);
+        //
+        // Exception: while an adb session is live, keep the epoch — the session
+        // bakes it into every line it emits, so bumping here would make all of
+        // its *future* lines be dropped by the ingest thread, silently killing
+        // the stream. Clearing during capture should empty the view yet keep new
+        // lines flowing. (adb_run supersedes any file-tail, so none is active.)
+        if self.adb_session.is_none() {
+            self.source_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         {
             let mut m = self.model.write_recover();
             m.clear();
@@ -2156,6 +2164,9 @@ impl App {
         let ctx = ui.ctx().clone();
         // Menu bar — File · Format · View · Encoding
         let mut recent_open: Option<PathBuf> = None;
+        // Set when the Encoding menu changes value; handled after the menu closure
+        // to re-decode the currently open file (can't call open_file mid-borrow).
+        let mut encoding_changed = false;
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(tr!("m_file"), |ui| {
@@ -2350,7 +2361,10 @@ impl App {
                     {
                         let selected = self.ui.encoding == value;
                         if ui.selectable_label(selected, label).clicked() {
-                            self.ui.encoding = value.into();
+                            if self.ui.encoding != value {
+                                self.ui.encoding = value.into();
+                                encoding_changed = true;
+                            }
                             ui.close();
                         }
                     }
@@ -2370,6 +2384,16 @@ impl App {
         if let Some(p) = recent_open {
             if let Err(e) = self.open_file(&p) {
                 self.status = tr!("status_failed_open", { e: &format!("{}", e) });
+            }
+        }
+        // Re-decode the open file under the newly chosen encoding. open_file keeps
+        // the column filters for the same path, so only the decoding changes.
+        if encoding_changed {
+            let current = self.model.read_recover().file_path.clone();
+            if let Some(p) = current {
+                if let Err(e) = self.open_file(&p) {
+                    self.status = tr!("status_failed_open", { e: &format!("{}", e) });
+                }
             }
         }
     }
@@ -2596,13 +2620,16 @@ impl App {
                 ui.label(format!("{} {}", tr!("filtered"), model.filtered.len()));
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
-                ui.separator();
-                // Show the encoding actually used for the loaded file (resolves
-                // "Local" to the sniffed codepage). Falls back to the menu choice
-                // before the load resolves or when the source is adb (no file).
-                let detected = self.detected_encoding.lock_recover().clone();
-                let enc_label = detected.unwrap_or_else(|| self.ui.encoding.clone());
-                ui.label(enc_label.to_uppercase());
+                // Encoding only applies to a loaded file (resolves "Local" to the
+                // sniffed codepage). An adb stream is always UTF-8-lossy and an
+                // empty view has no source, so showing an encoding there is stale
+                // or misleading — omit it unless a file is loaded.
+                if model.file_path.is_some() {
+                    ui.separator();
+                    let detected = self.detected_encoding.lock_recover().clone();
+                    let enc_label = detected.unwrap_or_else(|| self.ui.encoding.clone());
+                    ui.label(enc_label.to_uppercase());
+                }
                 let n = self.selected_rows.len();
                 if !self.status.is_empty() {
                     ui.separator();
@@ -3626,6 +3653,25 @@ mod ui_tests {
         assert!(
             !text2.contains("msg"),
             "hidden Message column must not be copied: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn clear_in_file_mode_bumps_epoch_to_stop_tail() {
+        // With no adb session, Clear must bump the source epoch so the file-tail
+        // poller stops feeding the just-emptied view. (The adb-live branch, which
+        // must NOT bump so the live stream survives, needs a real Session and is
+        // covered by review rather than a unit test.)
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 10);
+        assert!(h.state().adb_session.is_none());
+        let before = h.state().source_epoch.load(Ordering::Acquire);
+        h.state_mut().clear();
+        let after = h.state().source_epoch.load(Ordering::Acquire);
+        assert!(
+            after > before,
+            "file-mode Clear should bump the epoch (was {before}, now {after})"
         );
     }
 
