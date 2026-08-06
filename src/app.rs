@@ -1299,21 +1299,24 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let shortcut = |key| KeyboardShortcut::new(cmd, key);
 
-        // Ctrl/Cmd+C copies the selected log row(s). When a row selection exists
-        // we copy it even if a filter field happens to hold focus — copying rows
-        // is the primary action and a selection is an explicit intent. With no
-        // rows selected we fall through to the focus guard below, so a focused
-        // Find/Remove/Highlight field keeps its own text copy.
-        if !self.selected_rows.is_empty()
-            && ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C)))
-        {
-            self.copy_selected_row();
-            return;
-        }
+        // egui/winit deliver Ctrl/Cmd+C as a semantic egui::Event::Copy, not a
+        // Key::C press — so matching a Key::C keyboard shortcut never fires on the
+        // real app (notably on Windows). Detect the Copy event instead.
+        let copy_event = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
 
         // When a text field is focused, let it keep its own editing shortcuts
         // (copy/cut/paste, arrows, etc.); row/table shortcuts below don't fire.
         if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        // No field focused: Ctrl/Cmd+C copies the selected log row(s). (Clicking a
+        // row clears field focus, so the common "select row → copy" path lands
+        // here.)
+        if copy_event {
+            if !self.selected_rows.is_empty() {
+                self.copy_selected_row();
+            }
             return;
         }
 
@@ -3433,6 +3436,28 @@ mod ui_tests {
     }
 
     // ─── Button clicks (real egui hit-test) ──────────────────────────────
+
+    #[test]
+    fn copy_event_copies_selected_row() {
+        // egui/winit deliver Ctrl/Cmd+C as Event::Copy, not a Key::C press.
+        // Simulate the real event and verify the row-copy path runs — status
+        // reflects a copy attempt ("copied" on success, or a headless clipboard
+        // error), never left blank as it was when we matched the wrong key.
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 10);
+        h.state_mut().select_filtered_row_with_len(3, 10);
+        h.run();
+        h.state_mut().status.clear();
+
+        h.event(egui::Event::Copy);
+        h.run();
+
+        assert!(
+            !h.state().status.is_empty(),
+            "Event::Copy with a row selected should run the copy path"
+        );
+    }
 
     #[test]
     fn click_clear_button_empties_model() {
