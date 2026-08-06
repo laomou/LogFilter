@@ -2534,7 +2534,20 @@ impl App {
                         }
                     }
                 }
-                ui.checkbox(&mut self.auto_scroll, tr!("auto_scroll"));
+                // Toggling Auto-scroll ON jumps to the bottom right away, so the
+                // switch takes effect immediately even when scrolled up (egui's
+                // stick-to-bottom otherwise only re-engages once you're already at
+                // the end). The table consumes pending_scroll later this same frame.
+                if ui
+                    .checkbox(&mut self.auto_scroll, tr!("auto_scroll"))
+                    .changed()
+                    && self.auto_scroll
+                {
+                    let len = self.model.read_recover().filtered.len();
+                    if len > 0 {
+                        self.pending_scroll = Some(len - 1);
+                    }
+                }
             });
         });
         if dirty {
@@ -4041,6 +4054,24 @@ mod ui_tests {
             "status bar should reflect the actually-used encoding"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn toggling_auto_scroll_on_runs_jump_path_without_panic() {
+        // Turning Auto-scroll ON requests a jump to the bottom (pending_scroll),
+        // which the table then consumes within the same frame — so it can't be
+        // observed after run(). This exercises the toggle path end-to-end and
+        // guards it against panics (e.g. the model read / empty-filtered guard).
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 50);
+        h.state_mut().auto_scroll = false;
+        h.run();
+
+        let label = tr!("auto_scroll");
+        h.get_by_label(label.as_str()).click();
+        h.run();
+        assert!(h.state().auto_scroll, "clicking should turn Auto-scroll on");
     }
 
     #[test]
