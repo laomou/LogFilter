@@ -237,6 +237,22 @@ impl Session {
         self.join_workers();
     }
 
+    /// Reap a session that ended on its own (its stdout closed, which set
+    /// `ended`): wait on the child and join the stdout/stderr workers so the
+    /// captured stderr is COMPLETE before it is read. Unlike `stop()` this does
+    /// not kill the child — it has already exited. Without this, reading
+    /// `stderr_text()` the instant `has_ended()` flips races the stderr thread
+    /// still flushing, and the failure reason (device offline, unknown command…)
+    /// can be lost.
+    pub fn reap(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        let _ = self.child.wait();
+        self.join_workers();
+    }
+
     /// Join the stdout/stderr workers after the child has exited. Handles are
     /// consumed so a later `Drop` cannot attempt to join them twice.
     fn join_workers(&mut self) {
@@ -321,6 +337,37 @@ mod tests {
         assert!(session.reader_handle.is_none());
         assert!(session.stderr_handle.is_none());
         assert!(session.reader_thread.is_none());
+    }
+
+    #[test]
+    fn reap_drains_stderr_of_a_self_ended_session() {
+        // A child that writes to stderr and exits. After it ends on its own,
+        // reap() must join the stderr worker so the reason is fully captured —
+        // this is the path the UI takes when has_ended() flips.
+        let (tx, _rx) = crossbeam_channel::bounded(4);
+        let mut session = Session::start(
+            Some("/bin/sh"),
+            None,
+            "-c 'printf \"device offline\" >&2'",
+            tx,
+            1,
+        )
+        .expect("shell-backed session should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !session.has_ended() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(session.has_ended(), "process should end on its own");
+
+        session.reap();
+        assert_eq!(
+            session.stderr_text(),
+            "device offline",
+            "reap must join the stderr worker so the reason is complete"
+        );
+        assert!(session.stderr_handle.is_none(), "stderr worker joined");
+        assert!(session.reader_handle.is_none(), "stdout worker joined");
     }
 
     #[test]
