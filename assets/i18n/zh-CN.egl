@@ -130,3 +130,4 @@ status_goto_filtered = 行号 {n} 已被当前过滤隐藏
 # selection status
 status_ctrl_click = Ctrl+点击，已选 {n} 行
 status_shift_click = Shift+点击，已选 {n} 行
+selected_n = 已选 {n} 行
