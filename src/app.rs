@@ -192,29 +192,38 @@ impl UiState {
     }
 
     fn from_config(cfg: &Config) -> Self {
+        // Columns-visible order matches ViewConfig::columns:
+        // line, date, time, level, pid, thread, uid, tag, bookmark, message.
+        let cv = cfg.view.columns_visible;
         Self {
             find: cfg.filters.find.clone(),
-            find_on: !cfg.filters.find.is_empty(),
+            find_on: cfg.filters.find_on.unwrap_or(!cfg.filters.find.is_empty()),
             remove: cfg.filters.remove.clone(),
-            remove_on: !cfg.filters.remove.is_empty(),
+            remove_on: cfg
+                .filters
+                .remove_on
+                .unwrap_or(!cfg.filters.remove.is_empty()),
             highlight: cfg.filters.highlight.clone(),
-            highlight_on: !cfg.filters.highlight.is_empty(),
+            highlight_on: cfg
+                .filters
+                .highlight_on
+                .unwrap_or(!cfg.filters.highlight.is_empty()),
             allowed_pids: None,
             allowed_tids: None,
             allowed_tags: None,
             disallowed_tags: std::collections::HashSet::new(),
             allowed_levels: None,
             encoding: cfg.view.encoding.clone(),
-            col_bookmark: false,
-            col_line: true,
-            col_date: true,
-            col_time: true,
-            col_loglv: true,
-            col_pid: true,
-            col_thread: true,
-            col_uid: false,
-            col_tag: true,
-            col_message: true,
+            col_line: cv[0],
+            col_date: cv[1],
+            col_time: cv[2],
+            col_loglv: cv[3],
+            col_pid: cv[4],
+            col_thread: cv[5],
+            col_uid: cv[6],
+            col_tag: cv[7],
+            col_bookmark: cv[8],
+            col_message: cv[9],
             goto_line: String::new(),
             bookmarks_only: false,
             picker: None,
@@ -246,7 +255,23 @@ impl UiState {
         cfg.filters.find = self.find.clone();
         cfg.filters.remove = self.remove.clone();
         cfg.filters.highlight = self.highlight.clone();
+        cfg.filters.find_on = Some(self.find_on);
+        cfg.filters.remove_on = Some(self.remove_on);
+        cfg.filters.highlight_on = Some(self.highlight_on);
         cfg.view.encoding = self.encoding.clone();
+        // Same order as ViewConfig::columns / columns_visible.
+        cfg.view.columns_visible = [
+            self.col_line,
+            self.col_date,
+            self.col_time,
+            self.col_loglv,
+            self.col_pid,
+            self.col_thread,
+            self.col_uid,
+            self.col_tag,
+            self.col_bookmark,
+            self.col_message,
+        ];
     }
 }
 
@@ -290,12 +315,18 @@ impl App {
         // Strings ahead of the (slower) parse/append step — it blocks instead,
         // capping peak memory. 8192 ≈ a few ingest batches of headroom.
         let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
-        let selected_cmd = cfg
-            .adb
-            .commands
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "logcat -v threadtime".into());
+        // Restore the last-used adb command/device; fall back to the first
+        // configured command / "(any)" device when not previously saved.
+        let selected_cmd = if !cfg.adb.selected_cmd.is_empty() {
+            cfg.adb.selected_cmd.clone()
+        } else {
+            cfg.adb
+                .commands
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "logcat -v threadtime".into())
+        };
+        let selected_device = cfg.adb.selected_device.clone();
         // Prime caches from the initial config so the first frame doesn't reallocate.
         let init_hl_raw = if ui.highlight_on {
             ui.highlight.clone()
@@ -336,7 +367,7 @@ impl App {
             line_tx,
             adb_session: None,
             adb_devices: Vec::new(),
-            selected_device: String::new(),
+            selected_device,
             selected_cmd,
             auto_scroll: true,
             device_refresh_rx: None,
@@ -2150,6 +2181,9 @@ impl eframe::App for App {
             self.cfg.window.height = size.y;
         }
         self.cfg.view.columns = self.cached_col_widths;
+        // Persist the last-used adb command/device so the next launch restores it.
+        self.cfg.adb.selected_cmd = self.selected_cmd.clone();
+        self.cfg.adb.selected_device = self.selected_device.clone();
         // On exit there's no UI left to surface a status, but a failed save
         // silently loses the user's window size / filters / column widths /
         // recent files. Log it so it's at least diagnosable rather than invisible.
@@ -3283,6 +3317,45 @@ mod tests {
     #[test]
     fn reset_table_font_size_uses_config_default() {
         assert_eq!(Config::default().view.font_size, 13.0);
+    }
+
+    #[test]
+    fn ui_state_round_trips_columns_and_filter_toggles() {
+        let mut cfg = Config::default();
+        let mut ui = UiState::from_config(&cfg);
+        // Tweak column visibility and filter toggles away from defaults.
+        ui.col_uid = true; // was hidden
+        ui.col_date = false; // was shown
+        ui.col_bookmark = true; // was hidden
+        ui.find = "needle".into();
+        ui.find_on = false; // text present but explicitly disabled
+        ui.highlight_on = true;
+
+        ui.write_back(&mut cfg);
+        let restored = UiState::from_config(&cfg);
+
+        assert!(restored.col_uid, "UID visibility should persist");
+        assert!(!restored.col_date, "Date hidden should persist");
+        assert!(restored.col_bookmark, "Bookmark column should persist");
+        assert_eq!(restored.find, "needle");
+        assert!(
+            !restored.find_on,
+            "a disabled Find must persist even with text present"
+        );
+        assert!(restored.highlight_on);
+    }
+
+    #[test]
+    fn old_config_infers_filter_on_from_text() {
+        // find_on == None (old config) → derive from whether the text is non-empty.
+        let mut cfg = Config::default();
+        cfg.filters.find = "hello".into();
+        cfg.filters.find_on = None;
+        cfg.filters.remove = String::new();
+        cfg.filters.remove_on = None;
+        let ui = UiState::from_config(&cfg);
+        assert!(ui.find_on, "non-empty Find text → on");
+        assert!(!ui.remove_on, "empty Remove text → off");
     }
 
     #[test]

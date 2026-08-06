@@ -36,6 +36,9 @@ impl Default for WindowConfig {
 pub struct ViewConfig {
     pub font_size: f32,
     pub columns: [f32; 10],
+    /// Per-column visibility, same order as `columns`:
+    /// line, date, time, level, pid, thread, uid, tag, bookmark, message.
+    pub columns_visible: [bool; 10],
     pub encoding: String,
     /// File stem of the user font to use as the *primary* face for both the
     /// Proportional and Monospace families (e.g. "SarasaMonoSC-Regular"). Empty
@@ -53,6 +56,9 @@ impl Default for ViewConfig {
         Self {
             font_size: 13.0,
             columns: [50.0, 50.0, 100.0, 20.0, 50.0, 50.0, 50.0, 100.0, 0.0, 600.0],
+            // line, date, time, level, pid, thread, uid, tag, bookmark, message —
+            // UID and the bookmark column are hidden by default.
+            columns_visible: [true, true, true, true, true, true, false, true, false, true],
             encoding: "utf-8".into(),
             font: String::new(),
             lang: "auto".into(),
@@ -67,6 +73,11 @@ pub struct FiltersConfig {
     pub find: String,
     pub remove: String,
     pub highlight: String,
+    /// Enabled state of each filter. `None` = field absent in an older config →
+    /// fall back to "on when the text is non-empty" (the historical behavior).
+    pub find_on: Option<bool>,
+    pub remove_on: Option<bool>,
+    pub highlight_on: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +147,10 @@ impl ColorsConfig {
 pub struct AdbConfig {
     pub commands: Vec<String>,
     pub adb_path: Option<String>,
+    /// Last-used adb command and device, restored on the next launch. Empty =
+    /// fall back to the first command / "(any)" device.
+    pub selected_cmd: String,
+    pub selected_device: String,
 }
 
 impl Default for AdbConfig {
@@ -149,6 +164,8 @@ impl Default for AdbConfig {
                 "shell cat /proc/kmsg".into(),
             ],
             adb_path: None,
+            selected_cmd: String::new(),
+            selected_device: String::new(),
         }
     }
 }
@@ -178,14 +195,8 @@ pub fn fonts_dir() -> Option<PathBuf> {
 
 pub fn load() -> Config {
     if let Some(path) = config_path() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            match toml::from_str(&text) {
-                Ok(cfg) => return cfg,
-                Err(e) => eprintln!(
-                    "logfilter: failed to parse config at {}: {e}",
-                    path.display()
-                ),
-            }
+        if let Some(cfg) = read_config(&path) {
+            return cfg;
         }
     }
     // Fall back to INI migration if the user is launching from the old repo dir.
@@ -198,15 +209,45 @@ pub fn load() -> Config {
     Config::default()
 }
 
+/// Read and parse a config file. Returns `None` if it's missing or unparseable.
+/// On a parse error the bad file is preserved as `.bak` instead of being left to
+/// be silently overwritten with defaults — otherwise a single bad value (or a
+/// truncated write) would lose every setting for good.
+fn read_config(path: &std::path::Path) -> Option<Config> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match toml::from_str(&text) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            let bak = path.with_extension("toml.bak");
+            let _ = std::fs::rename(path, &bak);
+            eprintln!(
+                "logfilter: failed to parse config at {} ({e}); backed up to {} and reset to defaults",
+                path.display(),
+                bak.display()
+            );
+            None
+        }
+    }
+}
+
 pub fn save(cfg: &Config) -> Result<()> {
     let Some(path) = config_path() else {
         return Ok(());
     };
+    write_config(&path, cfg)
+}
+
+/// Write the config atomically: a crash/power-loss mid-write would otherwise
+/// leave a truncated (unparseable) file that wipes every setting on next launch.
+/// Write to a sibling temp file, then rename over the target.
+fn write_config(path: &std::path::Path, cfg: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, text)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -401,6 +442,78 @@ mod tests {
         assert_eq!(cfg.filters.find, "hello");
         assert_eq!(cfg.view.columns[0], 42.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_toml_roundtrips_new_persisted_fields() {
+        let mut cfg = Config::default();
+        cfg.view.columns_visible = [
+            false, true, false, true, false, true, true, false, true, false,
+        ];
+        cfg.filters.find_on = Some(false);
+        cfg.filters.highlight_on = Some(true);
+        cfg.adb.selected_cmd = "logcat -b radio -v time".into();
+        cfg.adb.selected_device = "emulator-5554".into();
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.view.columns_visible, cfg.view.columns_visible);
+        assert_eq!(back.filters.find_on, Some(false));
+        assert_eq!(back.filters.highlight_on, Some(true));
+        assert_eq!(back.adb.selected_cmd, "logcat -b radio -v time");
+        assert_eq!(back.adb.selected_device, "emulator-5554");
+    }
+
+    #[test]
+    fn old_config_missing_new_fields_uses_defaults() {
+        // An older config that predates the new fields must still load, with the
+        // new fields defaulting (find_on = None so the app infers from the text).
+        let cfg: Config = toml::from_str("[filters]\nfind = \"hello\"\n").unwrap();
+        assert_eq!(cfg.filters.find, "hello");
+        assert_eq!(cfg.filters.find_on, None);
+        assert_eq!(
+            cfg.view.columns_visible,
+            ViewConfig::default().columns_visible
+        );
+        assert_eq!(cfg.adb.selected_cmd, "");
+    }
+
+    #[test]
+    fn write_config_atomic_roundtrips_and_leaves_no_temp() {
+        let dir = tempdir_new();
+        let path = dir.join("rt_config.toml");
+        let mut cfg = Config::default();
+        cfg.adb.selected_device = "dev1".into();
+        cfg.view.columns_visible[6] = true; // show UID
+
+        write_config(&path, &cfg).unwrap();
+        assert!(path.exists(), "config file written");
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "temp file should be renamed away, not left behind"
+        );
+        let back = read_config(&path).expect("written config parses");
+        assert_eq!(back.adb.selected_device, "dev1");
+        assert!(back.view.columns_visible[6]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_config_backs_up_corrupt_file() {
+        let dir = tempdir_new();
+        let path = dir.join("bad_config.toml");
+        std::fs::write(&path, "this is = not valid toml ][").unwrap();
+
+        let result = read_config(&path);
+        assert!(result.is_none(), "corrupt config should not parse");
+        assert!(
+            path.with_extension("toml.bak").exists(),
+            "corrupt config must be preserved as .bak, not lost"
+        );
+        assert!(!path.exists(), "the bad file is moved aside");
+
+        let _ = std::fs::remove_file(path.with_extension("toml.bak"));
     }
 
     fn tempdir_new() -> std::path::PathBuf {
