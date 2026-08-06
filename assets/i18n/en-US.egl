@@ -115,9 +115,6 @@ status_failed_open_dropped = Failed to open dropped file: {e}
 bookmarks_only = Bookmarks only
 bookmarks_only_hover = Show only bookmarked lines
 
-# empty states
-no_matches = No rows match the active filters
-
 # clipboard / save status
 status_clipboard_error = Clipboard error: {e}
 status_copied_row = Copied 1 row
