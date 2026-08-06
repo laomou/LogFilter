@@ -1299,17 +1299,21 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let shortcut = |key| KeyboardShortcut::new(cmd, key);
 
-        // When a text field (Find/Remove/Highlight/Goto) is focused, let it keep
-        // its own editing shortcuts — including Ctrl/Cmd+C to copy the selected
-        // field text. Row/table shortcuts below only fire when no field wants input.
-        if ctx.egui_wants_keyboard_input() {
+        // Ctrl/Cmd+C copies the selected log row(s). When a row selection exists
+        // we copy it even if a filter field happens to hold focus — copying rows
+        // is the primary action and a selection is an explicit intent. With no
+        // rows selected we fall through to the focus guard below, so a focused
+        // Find/Remove/Highlight field keeps its own text copy.
+        if !self.selected_rows.is_empty()
+            && ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C)))
+        {
+            self.copy_selected_row();
             return;
         }
 
-        // Copy the selected log row(s). Placed after the guard so it doesn't
-        // hijack Ctrl/Cmd+C from a focused filter field.
-        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
-            self.copy_selected_row();
+        // When a text field is focused, let it keep its own editing shortcuts
+        // (copy/cut/paste, arrows, etc.); row/table shortcuts below don't fire.
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
 
