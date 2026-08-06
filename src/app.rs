@@ -788,6 +788,42 @@ impl App {
         self.ui.allowed_levels = None;
     }
 
+    /// Tab-separated text of an entry's *visible* columns, in display order, so a
+    /// copied row matches what the table shows. Notably this omits a hidden column
+    /// (e.g. the UID column, off by default) instead of emitting an empty field —
+    /// otherwise a normal log copies as `…tid\t\ttag…` with a phantom column.
+    fn visible_row_text(&self, e: &crate::model::LogEntry) -> String {
+        let mut fields: Vec<String> = Vec::with_capacity(9);
+        if self.ui.col_line {
+            fields.push(e.line_no.to_string());
+        }
+        if self.ui.col_date {
+            fields.push(e.date().to_string());
+        }
+        if self.ui.col_time {
+            fields.push(e.time().to_string());
+        }
+        if self.ui.col_loglv {
+            fields.push(e.level.as_char().to_string());
+        }
+        if self.ui.col_pid {
+            fields.push(e.pid().to_string());
+        }
+        if self.ui.col_thread {
+            fields.push(e.tid().to_string());
+        }
+        if self.ui.col_uid {
+            fields.push(e.uid().to_string());
+        }
+        if self.ui.col_tag {
+            fields.push(e.tag().to_string());
+        }
+        if self.ui.col_message {
+            fields.push(e.message().to_string());
+        }
+        fields.join("\t")
+    }
+
     fn copy_selected_rows_text(&self) -> String {
         let m = self.model.read_recover();
         let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
@@ -796,19 +832,7 @@ impl App {
             .iter()
             .filter_map(|&&r| {
                 let &ei = m.filtered.get(r)?;
-                let e = &m.entries[ei as usize];
-                Some(format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    e.line_no,
-                    e.date(),
-                    e.time(),
-                    e.level.as_char(),
-                    e.pid(),
-                    e.tid(),
-                    e.uid(),
-                    e.tag(),
-                    e.message()
-                ))
+                Some(self.visible_row_text(&m.entries[ei as usize]))
             })
             .collect();
         texts.join("\n")
@@ -1275,14 +1299,17 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let shortcut = |key| KeyboardShortcut::new(cmd, key);
 
-        // Allow copy even when a text field is focused: text selection is
-        // disabled (selectable_labels = false), so there is no conflict.
-        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
-            self.copy_selected_row();
+        // When a text field (Find/Remove/Highlight/Goto) is focused, let it keep
+        // its own editing shortcuts — including Ctrl/Cmd+C to copy the selected
+        // field text. Row/table shortcuts below only fire when no field wants input.
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
 
-        if ctx.egui_wants_keyboard_input() {
+        // Copy the selected log row(s). Placed after the guard so it doesn't
+        // hijack Ctrl/Cmd+C from a focused filter field.
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut(Key::C))) {
+            self.copy_selected_row();
             return;
         }
 
@@ -2964,18 +2991,7 @@ impl App {
                                     if self.selected_rows.len() > 1 {
                                         copy_cell_text = Some(self.copy_selected_rows_text());
                                     } else {
-                                        copy_cell_text = Some(format!(
-                                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                            e.line_no,
-                                            e.date(),
-                                            e.time(),
-                                            e.level.as_char(),
-                                            e.pid(),
-                                            e.tid(),
-                                            e.uid(),
-                                            e.tag(),
-                                            e.message()
-                                        ));
+                                        copy_cell_text = Some(self.visible_row_text(e));
                                     }
                                     ui.close();
                                 }
@@ -3096,7 +3112,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LogEntry;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3182,90 +3197,6 @@ mod tests {
         assert_eq!(page_row(Some(95), 100, 10, true), Some(99));
         assert_eq!(page_row(Some(5), 100, 10, false), Some(0));
         assert_eq!(page_row(Some(5), 100, 0, true), Some(6));
-    }
-
-    #[test]
-    fn copy_selected_rows_text_joins_multiple_rows() {
-        use crate::model::LevelMask;
-        let model = Model {
-            entries: vec![
-                LogEntry::from_fields(
-                    "07-10",
-                    "10:00:00.000",
-                    LevelMask::I,
-                    "100",
-                    "200",
-                    "Tag1",
-                    "msg one",
-                ),
-                LogEntry::from_fields(
-                    "07-10",
-                    "10:00:01.000",
-                    LevelMask::E,
-                    "101",
-                    "201",
-                    "Tag2",
-                    "msg two",
-                ),
-                LogEntry::from_fields(
-                    "07-10",
-                    "10:00:02.000",
-                    LevelMask::W,
-                    "102",
-                    "202",
-                    "Tag3",
-                    "msg three",
-                ),
-            ],
-            filtered: vec![0, 1, 2],
-            ..Model::default()
-        };
-        let model = Arc::new(RwLock::new(model));
-
-        let mut selected_rows = HashSet::new();
-        selected_rows.insert(0);
-        selected_rows.insert(2);
-
-        // Unit-test the core copy logic without building a full App.
-        let text = {
-            let m = model.read_recover();
-            let mut rows: Vec<&usize> = selected_rows.iter().collect();
-            rows.sort();
-            let texts: Vec<String> = rows
-                .iter()
-                .filter_map(|&&r| {
-                    let &ei = m.filtered.get(r)?;
-                    let e = &m.entries[ei as usize];
-                    Some(format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        e.line_no,
-                        e.date(),
-                        e.time(),
-                        e.level.as_char(),
-                        e.pid(),
-                        e.tid(),
-                        e.uid(),
-                        e.tag(),
-                        e.message()
-                    ))
-                })
-                .collect();
-            texts.join("\n")
-        };
-        let lines: Vec<&str> = text.split('\n').collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "should have 2 lines (rows 0 and 2), got: {lines:?}"
-        );
-        assert!(
-            lines[0].contains("msg one"),
-            "first line should contain msg one: {lines:?}"
-        );
-        assert!(
-            lines[1].contains("msg three"),
-            "second line should contain msg three: {lines:?}"
-        );
     }
 
     #[test]
@@ -3516,6 +3447,36 @@ mod ui_tests {
         assert!(
             h.state().model.read().unwrap().entries.is_empty(),
             "clicking Clear should empty the model"
+        );
+    }
+
+    #[test]
+    fn copy_row_respects_visible_columns() {
+        // Exercises the real App::copy_selected_rows_text / visible_row_text.
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 3); // pid 100, tid 200, tag Tag{i%3}, msg "msg {i}"
+        h.state_mut().selected_rows.insert(0);
+        h.state_mut().selected_rows.insert(2);
+
+        let text = h.state().copy_selected_rows_text();
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines.len(), 2, "rows 0 and 2 → 2 lines, got {lines:?}");
+        assert!(lines[0].contains("msg 0"), "first line: {:?}", lines[0]);
+        assert!(lines[1].contains("msg 2"), "second line: {:?}", lines[1]);
+        // UID column is hidden by default → no phantom empty field.
+        assert!(
+            !lines[0].contains("\t\t"),
+            "hidden UID must not leave an empty column: {:?}",
+            lines[0]
+        );
+
+        // Hiding a column drops it from the copy (WYSIWYG).
+        h.state_mut().ui.col_message = false;
+        let text2 = h.state().copy_selected_rows_text();
+        assert!(
+            !text2.contains("msg"),
+            "hidden Message column must not be copied: {text2:?}"
         );
     }
 
