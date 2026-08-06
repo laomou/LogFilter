@@ -1213,8 +1213,11 @@ impl App {
 
     fn page_selected_row(&mut self, forward: bool) {
         let len = self.model.read_recover().filtered.len();
-        let anchor = self.selected_rows.iter().next().copied();
-        let Some(row) = page_row(anchor, len, self.visible_table_rows, forward) else {
+        // Page from the deterministic cursor (like the arrow keys), not an
+        // arbitrary HashSet element — otherwise a multi-row selection pages from
+        // a random member and the jump distance is non-deterministic.
+        let cursor = self.selection_cursor.or(self.selection_anchor);
+        let Some(row) = page_row(cursor, len, self.visible_table_rows, forward) else {
             return;
         };
         self.select_filtered_row_with_len(row, len);
@@ -1421,7 +1424,11 @@ impl App {
         if m.filtered.is_empty() {
             return;
         }
-        let cur = self.selected_rows.iter().next().copied().unwrap_or(0);
+        let cur = self
+            .selection_cursor
+            .or(self.selection_anchor)
+            .unwrap_or(0)
+            .min(m.filtered.len().saturating_sub(1));
         let indices: Vec<usize> = (0..m.filtered.len())
             .filter(|&i| m.bookmarks.contains(&m.filtered[i]))
             .collect();
@@ -2440,16 +2447,17 @@ impl App {
                     )
                     .changed();
                 ui.separator();
-                dirty |= ui
-                    .checkbox(&mut self.ui.highlight_on, tr!("highlight"))
-                    .changed();
-                dirty |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.ui.highlight)
-                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                            .desired_width(text_w),
-                    )
-                    .changed();
+                // Highlight is purely visual — it never changes which rows are
+                // shown, so it must NOT feed `dirty`/notify_filter (that clears the
+                // row selection and forces a full refilter). refresh_highlight_caches()
+                // picks up the new tokens every frame, so the edit shows up on its own.
+                ui.checkbox(&mut self.ui.highlight_on, tr!("highlight"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ui.highlight)
+                        .id(egui::Id::new("filter_highlight_edit"))
+                        .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                        .desired_width(text_w),
+                );
                 ui.separator();
                 dirty |= ui
                     .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
@@ -3865,6 +3873,82 @@ mod ui_tests {
         let pos = *h.state().selected_rows.iter().next().unwrap();
         // Should jump forward by at least 1 row (actual page size depends on harness layout)
         assert!(pos > 0, "PageDown should move forward from 0, got {pos}");
+    }
+
+    #[test]
+    fn page_down_pages_from_cursor_not_arbitrary_selection() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 300);
+        // Selection member at row 0, but the cursor is far away at 100. Paging
+        // must follow the cursor (deterministic), not the HashSet member.
+        h.state_mut().selected_rows.clear();
+        h.state_mut().selected_rows.insert(0);
+        h.state_mut().selection_cursor = Some(100);
+        h.state_mut().selection_anchor = Some(100);
+        h.run(); // set visible_table_rows
+
+        h.key_press(egui::Key::PageDown);
+        h.run();
+
+        let pos = *h.state().selected_rows.iter().next().unwrap();
+        assert!(
+            pos > 100,
+            "PageDown must page from the cursor (100), not the selection member (0); got {pos}"
+        );
+    }
+
+    #[test]
+    fn f3_bookmark_jump_starts_from_cursor_not_arbitrary_selection() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 300);
+        h.state_mut().toggle_bookmark(50);
+        h.state_mut().toggle_bookmark(150);
+        // Selection member at row 0, cursor at 100. Forward jump from the cursor
+        // should reach bookmark 150 — not 50 (which is what a jump from row 0 gives).
+        h.state_mut().selected_rows.clear();
+        h.state_mut().selected_rows.insert(0);
+        h.state_mut().selection_cursor = Some(100);
+        h.state_mut().selection_anchor = Some(100);
+        h.run();
+
+        h.key_press(egui::Key::F3);
+        h.run();
+
+        assert!(
+            h.state().selected_rows.contains(&150),
+            "F3 should jump from the cursor (100) to bookmark 150, got {:?}",
+            h.state().selected_rows
+        );
+    }
+
+    #[test]
+    fn editing_highlight_keeps_selection() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.state_mut().select_filtered_row_with_len(5, 20);
+        h.run();
+        assert!(h.state().selected_rows.contains(&5));
+
+        // Simulate the user typing into the Highlight field. Highlight is visual
+        // only, so it must not clear the row selection (which notify_filter does).
+        h.ctx
+            .memory_mut(|m| m.request_focus(egui::Id::new("filter_highlight_edit")));
+        h.run();
+        h.event(egui::Event::Text("err".into()));
+        h.run();
+
+        assert_eq!(
+            h.state().ui.highlight,
+            "err",
+            "highlight text should update"
+        );
+        assert!(
+            h.state().selected_rows.contains(&5),
+            "editing Highlight must not clear the row selection"
+        );
     }
 
     #[test]
