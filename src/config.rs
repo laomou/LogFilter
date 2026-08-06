@@ -517,7 +517,13 @@ mod tests {
     }
 
     fn tempdir_new() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("lf_test_{}", std::process::id()));
+        // Unique per call so tests don't share a directory — ini_migration_reads_main_ini
+        // does remove_dir_all(), which would otherwise race the file-based tests
+        // running in parallel and wipe their files mid-test.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("lf_test_{}_{n}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     }

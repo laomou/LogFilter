@@ -2158,16 +2158,18 @@ impl eframe::App for App {
         // Detect an adb session that ended on its own (device unplugged, adb
         // exited, bad command) so the UI stops showing it as live and surfaces
         // any captured stderr instead of a silently frozen stream.
-        if let Some(s) = &self.adb_session {
-            if s.has_ended() {
-                let err = s.stderr_text();
-                self.adb_session = None;
-                self.status = if err.is_empty() {
-                    tr!("status_adb_ended")
-                } else {
-                    tr!("status_adb_ended_err", { e: &err })
-                };
-            }
+        if self.adb_session.as_ref().is_some_and(|s| s.has_ended()) {
+            // The session ended on its own (stdout closed). Reap it first — that
+            // joins the stderr worker so the captured failure reason is complete,
+            // instead of racing the stdout/stderr close and losing it.
+            let mut s = self.adb_session.take().expect("checked is_some above");
+            s.reap();
+            let err = s.stderr_text();
+            self.status = if err.is_empty() {
+                tr!("status_adb_ended")
+            } else {
+                tr!("status_adb_ended_err", { e: &err })
+            };
         }
 
         self.handle_shortcuts(&ctx);
