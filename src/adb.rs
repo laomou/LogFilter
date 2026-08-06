@@ -156,14 +156,19 @@ impl Session {
         let handle = thread::Builder::new()
             .name("adb-reader".into())
             .spawn(move || {
+                // Cap on lines held while paused: keeps memory bounded on a long
+                // pause under a heavy log rate (~a few MB at this size).
+                const PAUSE_BUFFER_CAP: usize = 100_000;
                 let reader = BufReader::new(stdout);
-                stream_lossy_lines(reader, &tx, epoch, || {
-                    // When paused, park the reader thread: it blocks here, neither
-                    // burning CPU nor consuming/discarding stdout data. The data
-                    // merely buffers in the kernel pipe until resumed.
-                    while paused_thr.load(std::sync::atomic::Ordering::Relaxed) {
-                        thread::park();
-                    }
+                let mut buffer = std::collections::VecDeque::new();
+                stream_lossy_lines(reader, |line| {
+                    // While paused, keep reading (drain the kernel pipe so adb
+                    // doesn't back up and logd doesn't rotate our logs away) but
+                    // hold lines in a bounded buffer; flush them on resume.
+                    let paused = paused_thr.load(std::sync::atomic::Ordering::Relaxed);
+                    route_line(paused, line, &mut buffer, PAUSE_BUFFER_CAP, |l| {
+                        tx.send((epoch, l)).is_ok()
+                    })
                 });
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
@@ -290,15 +295,9 @@ impl Drop for Session {
 /// first line with a non-UTF-8 byte, and the previous `map_while(Result::ok)`
 /// turned that single bad line into a premature end-of-stream — silently losing
 /// it and everything after. Lossy decoding keeps the line and the stream alive.
-fn stream_lossy_lines<R: BufRead>(
-    mut reader: R,
-    tx: &Sender<(u64, String)>,
-    epoch: u64,
-    mut before_read: impl FnMut(),
-) {
+fn stream_lossy_lines<R: BufRead>(mut reader: R, mut emit: impl FnMut(String) -> bool) {
     let mut buf = Vec::new();
     loop {
-        before_read();
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break, // EOF: stdout closed.
@@ -308,10 +307,38 @@ fn stream_lossy_lines<R: BufRead>(
         let line = String::from_utf8_lossy(&buf)
             .trim_end_matches(['\n', '\r'])
             .to_string();
-        if tx.send((epoch, line)).is_err() {
-            break;
+        if !emit(line) {
+            break; // receiver gone
         }
     }
+}
+
+/// Route one streamed line while honoring pause. While `paused`, buffer the line
+/// (bounded by `cap`, dropping the oldest past the cap) instead of emitting it —
+/// this keeps draining adb's stdout so the kernel pipe never backs up (a full
+/// pipe makes the device's logd rotate our logs away). On resume, the buffered
+/// backlog is flushed oldest-first, then the current line, via `send`. Returns
+/// false when `send` fails (the receiver is gone), so the caller stops.
+fn route_line(
+    paused: bool,
+    line: String,
+    buffer: &mut std::collections::VecDeque<String>,
+    cap: usize,
+    mut send: impl FnMut(String) -> bool,
+) -> bool {
+    if paused {
+        if buffer.len() >= cap {
+            buffer.pop_front();
+        }
+        buffer.push_back(line);
+        return true;
+    }
+    while let Some(buffered) = buffer.pop_front() {
+        if !send(buffered) {
+            return false;
+        }
+    }
+    send(line)
 }
 
 #[cfg(all(test, unix))]
@@ -418,7 +445,9 @@ mod tests {
         data.extend_from_slice(b"third\n");
 
         let (tx, rx) = crossbeam_channel::bounded(16);
-        stream_lossy_lines(std::io::Cursor::new(data), &tx, 7, || {});
+        stream_lossy_lines(std::io::Cursor::new(data), |line| {
+            tx.send((7, line)).is_ok()
+        });
         drop(tx);
 
         let lines: Vec<(u64, String)> = rx.try_iter().collect();
@@ -438,7 +467,9 @@ mod tests {
     fn stream_lossy_lines_trims_crlf_and_handles_no_final_newline() {
         let data = b"has\r\nno-newline-tail".to_vec();
         let (tx, rx) = crossbeam_channel::bounded(16);
-        stream_lossy_lines(std::io::Cursor::new(data), &tx, 1, || {});
+        stream_lossy_lines(std::io::Cursor::new(data), |line| {
+            tx.send((1, line)).is_ok()
+        });
         drop(tx);
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert_eq!(
@@ -453,7 +484,46 @@ mod tests {
         let data = b"a\nb\nc\n".to_vec();
         let (tx, rx) = crossbeam_channel::bounded(16);
         drop(rx);
-        stream_lossy_lines(std::io::Cursor::new(data), &tx, 1, || {});
+        stream_lossy_lines(std::io::Cursor::new(data), |line| {
+            tx.send((1, line)).is_ok()
+        });
         // Returning at all (no hang/panic) is the assertion.
+    }
+
+    #[test]
+    fn route_line_buffers_while_paused_then_flushes_on_resume() {
+        use std::collections::VecDeque;
+        let mut buffer: VecDeque<String> = VecDeque::new();
+        let mut out: Vec<String> = Vec::new();
+
+        // Paused: lines are buffered, nothing emitted.
+        route_line(true, "a".into(), &mut buffer, 3, |l| {
+            out.push(l);
+            true
+        });
+        route_line(true, "b".into(), &mut buffer, 3, |l| {
+            out.push(l);
+            true
+        });
+        assert!(out.is_empty(), "paused lines must not be emitted yet");
+        assert_eq!(buffer.len(), 2);
+
+        // Resume: the next line flushes the backlog (oldest first) then itself.
+        route_line(false, "c".into(), &mut buffer, 3, |l| {
+            out.push(l);
+            true
+        });
+        assert_eq!(out, vec!["a", "b", "c"]);
+        assert!(buffer.is_empty());
+
+        // Overflow past the cap drops the oldest buffered line.
+        for l in ["x", "y", "z", "w"] {
+            route_line(true, l.into(), &mut buffer, 3, |_| true);
+        }
+        assert_eq!(
+            buffer.iter().cloned().collect::<Vec<_>>(),
+            vec!["y", "z", "w"],
+            "cap=3 drops the oldest ('x')"
+        );
     }
 }
