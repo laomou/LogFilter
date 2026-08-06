@@ -33,6 +33,11 @@ pub struct App {
     source_format_hint: Arc<Mutex<LogFormat>>,
     pub wake: Arc<(Mutex<bool>, Condvar)>,
     pub status: String,
+    /// Last `status` value the auto-expiry logic observed, and the egui time it
+    /// first appeared — used to clear transient messages after a few seconds so
+    /// they don't linger or permanently hide the "Selected N" readout.
+    last_status_seen: String,
+    status_shown_at: f64,
     pub ui: UiState,
 
     pub selected_rows: HashSet<usize>,
@@ -325,6 +330,8 @@ impl App {
             source_format_hint: Arc::new(Mutex::new(LogFormat::Unknown)),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             status: String::new(),
+            last_status_seen: String::new(),
+            status_shown_at: 0.0,
             ui,
             selected_rows: HashSet::new(),
             selection_anchor: None,
@@ -2601,7 +2608,31 @@ impl App {
         }
     }
 
+    /// Clear a transient status message once it has been shown for a few seconds,
+    /// so old messages ("Copied…", "Saved…") don't linger after Clear/open/adb and
+    /// don't permanently hide the "Selected N" readout. `now` is the egui frame
+    /// time (seconds). Resets the timer whenever the message changes.
+    fn tick_status(&mut self, now: f64) {
+        const STATUS_TTL_SECS: f64 = 5.0;
+        if self.status != self.last_status_seen {
+            self.last_status_seen = self.status.clone();
+            self.status_shown_at = now;
+        }
+        if !self.status.is_empty() && now - self.status_shown_at > STATUS_TTL_SECS {
+            self.status.clear();
+            self.last_status_seen.clear();
+        }
+    }
+
     fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
+        // Expire stale status messages so "Selected N" can reappear. Request a
+        // repaint while one is showing so it clears on time even when idle.
+        let now = ui.input(|i| i.time);
+        self.tick_status(now);
+        if !self.status.is_empty() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             let model = self.model.read_recover();
@@ -3622,6 +3653,33 @@ mod ui_tests {
         assert!(
             h.state().model.read().unwrap().entries.is_empty(),
             "clicking Clear should empty the model"
+        );
+    }
+
+    #[test]
+    fn status_auto_expires_after_ttl() {
+        let mut h = harness();
+        h.run();
+        h.state_mut().status = "已复制 1 行".into();
+
+        // First tick records when the message appeared.
+        h.state_mut().tick_status(100.0);
+        assert_eq!(h.state().status, "已复制 1 行");
+        // Still within the 5s TTL — kept.
+        h.state_mut().tick_status(104.0);
+        assert_eq!(h.state().status, "已复制 1 行");
+        // Past the TTL — cleared so "Selected N" can show again.
+        h.state_mut().tick_status(106.0);
+        assert_eq!(h.state().status, "");
+
+        // A new message resets the timer (doesn't inherit the old expiry).
+        h.state_mut().status = "已保存".into();
+        h.state_mut().tick_status(106.0);
+        h.state_mut().tick_status(108.0);
+        assert_eq!(
+            h.state().status,
+            "已保存",
+            "new message should not expire early"
         );
     }
 
