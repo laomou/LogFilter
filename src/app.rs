@@ -171,6 +171,26 @@ pub struct PickerState {
 }
 
 impl UiState {
+    /// Number of currently-visible table columns. Used to forbid hiding the last
+    /// one, which would leave an empty, unusable table.
+    fn visible_column_count(&self) -> usize {
+        [
+            self.col_bookmark,
+            self.col_line,
+            self.col_date,
+            self.col_time,
+            self.col_loglv,
+            self.col_pid,
+            self.col_thread,
+            self.col_uid,
+            self.col_tag,
+            self.col_message,
+        ]
+        .into_iter()
+        .filter(|&v| v)
+        .count()
+    }
+
     fn from_config(cfg: &Config) -> Self {
         Self {
             find: cfg.filters.find.clone(),
@@ -2238,17 +2258,51 @@ impl App {
 
                 ui.menu_button(tr!("m_view"), |ui| {
                     ui.menu_button(tr!("columns"), |ui| {
-                        ui.checkbox(&mut self.ui.col_bookmark, tr!("col_mark"))
-                            .on_hover_text(tr!("col_mark_hover"));
-                        ui.checkbox(&mut self.ui.col_line, tr!("col_line"));
-                        ui.checkbox(&mut self.ui.col_date, tr!("col_date"));
-                        ui.checkbox(&mut self.ui.col_time, tr!("col_time"));
-                        ui.checkbox(&mut self.ui.col_loglv, tr!("col_lv"));
-                        ui.checkbox(&mut self.ui.col_pid, tr!("col_pid"));
-                        ui.checkbox(&mut self.ui.col_thread, tr!("col_thread"));
-                        ui.checkbox(&mut self.ui.col_uid, tr!("col_uid"));
-                        ui.checkbox(&mut self.ui.col_tag, tr!("col_tag"));
-                        ui.checkbox(&mut self.ui.col_message, tr!("col_msg"));
+                        // Keep at least one column visible: when only one remains,
+                        // disable its checkbox so it can't be unchecked (hiding
+                        // every column leaves an empty, dead-looking table).
+                        let only_one = self.ui.visible_column_count() == 1;
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_bookmark),
+                            egui::Checkbox::new(&mut self.ui.col_bookmark, tr!("col_mark")),
+                        )
+                        .on_hover_text(tr!("col_mark_hover"));
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_line),
+                            egui::Checkbox::new(&mut self.ui.col_line, tr!("col_line")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_date),
+                            egui::Checkbox::new(&mut self.ui.col_date, tr!("col_date")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_time),
+                            egui::Checkbox::new(&mut self.ui.col_time, tr!("col_time")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_loglv),
+                            egui::Checkbox::new(&mut self.ui.col_loglv, tr!("col_lv")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_pid),
+                            egui::Checkbox::new(&mut self.ui.col_pid, tr!("col_pid")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_thread),
+                            egui::Checkbox::new(&mut self.ui.col_thread, tr!("col_thread")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_uid),
+                            egui::Checkbox::new(&mut self.ui.col_uid, tr!("col_uid")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_tag),
+                            egui::Checkbox::new(&mut self.ui.col_tag, tr!("col_tag")),
+                        );
+                        ui.add_enabled(
+                            !(only_one && self.ui.col_message),
+                            egui::Checkbox::new(&mut self.ui.col_message, tr!("col_msg")),
+                        );
                         ui.separator();
                         if ui.button(tr!("show_all")).clicked() {
                             self.ui.col_bookmark = true;
@@ -2792,7 +2846,14 @@ impl App {
                                     ui.close();
                                 }
                                 ui.separator();
-                                if ui.button(tr!("hide_this")).clicked() {
+                                // Forbid hiding the last visible column (keeps the
+                                // table and its headers usable).
+                                let only_one_col =
+                                    cols_show.iter().filter(|(v, _, _)| *v).count() == 1;
+                                if ui
+                                    .add_enabled(!only_one_col, egui::Button::new(tr!("hide_this")))
+                                    .clicked()
+                                {
                                     hide_col_idx = Some(i);
                                     ui.close();
                                 }
@@ -3196,6 +3257,32 @@ mod tests {
     #[test]
     fn reset_table_font_size_uses_config_default() {
         assert_eq!(Config::default().view.font_size, 13.0);
+    }
+
+    #[test]
+    fn visible_column_count_tracks_visible_columns() {
+        let mut ui = UiState::from_config(&Config::default());
+        // Hide everything, then reveal one at a time.
+        ui.col_bookmark = false;
+        ui.col_line = false;
+        ui.col_date = false;
+        ui.col_time = false;
+        ui.col_loglv = false;
+        ui.col_pid = false;
+        ui.col_thread = false;
+        ui.col_uid = false;
+        ui.col_tag = false;
+        ui.col_message = false;
+        assert_eq!(ui.visible_column_count(), 0);
+
+        ui.col_message = true;
+        assert_eq!(ui.visible_column_count(), 1);
+        // With one column left, the guard disables its checkbox / "Hide this":
+        // `only_one && col_message` is true, so add_enabled(false) is passed.
+        assert!(ui.visible_column_count() == 1 && ui.col_message);
+
+        ui.col_tag = true;
+        assert_eq!(ui.visible_column_count(), 2);
     }
 
     #[test]
