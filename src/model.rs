@@ -57,6 +57,9 @@ pub enum LogFormat {
     Brief,
     Time,
     ThreadTime,
+    /// HarmonyOS `hilog`: like threadtime but with a `Domain/Tag` field and a
+    /// timestamp that may carry more than 3 fractional-second digits.
+    HiLog,
     Kernel,
     Unknown,
 }

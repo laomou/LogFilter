@@ -162,6 +162,8 @@ impl Default for AdbConfig {
                 "logcat -b radio -v time".into(),
                 "logcat -b events -v time".into(),
                 "shell cat /proc/kmsg".into(),
+                // HarmonyOS hilog (run via hdc — set the adb/hdc path in config).
+                "hilog".into(),
             ],
             adb_path: None,
             selected_cmd: String::new(),
@@ -194,6 +196,12 @@ pub fn fonts_dir() -> Option<PathBuf> {
 }
 
 pub fn load() -> Config {
+    let mut cfg = load_raw();
+    ensure_builtin_commands(&mut cfg);
+    cfg
+}
+
+fn load_raw() -> Config {
     if let Some(path) = config_path() {
         if let Some(cfg) = read_config(&path) {
             return cfg;
@@ -207,6 +215,17 @@ pub fn load() -> Config {
         }
     }
     Config::default()
+}
+
+/// Ensure built-in commands introduced in newer versions are present even in an
+/// older saved config — the command combo isn't editable, so a user couldn't add
+/// them otherwise. Idempotent (won't duplicate).
+fn ensure_builtin_commands(cfg: &mut Config) {
+    for cmd in ["hilog"] {
+        if !cfg.adb.commands.iter().any(|c| c == cmd) {
+            cfg.adb.commands.push(cmd.to_string());
+        }
+    }
 }
 
 /// Read and parse a config file. Returns `None` if it's missing or unparseable.
@@ -451,6 +470,19 @@ mod tests {
         assert_eq!(cfg.filters.find, "hello");
         assert_eq!(cfg.view.columns[0], 42.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_builtin_commands_injects_hilog_into_old_config() {
+        // An older saved config without the hilog command should get it added.
+        let mut cfg = Config::default();
+        cfg.adb.commands = vec!["logcat -v threadtime".into()];
+        ensure_builtin_commands(&mut cfg);
+        assert!(cfg.adb.commands.iter().any(|c| c == "hilog"), "hilog added");
+        // Idempotent — a second call doesn't duplicate.
+        let n = cfg.adb.commands.len();
+        ensure_builtin_commands(&mut cfg);
+        assert_eq!(cfg.adb.commands.len(), n, "no duplicate on re-run");
     }
 
     #[test]

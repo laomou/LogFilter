@@ -12,6 +12,23 @@ fn re_threadtime() -> &'static Regex {
     })
 }
 
+/// HarmonyOS `hilog`: `MM-DD HH:MM:SS.sss PID TID Level Domain/Tag: message`.
+/// Differs from threadtime by the `Domain/Tag` field (hex domain + `/` + tag)
+/// and a fractional-second part that may be 3–9 digits (ms/µs/ns). The domain is
+/// required to be ≥5 hex digits (real hilog domains are 5–7) so this doesn't
+/// claim Android tags that merely start with a short hex word then a slash
+/// (e.g. `DB/query`); any that still slip through fall back to lossless
+/// ThreadTime. Safe to try before threadtime.
+fn re_hilog() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<domain>[0-9A-Fa-f]{5,})/(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+        )
+        .unwrap()
+    })
+}
+
 fn re_time() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -96,6 +113,30 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                 )
             })
         };
+        let try_hilog = |s: &str| {
+            re_hilog().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::HiLog,
+                    lv,
+                    [
+                        span(&c, "date"),
+                        span(&c, "time"),
+                        span(&c, "pid"),
+                        span(&c, "tid"),
+                        EMPTY,
+                        // Tag column shows just the tag (after the domain/), so
+                        // tag filtering stays clean; the numeric domain is dropped.
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
         let try_time = |s: &str| {
             re_time().captures(s).map(|c| {
                 let lv = c["lv"]
@@ -162,6 +203,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
         // Try the hinted format first; fall back to the full scan only on a miss.
         let hinted = match hint {
             LogFormat::ThreadTime => try_threadtime(s),
+            LogFormat::HiLog => try_hilog(s),
             LogFormat::Time => try_time(s),
             LogFormat::Brief => try_brief(s),
             LogFormat::Kernel => try_kernel(s),
@@ -171,22 +213,33 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
         if hinted.is_some() {
             hinted
         } else {
-            // Full scan in priority order (ThreadTime → Time → Brief → Kernel),
-            // skipping whichever format the hint already tried.
+            // Full scan in priority order (HiLog → ThreadTime → Time → Brief →
+            // Kernel), skipping whichever format the hint already tried. HiLog is
+            // tried before ThreadTime because a hilog line would otherwise match
+            // threadtime with the domain glued onto the tag.
             match hint {
-                LogFormat::ThreadTime => try_time(s)
+                LogFormat::HiLog => try_threadtime(s)
+                    .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
-                LogFormat::Time => try_threadtime(s)
+                LogFormat::ThreadTime => try_hilog(s)
+                    .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
-                LogFormat::Brief => try_threadtime(s)
+                LogFormat::Time => try_hilog(s)
+                    .or_else(|| try_threadtime(s))
+                    .or_else(|| try_brief(s))
+                    .or_else(|| try_kernel(s)),
+                LogFormat::Brief => try_hilog(s)
+                    .or_else(|| try_threadtime(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_kernel(s)),
-                LogFormat::Kernel => try_threadtime(s)
+                LogFormat::Kernel => try_hilog(s)
+                    .or_else(|| try_threadtime(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s)),
-                LogFormat::Unknown => try_threadtime(s)
+                LogFormat::Unknown => try_hilog(s)
+                    .or_else(|| try_threadtime(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
@@ -246,6 +299,55 @@ mod tests {
         assert_eq!(e.level, LevelMask::I);
         assert_eq!(e.tag(), "ActivityManager");
         assert_eq!(e.message(), "Start proc");
+    }
+
+    #[test]
+    fn parses_hilog_harmonyos() {
+        // HarmonyOS hilog: Domain/Tag field; tag column shows just the tag.
+        let line = "08-06 15:43:53.405  1234  5678 I A03D00/MyApp: key frame id: 0";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.date(), "08-06");
+        assert_eq!(e.time(), "15:43:53.405");
+        assert_eq!(e.pid(), "1234");
+        assert_eq!(e.tid(), "5678");
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.tag(), "MyApp", "domain stripped, clean tag");
+        assert_eq!(e.message(), "key frame id: 0");
+    }
+
+    #[test]
+    fn parses_hilog_microsecond_timestamp() {
+        // hilog timestamps can carry more than 3 fractional-second digits.
+        let line = "08-06 15:43:53.405123  900  901 W C01719/HiSysEvent: warn body";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.time(), "15:43:53.405123");
+        assert_eq!(e.level, LevelMask::W);
+        assert_eq!(e.tag(), "HiSysEvent");
+        assert_eq!(e.message(), "warn body");
+    }
+
+    #[test]
+    fn android_threadtime_not_misparsed_as_hilog() {
+        // A plain Android tag has no "hexdomain/" prefix, so HiLog must not claim
+        // it — it stays ThreadTime with the whole tag intact.
+        let line = "01-01 12:34:56.789  1234  5678 I ActivityManager: Start proc";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.tag(), "ActivityManager");
+    }
+
+    #[test]
+    fn short_hex_slash_tag_stays_threadtime() {
+        // An Android tag that starts with a short hex word then a slash must NOT
+        // be claimed by HiLog (its domain requires ≥5 hex digits) — the whole
+        // "DB/query" tag stays intact under ThreadTime.
+        let line = "01-01 12:34:56.789  1234  5678 I DB/query: run";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.tag(), "DB/query");
+        assert_eq!(e.message(), "run");
     }
 
     #[test]
