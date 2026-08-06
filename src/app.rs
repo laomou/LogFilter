@@ -720,6 +720,10 @@ fn follow_file(
 /// Infer the expected log format from an adb command string.
 /// The `-v <fmt>` flag selects the format; `/kmsg` path means kernel format.
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
+    // HarmonyOS `hilog` (run via hdc) → HiLog format.
+    if cmd.contains("hilog") {
+        return LogFormat::HiLog;
+    }
     if cmd.contains("/kmsg") {
         return LogFormat::Kernel;
     }
@@ -3487,6 +3491,8 @@ mod tests {
             detect_format_from_cmd("logcat -v nonsense"),
             LogFormat::Unknown
         );
+        assert_eq!(detect_format_from_cmd("hilog"), LogFormat::HiLog);
+        assert_eq!(detect_format_from_cmd("shell hilog"), LogFormat::HiLog);
     }
 
     #[test]
