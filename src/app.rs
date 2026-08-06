@@ -381,6 +381,14 @@ impl App {
         *self.source_format_hint.lock_recover() = LogFormat::Unknown;
         let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
+        // Whether this is a switch to a *different* file, as opposed to an
+        // automatic reload of the same file after a truncation/rotation. Only a
+        // genuine source change should drop the column-picker filters — reloading
+        // the same file (or re-opening it) keeps them, since the values (PID/tag/…)
+        // still refer to the same data. Captured before `model.clear()` overwrites
+        // the stored path below.
+        let source_changed = self.model.read_recover().file_path.as_deref() != Some(path);
+
         // Reset the model synchronously (cheap) and let lines stream in.
         {
             let mut model = self.model.write_recover();
@@ -390,7 +398,9 @@ impl App {
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
-        self.reset_column_filters();
+        if source_changed {
+            self.reset_column_filters();
+        }
         config::add_recent(&mut self.cfg, path);
         self.notify_filter();
 
@@ -700,7 +710,9 @@ impl App {
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
-        self.reset_column_filters();
+        // Keep the column-picker filters (level/PID/TID/tag): Run/Restart
+        // re-monitor the same device/app, so the values stay relevant — unlike a
+        // file open, which switches to an unrelated source.
         self.notify_filter();
 
         let device = if self.selected_device.is_empty() {
@@ -761,9 +773,13 @@ impl App {
 
     /// Reset the value-based column-picker filters (PID/TID/tag/level). These
     /// hold literal string/level values captured from one source; carrying them
-    /// into a different file or adb session silently filters the new data by
-    /// unrelated values (often leaving a blank table with no visible cause).
-    /// Text filters (find/remove/highlight) are content patterns and are kept.
+    /// into a *different* file silently filters the new data by unrelated values
+    /// (often leaving a blank table with no visible cause). Text filters
+    /// (find/remove/highlight) are content patterns and are kept.
+    ///
+    /// Only genuine source changes reset: opening a different file does, but
+    /// reloading the same file (truncation/rotation) and adb Run/Restart do not —
+    /// those keep watching the same data, so the values stay relevant.
     fn reset_column_filters(&mut self) {
         self.ui.allowed_pids = None;
         self.ui.allowed_tids = None;
@@ -3750,6 +3766,38 @@ mod ui_tests {
     }
 
     #[test]
+    fn adb_run_preserves_column_filters() {
+        use crate::model::LevelMask;
+        let mut h = harness();
+        h.run();
+
+        // User narrows the view by level/PID/TID/tag before restarting capture.
+        h.state_mut().ui.allowed_levels = Some(LevelMask::E);
+        h.state_mut().ui.allowed_pids = Some(std::collections::HashSet::from(["100".to_string()]));
+        h.state_mut().ui.allowed_tids = Some(std::collections::HashSet::from(["200".to_string()]));
+        h.state_mut().ui.allowed_tags = Some(std::collections::HashSet::from(["Tag0".to_string()]));
+        h.state_mut().ui.disallowed_tags.insert("Tag1".to_string());
+
+        // Run/Restart re-monitors the same source: filters must survive.
+        h.state_mut().adb_run();
+
+        assert_eq!(h.state().ui.allowed_levels, Some(LevelMask::E));
+        assert_eq!(
+            h.state().ui.allowed_pids,
+            Some(std::collections::HashSet::from(["100".to_string()]))
+        );
+        assert_eq!(
+            h.state().ui.allowed_tids,
+            Some(std::collections::HashSet::from(["200".to_string()]))
+        );
+        assert_eq!(
+            h.state().ui.allowed_tags,
+            Some(std::collections::HashSet::from(["Tag0".to_string()]))
+        );
+        assert!(h.state().ui.disallowed_tags.contains("Tag1"));
+    }
+
+    #[test]
     fn adb_stop_when_no_session_is_noop() {
         let mut h = harness();
         h.run();
@@ -3961,6 +4009,58 @@ mod ui_tests {
         drop(m);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_different_file_resets_column_filters() {
+        use crate::model::LevelMask;
+        let mut h = harness();
+        h.run();
+
+        let a = std::env::temp_dir().join(format!("lf_srcA_{}.log", std::process::id()));
+        std::fs::write(&a, "01-01 10:00:00.000  1  1 I T: msg\n").unwrap();
+        h.state_mut().open_file(&a).unwrap();
+
+        // Filters set against file A, then a *different* file B is opened.
+        h.state_mut().ui.allowed_levels = Some(LevelMask::E);
+        h.state_mut().ui.allowed_pids = Some(std::collections::HashSet::from(["1".to_string()]));
+
+        let b = std::env::temp_dir().join(format!("lf_srcB_{}.log", std::process::id()));
+        std::fs::write(&b, "02-02 11:00:00.000  9  9 W T: other\n").unwrap();
+        h.state_mut().open_file(&b).unwrap();
+
+        // Unrelated values would hide the new file's data — must be cleared.
+        assert_eq!(h.state().ui.allowed_levels, None);
+        assert_eq!(h.state().ui.allowed_pids, None);
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn reopen_same_file_keeps_column_filters() {
+        use crate::model::LevelMask;
+        let mut h = harness();
+        h.run();
+
+        let p = std::env::temp_dir().join(format!("lf_same_{}.log", std::process::id()));
+        std::fs::write(&p, "01-01 10:00:00.000  1  1 I T: msg\n").unwrap();
+        h.state_mut().open_file(&p).unwrap();
+
+        h.state_mut().ui.allowed_levels = Some(LevelMask::I);
+        h.state_mut().ui.allowed_tags = Some(std::collections::HashSet::from(["T".to_string()]));
+
+        // Reloading the same path (mirrors a truncation/rotation reload) keeps
+        // filters, since the values still refer to the same source.
+        h.state_mut().open_file(&p).unwrap();
+
+        assert_eq!(h.state().ui.allowed_levels, Some(LevelMask::I));
+        assert_eq!(
+            h.state().ui.allowed_tags,
+            Some(std::collections::HashSet::from(["T".to_string()]))
+        );
+
+        let _ = std::fs::remove_file(&p);
     }
 
     // ─── Bookmarks + filter interaction ──────────────────────────────────
