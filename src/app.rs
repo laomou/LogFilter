@@ -776,7 +776,8 @@ impl App {
         let device = if self.selected_device.is_empty() {
             None
         } else {
-            Some(self.selected_device.as_str())
+            // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
+            Some(adb::device_serial(&self.selected_device))
         };
         match adb::Session::start(
             self.cfg.adb.adb_path.as_deref(),
