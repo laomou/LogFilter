@@ -714,19 +714,6 @@ fn follow_file(
                 Err(_) => {}
             }
         },
-        Tail::ReloadOnChange { len, .. } => loop {
-            thread::sleep(POLL);
-            if source_epoch.load(Ordering::Acquire) != epoch {
-                return;
-            }
-            // UTF-16: can't byte-tail safely, so reload whenever the size changes.
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() != len {
-                    request_reload();
-                    return;
-                }
-            }
-        },
     }
 }
 

@@ -10,16 +10,11 @@ use std::sync::Arc;
 /// How the tail/follow poller should pick up data appended after the initial
 /// load, decided once from the encoding chosen for that load.
 pub enum Tail {
-    /// Byte-safe encodings (UTF-8 and every ASCII-superset legacy codepage:
-    /// GBK, Shift_JIS, EUC-KR, Big5, Windows-1252). `b'\n'` is an unambiguous
-    /// single byte in all of them, so appended data can be split on raw
-    /// newlines and each complete line decoded with `enc`. `offset` is the byte
-    /// position just past the end of the initial load.
+    /// `offset` is the byte position just past the end of the initial load. For
+    /// UTF-8 and byte-safe legacy codepages (GBK, Shift_JIS, EUC-KR, Big5,
+    /// Windows-1252) appended data is split on raw `\n`; UTF-16 is decoded into
+    /// code units and split on the '\n' character (see `read_appended`).
     Append { offset: u64, enc: &'static Encoding },
-    /// UTF-16: `0x0A` also appears as the low byte of unrelated code units, so
-    /// raw-newline splitting is unsafe. Fall back to reloading the whole file
-    /// when its length changes. `len` is the size at initial load.
-    ReloadOnChange { len: u64, enc: &'static Encoding },
 }
 
 impl Tail {
@@ -29,7 +24,6 @@ impl Tail {
     pub fn encoding_name(&self) -> &'static str {
         match self {
             Tail::Append { enc, .. } => enc.name(),
-            Tail::ReloadOnChange { enc, .. } => enc.name(),
         }
     }
 }
@@ -188,17 +182,10 @@ fn send_decoded_lines_with_enc(
     let mut text_buf = String::with_capacity(8192);
     let mut raw_buf = vec![0u8; 8192];
     let mut read_bytes: u64 = 0;
-    // UTF-16 is not an ASCII superset (0x0A appears inside unrelated code
-    // units), so byte-newline tailing is unsafe — follow by reloading on size
-    // change. Every other encoding here (UTF-8, GBK, Shift_JIS, EUC-KR, Big5,
-    // Windows-1252) is byte-safe for `\n`.
-    let tail_for = |bytes: u64| {
-        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
-            Tail::ReloadOnChange { len: bytes, enc }
-        } else {
-            Tail::Append { offset: bytes, enc }
-        }
-    };
+    // All encodings here tail incrementally: UTF-8 and the byte-safe legacy
+    // codepages split on raw `\n`, and UTF-16 is handled specially in
+    // `read_appended` (decode code units, split on the '\n' character).
+    let tail_for = |bytes: u64| Tail::Append { offset: bytes, enc };
     loop {
         let n = reader.read(&mut raw_buf)?;
         if n == 0 {
@@ -272,6 +259,35 @@ pub fn read_appended(
     // grew between 500 ms polls — small in practice).
     let mut raw = Vec::with_capacity((len - offset) as usize);
     file.read_to_end(&mut raw)?;
+
+    // UTF-16: `0x0A` also occurs as a byte inside unrelated code units, so we
+    // can't split on raw newline bytes. Decode whole 2-byte code units, split on
+    // the '\n' *character*, and advance the offset by the UTF-16 byte length of
+    // what we consumed. (This lets UTF-16 files tail incrementally instead of
+    // reloading the whole file on every size change.)
+    if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+        let usable = raw.len() & !1; // whole code units only; hold back a stray byte
+        let (text, _, _) = enc.decode(&raw[..usable]);
+        let Some(nl) = text.rfind('\n') else {
+            return Ok(Appended {
+                offset,
+                truncated: false,
+            });
+        };
+        let consumed = &text[..=nl];
+        for chunk in consumed.split_inclusive('\n') {
+            let line = chunk.trim_end_matches(['\r', '\n']).to_string();
+            if tx.send((epoch, line)).is_err() {
+                break;
+            }
+        }
+        let consumed_bytes = consumed.encode_utf16().count() as u64 * 2;
+        return Ok(Appended {
+            offset: offset + consumed_bytes,
+            truncated: false,
+        });
+    }
+
     // Only consume up to the last newline; bytes after it are a partial line.
     let last_nl = raw.iter().rposition(|&b| b == b'\n');
     let Some(end) = last_nl else {
@@ -597,6 +613,48 @@ mod tests {
     }
 
     #[test]
+    fn read_appended_tails_utf16le_incrementally() {
+        // UTF-16 now tails by append (was full-reload-on-change). Verify complete
+        // lines are emitted, a partial line is withheld, and the offset advances
+        // by the correct UTF-16 byte count.
+        let enc16 =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+        let tmp = unique_tmp("append_u16");
+        let initial = enc16("one\ntwo\n"); // 16 bytes
+        std::fs::write(&tmp, &initial).unwrap();
+        let off0 = initial.len() as u64;
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        // Append a complete line plus a partial one (no newline yet).
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(&enc16("three\npar")).unwrap();
+        }
+        let a = read_appended(&tmp, off0, encoding_rs::UTF_16LE, &tx, 1).unwrap();
+        let got: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(got, vec!["three".to_string()], "partial 'par' withheld");
+        assert_eq!(
+            a.offset,
+            off0 + enc16("three\n").len() as u64,
+            "offset stops before the partial line"
+        );
+        assert!(!a.truncated);
+
+        // Completing the partial line emits it whole (not split).
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(&enc16("tial\n")).unwrap();
+        }
+        let a2 = read_appended(&tmp, a.offset, encoding_rs::UTF_16LE, &tx, 1).unwrap();
+        let got2: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(got2, vec!["partial".to_string()]);
+        assert!(!a2.truncated);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
     fn read_appended_reports_truncation() {
         let tmp = unique_tmp("trunc");
         std::fs::write(&tmp, b"aaaa\nbbbb\n").unwrap(); // 10 bytes
@@ -647,7 +705,6 @@ mod tests {
                 assert_eq!(offset, 12);
                 assert_eq!(enc.name(), "UTF-8");
             }
-            Tail::ReloadOnChange { .. } => panic!("UTF-8 should tail by append"),
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -663,8 +720,8 @@ mod tests {
             "GBK"
         );
         assert_eq!(
-            Tail::ReloadOnChange {
-                len: 0,
+            Tail::Append {
+                offset: 0,
                 enc: encoding_rs::UTF_16LE
             }
             .encoding_name(),
