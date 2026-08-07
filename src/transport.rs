@@ -548,6 +548,58 @@ mod tests {
         eprintln!("real hdc reported devices: {devices:?}");
     }
 
+    /// Full data-path check against a real HarmonyOS device: start a `hilog`
+    /// session through [`Session::start`], read what streams in, and confirm the
+    /// lines parse as HiLog. Ignored by default; run with:
+    /// `HDC_BIN=/path/to/hdc LD_LIBRARY_PATH=/path/to/hdc-libs \
+    ///  cargo test -- --ignored real_hdc_streams_and_parses_hilog --nocapture`
+    #[test]
+    #[ignore = "requires a real hdc binary + connected HarmonyOS device; set HDC_BIN"]
+    fn real_hdc_streams_and_parses_hilog() {
+        use std::time::{Duration, Instant};
+        let Ok(bin) = std::env::var("HDC_BIN") else {
+            return;
+        };
+        let devices = list_devices(Transport::Hdc, Some(&bin)).expect("list targets");
+        let Some(dev) = devices.first() else {
+            eprintln!("no HarmonyOS device connected — skipping stream check");
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::bounded(8192);
+        let mut session = Session::start(
+            Transport::Hdc,
+            Some(&bin),
+            Some(device_serial(dev)),
+            "hilog -v time",
+            tx,
+            1,
+        )
+        .expect("hilog session starts");
+
+        let mut lines = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && lines.len() < 200 {
+            if let Ok((_, line)) = rx.recv_timeout(Duration::from_millis(500)) {
+                lines.push(line);
+            }
+        }
+        session.stop();
+
+        assert!(!lines.is_empty(), "expected hilog lines from the device");
+        let hilog = lines
+            .iter()
+            .filter(|l| crate::parser::parse_line((*l).clone()).1 == LogFormat::HiLog)
+            .count();
+        eprintln!(
+            "hilog stream: {hilog}/{} lines parsed as HiLog",
+            lines.len()
+        );
+        assert!(
+            hilog * 2 >= lines.len(),
+            "majority of streamed lines should parse as HiLog"
+        );
+    }
+
     #[test]
     fn transport_binary_list_args_and_device_flag() {
         assert_eq!(Transport::Adb.binary(), "adb");
