@@ -142,11 +142,17 @@ impl ColorsConfig {
     }
 }
 
+use crate::transport::Transport;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdbConfig {
     pub commands: Vec<String>,
     pub adb_path: Option<String>,
+    /// Path to the hdc binary (HarmonyOS). Empty/None = resolve "hdc" on PATH.
+    pub hdc_path: Option<String>,
+    /// Selected device-connector backend (adb / hdc).
+    pub transport: Transport,
     /// Last-used adb command and device, restored on the next launch. Empty =
     /// fall back to the first command / "(any)" device.
     pub selected_cmd: String,
@@ -162,10 +168,12 @@ impl Default for AdbConfig {
                 "logcat -b radio -v time".into(),
                 "logcat -b events -v time".into(),
                 "shell cat /proc/kmsg".into(),
-                // HarmonyOS hilog (run via hdc — set the adb/hdc path in config).
+                // HarmonyOS hilog (select the HarmonyOS transport to run via hdc).
                 "hilog".into(),
             ],
             adb_path: None,
+            hdc_path: None,
+            transport: Transport::Adb,
             selected_cmd: String::new(),
             selected_device: String::new(),
         }
@@ -483,6 +491,21 @@ mod tests {
         let n = cfg.adb.commands.len();
         ensure_builtin_commands(&mut cfg);
         assert_eq!(cfg.adb.commands.len(), n, "no duplicate on re-run");
+    }
+
+    #[test]
+    fn transport_roundtrips_and_defaults_to_adb() {
+        assert_eq!(AdbConfig::default().transport, Transport::Adb);
+        // An older config without the transport field loads as adb.
+        let old: Config = toml::from_str("[adb]\n").unwrap();
+        assert_eq!(old.adb.transport, Transport::Adb);
+        // Round-trips hdc + the hdc path.
+        let mut cfg = Config::default();
+        cfg.adb.transport = Transport::Hdc;
+        cfg.adb.hdc_path = Some("/opt/harmony/hdc".into());
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back.adb.transport, Transport::Hdc);
+        assert_eq!(back.adb.hdc_path.as_deref(), Some("/opt/harmony/hdc"));
     }
 
     #[test]
