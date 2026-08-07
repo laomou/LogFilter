@@ -723,6 +723,19 @@ fn follow_file(
 }
 
 /// Infer the expected log format from an adb command string.
+/// Whether a command belongs to `t`'s dropdown: a `hilog` command is
+/// HarmonyOS-only, a `logcat` command is Android-only, and anything else
+/// (`shell cat /proc/kmsg`, custom shell commands) runs on either backend.
+fn command_matches_transport(cmd: &str, t: Transport) -> bool {
+    if cmd.contains("hilog") {
+        t == Transport::Hdc
+    } else if cmd.contains("logcat") {
+        t == Transport::Adb
+    } else {
+        true
+    }
+}
+
 /// The `-v <fmt>` flag selects the format; `/kmsg` path means kernel format.
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
     // HarmonyOS `hilog` (run via hdc) → HiLog format.
@@ -2543,16 +2556,34 @@ impl App {
                     // and re-probe with the new transport's list command.
                     self.selected_device.clear();
                     self.adb_devices.clear();
+                    // Also switch the command to one that matches the new backend
+                    // (e.g. hilog for HarmonyOS) instead of leaving a logcat
+                    // command selected that hdc can't run.
+                    if !command_matches_transport(&self.selected_cmd, new_transport) {
+                        self.selected_cmd = self
+                            .cfg
+                            .adb
+                            .commands
+                            .iter()
+                            .find(|c| command_matches_transport(c, new_transport))
+                            .cloned()
+                            .unwrap_or_default();
+                    }
                     self.refresh_devices(ctx.clone());
                 }
                 ui.separator();
                 let cmds = self.cfg.adb.commands.clone();
+                let transport = self.transport;
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")
                     .selected_text(&self.selected_cmd)
                     .width(220.0)
                     .show_ui(ui, |ui| {
-                        for c in &cmds {
+                        // Only show commands for the current backend.
+                        for c in cmds
+                            .iter()
+                            .filter(|c| command_matches_transport(c, transport))
+                        {
                             ui.selectable_value(&mut self.selected_cmd, c.clone(), c);
                         }
                     });
@@ -3536,6 +3567,43 @@ mod tests {
         );
         assert_eq!(detect_format_from_cmd("hilog"), LogFormat::HiLog);
         assert_eq!(detect_format_from_cmd("shell hilog"), LogFormat::HiLog);
+        assert_eq!(
+            detect_format_from_cmd("hilog -v threadtime -r"),
+            LogFormat::HiLog
+        );
+        assert_eq!(
+            detect_format_from_cmd("hilog -D 0x2F00 -v time"),
+            LogFormat::HiLog
+        );
+    }
+
+    #[test]
+    fn command_matches_transport_classifies_by_tool() {
+        // logcat → Android only; hilog → HarmonyOS only; shell → both.
+        assert!(command_matches_transport(
+            "logcat -v threadtime",
+            Transport::Adb
+        ));
+        assert!(!command_matches_transport(
+            "logcat -v threadtime",
+            Transport::Hdc
+        ));
+        assert!(command_matches_transport(
+            "hilog -v time -r",
+            Transport::Hdc
+        ));
+        assert!(!command_matches_transport(
+            "hilog -v time -r",
+            Transport::Adb
+        ));
+        assert!(command_matches_transport(
+            "shell cat /proc/kmsg",
+            Transport::Adb
+        ));
+        assert!(command_matches_transport(
+            "shell cat /proc/kmsg",
+            Transport::Hdc
+        ));
     }
 
     #[test]

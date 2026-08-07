@@ -167,9 +167,13 @@ impl Default for AdbConfig {
                 "logcat -v time".into(),
                 "logcat -b radio -v time".into(),
                 "logcat -b events -v time".into(),
-                "shell cat /proc/kmsg".into(),
                 // HarmonyOS hilog (select the HarmonyOS transport to run via hdc).
-                "hilog".into(),
+                "hilog -v threadtime -r".into(),
+                "hilog -v time -r".into(),
+                "hilog -D 0x2F00 -v time".into(),
+                "hilog -D 0x2D00 -v time".into(),
+                // Kernel log — works via adb shell or hdc shell.
+                "shell cat /proc/kmsg".into(),
             ],
             adb_path: None,
             hdc_path: None,
@@ -229,7 +233,12 @@ fn load_raw() -> Config {
 /// older saved config — the command combo isn't editable, so a user couldn't add
 /// them otherwise. Idempotent (won't duplicate).
 fn ensure_builtin_commands(cfg: &mut Config) {
-    for cmd in ["hilog"] {
+    for cmd in [
+        "hilog -v threadtime -r",
+        "hilog -v time -r",
+        "hilog -D 0x2F00 -v time",
+        "hilog -D 0x2D00 -v time",
+    ] {
         if !cfg.adb.commands.iter().any(|c| c == cmd) {
             cfg.adb.commands.push(cmd.to_string());
         }
@@ -486,7 +495,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.adb.commands = vec!["logcat -v threadtime".into()];
         ensure_builtin_commands(&mut cfg);
-        assert!(cfg.adb.commands.iter().any(|c| c == "hilog"), "hilog added");
+        assert!(
+            cfg.adb.commands.iter().any(|c| c.contains("hilog")),
+            "hilog command added"
+        );
         // Idempotent — a second call doesn't duplicate.
         let n = cfg.adb.commands.len();
         ensure_builtin_commands(&mut cfg);
