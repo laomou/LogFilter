@@ -147,7 +147,9 @@ use crate::transport::{self, Transport};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceConfig {
-    pub commands: Vec<String>,
+    /// Command dropdown per backend (adb runs logcat/shell, hdc runs hilog).
+    pub adb_commands: Vec<String>,
+    pub hdc_commands: Vec<String>,
     pub adb_path: Option<String>,
     /// Path to the hdc binary (HarmonyOS). Empty/None = resolve "hdc" on PATH.
     pub hdc_path: Option<String>,
@@ -162,10 +164,8 @@ pub struct DeviceConfig {
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
-            commands: transport::BUILTIN_COMMANDS
-                .iter()
-                .map(|b| b.cmd.to_string())
-                .collect(),
+            adb_commands: transport::default_commands(Transport::Adb),
+            hdc_commands: transport::default_commands(Transport::Hdc),
             adb_path: None,
             hdc_path: None,
             transport: Transport::Adb,
@@ -222,25 +222,25 @@ fn load_raw() -> Config {
 
 /// Reconcile an older saved config with the built-in command set introduced in
 /// newer versions — the command combo isn't user-editable, so this is the only
-/// way an existing config picks up new commands or sheds obsolete ones. Idempotent.
+/// way an existing config picks up new commands. Idempotent.
 fn ensure_builtin_commands(cfg: &mut Config) {
-    // Drop the obsolete standalone `hilog`: earlier builds injected it, but it's
-    // now superseded by the specific hilog commands in BUILTIN_COMMANDS.
-    cfg.device.commands.retain(|c| c != "hilog");
-
-    // Add any built-in command an older config is missing.
+    // Add any built-in command an older config is missing, to its backend's list.
     for b in transport::BUILTIN_COMMANDS {
-        if !cfg.device.commands.iter().any(|c| c == b.cmd) {
-            cfg.device.commands.push(b.cmd.to_string());
+        let list = match b.transport {
+            Transport::Adb => &mut cfg.device.adb_commands,
+            Transport::Hdc => &mut cfg.device.hdc_commands,
+        };
+        if !list.iter().any(|c| c == b.cmd) {
+            list.push(b.cmd.to_string());
         }
     }
 
-    // Keep the kernel-log command last: injecting the commands above (or an older
-    // saved order) can otherwise strand it in the middle of the dropdown.
+    // Keep the kernel-log command last in the adb list: injecting the commands
+    // above (or an older saved order) can otherwise strand it mid-dropdown.
     const KMSG: &str = "shell cat /proc/kmsg";
-    if let Some(pos) = cfg.device.commands.iter().position(|c| c == KMSG) {
-        let kmsg = cfg.device.commands.remove(pos);
-        cfg.device.commands.push(kmsg);
+    if let Some(pos) = cfg.device.adb_commands.iter().position(|c| c == KMSG) {
+        let kmsg = cfg.device.adb_commands.remove(pos);
+        cfg.device.adb_commands.push(kmsg);
     }
 }
 
@@ -427,7 +427,9 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
                 }
             }
             if !cmds.is_empty() {
-                cfg.device.commands = cmds;
+                // The old C++ LogFilter predates HarmonyOS, so its command list is
+                // all adb commands.
+                cfg.device.adb_commands = cmds;
             }
         }
     }
@@ -490,37 +492,36 @@ mod tests {
 
     #[test]
     fn ensure_builtin_commands_injects_hilog_into_old_config() {
-        // An older saved config without the hilog command should get it added.
+        // An older saved config missing the hilog commands should get them added
+        // to the hdc list.
         let mut cfg = Config::default();
-        cfg.device.commands = vec!["logcat -v threadtime".into()];
+        cfg.device.adb_commands = vec!["logcat -v threadtime".into()];
+        cfg.device.hdc_commands = vec![];
         ensure_builtin_commands(&mut cfg);
         assert!(
-            cfg.device.commands.iter().any(|c| c.contains("hilog")),
-            "hilog command added"
+            cfg.device.hdc_commands.iter().any(|c| c.contains("hilog")),
+            "hilog command added to hdc list"
         );
-        // Idempotent — a second call doesn't duplicate.
-        let n = cfg.device.commands.len();
+        // Idempotent — a second call doesn't duplicate either list.
+        let (na, nh) = (cfg.device.adb_commands.len(), cfg.device.hdc_commands.len());
         ensure_builtin_commands(&mut cfg);
-        assert_eq!(cfg.device.commands.len(), n, "no duplicate on re-run");
+        assert_eq!(
+            (cfg.device.adb_commands.len(), cfg.device.hdc_commands.len()),
+            (na, nh),
+            "no duplicate on re-run"
+        );
     }
 
     #[test]
-    fn ensure_builtin_commands_drops_bare_hilog_and_keeps_kmsg_last() {
-        // Config from an earlier build: obsolete bare `hilog`, and the kernel-log
-        // command stranded before the injected hilog commands.
+    fn ensure_builtin_commands_keeps_kmsg_last() {
+        // A saved config with the kernel-log command stranded before the other
+        // adb builtins: it must be moved back to the end of the adb list.
         let mut cfg = Config::default();
-        cfg.device.commands = vec![
-            "logcat -v threadtime".into(),
-            "hilog".into(),
-            "shell cat /proc/kmsg".into(),
-        ];
+        cfg.device.adb_commands =
+            vec!["shell cat /proc/kmsg".into(), "logcat -v threadtime".into()];
         ensure_builtin_commands(&mut cfg);
-        assert!(
-            !cfg.device.commands.iter().any(|c| c == "hilog"),
-            "standalone hilog removed"
-        );
         assert_eq!(
-            cfg.device.commands.last().map(String::as_str),
+            cfg.device.adb_commands.last().map(String::as_str),
             Some("shell cat /proc/kmsg"),
             "kernel-log command stays last"
         );

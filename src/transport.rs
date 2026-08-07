@@ -52,63 +52,64 @@ impl Transport {
 }
 
 /// A command shipped in the (non-editable) command dropdown, tagged with the
-/// transport it belongs to and the log format it produces. This is the single
-/// source of truth for both — the UI classifies commands by looking them up
-/// here rather than sniffing the command string for `"hilog"`/`"logcat"`.
+/// transport it belongs to and the log format it produces. This table is the
+/// single source of truth: the default per-backend command lists
+/// ([`default_commands`]) and format detection ([`builtin_command`]) both derive
+/// from it, rather than sniffing the command string for `"hilog"`/`"logcat"`.
 pub struct BuiltinCommand {
     pub cmd: &'static str,
-    /// `None` = transport-agnostic (shown under every backend), e.g. a shell command.
-    pub transport: Option<Transport>,
+    /// The backend this command runs on (each shipped command targets exactly one).
+    pub transport: Transport,
     pub format: LogFormat,
 }
 
-/// The built-in command set. Order here is the order shown in the dropdown; keep
-/// the transport-agnostic kernel-log command last.
+/// The built-in command set. Order here is the per-backend dropdown order; the
+/// kernel-log command is kept last within the adb list.
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         cmd: "logcat -v threadtime",
-        transport: Some(Transport::Adb),
+        transport: Transport::Adb,
         format: LogFormat::ThreadTime,
     },
     BuiltinCommand {
         cmd: "logcat -v time",
-        transport: Some(Transport::Adb),
+        transport: Transport::Adb,
         format: LogFormat::Time,
     },
     BuiltinCommand {
         cmd: "logcat -b radio -v time",
-        transport: Some(Transport::Adb),
+        transport: Transport::Adb,
         format: LogFormat::Time,
     },
     BuiltinCommand {
         cmd: "logcat -b events -v time",
-        transport: Some(Transport::Adb),
+        transport: Transport::Adb,
         format: LogFormat::Time,
     },
     BuiltinCommand {
         cmd: "hilog -v threadtime -r",
-        transport: Some(Transport::Hdc),
+        transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
     BuiltinCommand {
         cmd: "hilog -v time -r",
-        transport: Some(Transport::Hdc),
+        transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
     BuiltinCommand {
         cmd: "hilog -D 0x2F00 -v time",
-        transport: Some(Transport::Hdc),
+        transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
     BuiltinCommand {
         cmd: "hilog -D 0x2D00 -v time",
-        transport: Some(Transport::Hdc),
+        transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
     BuiltinCommand {
         cmd: "shell cat /proc/kmsg",
         // Android-only: HarmonyOS has no /proc/kmsg (hdc reports "No such file").
-        transport: Some(Transport::Adb),
+        transport: Transport::Adb,
         format: LogFormat::Kernel,
     },
 ];
@@ -116,6 +117,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 /// Look up a command in [`BUILTIN_COMMANDS`] by exact match.
 pub fn builtin_command(cmd: &str) -> Option<&'static BuiltinCommand> {
     BUILTIN_COMMANDS.iter().find(|b| b.cmd == cmd)
+}
+
+/// Built-in commands for a transport, in dropdown order. Used for the default
+/// per-backend command lists and as the fallback when switching backends.
+pub fn default_commands(transport: Transport) -> Vec<String> {
+    BUILTIN_COMMANDS
+        .iter()
+        .filter(|b| b.transport == transport)
+        .map(|b| b.cmd.to_string())
+        .collect()
 }
 
 /// Windows CREATE_NO_WINDOW: suppresses the black cmd.exe window that would
@@ -545,6 +556,21 @@ mod tests {
         assert_eq!(Transport::Hdc.device_flag(), "-t");
         assert_eq!(Transport::Adb.list_args(), ["devices"]);
         assert_eq!(Transport::Hdc.list_args(), ["list", "targets"]);
+    }
+
+    #[test]
+    fn default_commands_split_by_backend() {
+        let adb = default_commands(Transport::Adb);
+        let hdc = default_commands(Transport::Hdc);
+        // logcat + kmsg are adb-only; hilog is hdc-only; no overlap.
+        assert!(adb
+            .iter()
+            .all(|c| c.starts_with("logcat") || c.starts_with("shell")));
+        assert!(hdc.iter().all(|c| c.starts_with("hilog")));
+        assert!(!adb.is_empty() && !hdc.is_empty());
+        assert!(adb.iter().all(|c| !hdc.contains(c)));
+        // Kernel-log command sits last in the adb list.
+        assert_eq!(adb.last().map(String::as_str), Some("shell cat /proc/kmsg"));
     }
 
     #[test]
