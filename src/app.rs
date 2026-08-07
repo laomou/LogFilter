@@ -322,19 +322,21 @@ impl App {
         // Strings ahead of the (slower) parse/append step — it blocks instead,
         // capping peak memory. 8192 ≈ a few ingest batches of headroom.
         let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
-        // Restore the last-used adb command/device; fall back to the first
-        // configured command / "(any)" device when not previously saved.
+        // Restore the last-used command/device; fall back to the first command
+        // of the saved backend / "(any)" device when not previously saved.
+        let transport = cfg.device.transport;
         let selected_cmd = if !cfg.device.selected_cmd.is_empty() {
             cfg.device.selected_cmd.clone()
         } else {
-            cfg.device
-                .commands
-                .first()
+            let cmds = match transport {
+                Transport::Adb => &cfg.device.adb_commands,
+                Transport::Hdc => &cfg.device.hdc_commands,
+            };
+            cmds.first()
                 .cloned()
                 .unwrap_or_else(|| "logcat -v threadtime".into())
         };
         let selected_device = cfg.device.selected_device.clone();
-        let transport = cfg.device.transport;
         // Prime caches from the initial config so the first frame doesn't reallocate.
         let init_hl_raw = if ui.highlight_on {
             ui.highlight.clone()
@@ -722,21 +724,6 @@ fn follow_file(
     }
 }
 
-/// Infer the expected log format from an adb command string.
-/// Whether a command belongs to `t`'s dropdown: a `hilog` command is
-/// HarmonyOS-only, a `logcat` command is Android-only, and anything else
-/// (`shell cat /proc/kmsg`, custom shell commands) runs on either backend.
-/// Whether a command should appear in the dropdown for the given transport.
-/// Built-in commands carry their transport (see [`transport::BUILTIN_COMMANDS`]);
-/// a `None` transport (e.g. a shell command) and any unrecognized command show
-/// under every backend.
-fn command_matches_transport(cmd: &str, t: Transport) -> bool {
-    match transport::builtin_command(cmd) {
-        Some(b) => b.transport.is_none_or(|bt| bt == t),
-        None => true,
-    }
-}
-
 /// The log format a command produces. Built-in commands carry it explicitly;
 /// for anything else, fall back to the `-v <fmt>` flag (`/kmsg` → kernel).
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
@@ -807,10 +794,10 @@ impl App {
         ) {
             Ok(s) => {
                 self.adb_session = Some(s);
-                self.status = tr!("status_adb_started", { cmd: &self.selected_cmd });
+                self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
             }
             Err(e) => {
-                self.status = tr!("status_adb_start_failed", { e: &format!("{}", e) });
+                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
             }
         }
     }
@@ -818,7 +805,7 @@ impl App {
     fn adb_stop(&mut self) {
         if let Some(mut s) = self.adb_session.take() {
             s.stop();
-            self.status = tr!("status_adb_stopped");
+            self.status = tr!("status_dev_stopped", { tool: self.transport.binary() });
         }
     }
 
@@ -827,9 +814,9 @@ impl App {
             let new = !s.is_paused();
             s.set_paused(new);
             self.status = if new {
-                tr!("status_adb_paused")
+                tr!("status_dev_paused", { tool: self.transport.binary() })
             } else {
-                tr!("status_adb_resumed")
+                tr!("status_dev_resumed", { tool: self.transport.binary() })
             };
         }
     }
@@ -1066,7 +1053,7 @@ impl App {
             })
         {
             self.device_refresh_rx = None;
-            self.status = tr!("status_adb_devices_failed", { e: &format!("{e}") });
+            self.status = tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &format!("{e}") });
         }
     }
 
@@ -1086,14 +1073,15 @@ impl App {
                     self.selected_device = String::new();
                 }
                 self.status = if n == 0 {
-                    tr!("status_adb_devices_zero")
+                    tr!("status_dev_devices_zero")
                 } else {
-                    tr!("status_adb_devices", { n: n })
+                    tr!("status_dev_devices", { tool: self.transport.binary(), n: n })
                 };
             }
             Err(e) => {
                 self.adb_devices.clear();
-                self.status = tr!("status_adb_devices_failed", { e: &e });
+                self.status =
+                    tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
             }
         }
     }
@@ -1113,7 +1101,8 @@ impl App {
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.device_refresh_rx = None;
-                self.status = tr!("status_adb_devices_failed", {
+                self.status = tr!("status_dev_devices_failed", {
+                    tool: self.transport.binary(),
                     e: &"device probe terminated unexpectedly".to_string()
                 });
             }
@@ -2192,9 +2181,9 @@ impl eframe::App for App {
             s.reap();
             let err = s.stderr_text();
             self.status = if err.is_empty() {
-                tr!("status_adb_ended")
+                tr!("status_dev_ended", { tool: self.transport.binary() })
             } else {
-                tr!("status_adb_ended_err", { e: &err })
+                tr!("status_dev_ended_err", { tool: self.transport.binary(), e: &err })
             };
         }
 
@@ -2557,34 +2546,29 @@ impl App {
                     // and re-probe with the new transport's list command.
                     self.selected_device.clear();
                     self.adb_devices.clear();
-                    // Also switch the command to one that matches the new backend
-                    // (e.g. hilog for HarmonyOS) instead of leaving a logcat
-                    // command selected that hdc can't run.
-                    if !command_matches_transport(&self.selected_cmd, new_transport) {
-                        self.selected_cmd = self
-                            .cfg
-                            .device
-                            .commands
-                            .iter()
-                            .find(|c| command_matches_transport(c, new_transport))
-                            .cloned()
-                            .unwrap_or_default();
+                    // Also switch the command to one for the new backend (e.g.
+                    // hilog for HarmonyOS) instead of leaving a logcat command
+                    // selected that hdc can't run.
+                    let new_cmds = match new_transport {
+                        Transport::Adb => &self.cfg.device.adb_commands,
+                        Transport::Hdc => &self.cfg.device.hdc_commands,
+                    };
+                    if !new_cmds.iter().any(|c| c == &self.selected_cmd) {
+                        self.selected_cmd = new_cmds.first().cloned().unwrap_or_default();
                     }
                     self.refresh_devices(ctx.clone());
                 }
                 ui.separator();
-                let cmds = self.cfg.device.commands.clone();
-                let transport = self.transport;
+                let cmds = match self.transport {
+                    Transport::Adb => self.cfg.device.adb_commands.clone(),
+                    Transport::Hdc => self.cfg.device.hdc_commands.clone(),
+                };
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")
                     .selected_text(&self.selected_cmd)
                     .width(220.0)
                     .show_ui(ui, |ui| {
-                        // Only show commands for the current backend.
-                        for c in cmds
-                            .iter()
-                            .filter(|c| command_matches_transport(c, transport))
-                        {
+                        for c in &cmds {
                             ui.selectable_value(&mut self.selected_cmd, c.clone(), c);
                         }
                     });
@@ -3577,35 +3561,6 @@ mod tests {
         );
         // A bare, non-shipped string isn't in the table and has no -v flag → Unknown.
         assert_eq!(detect_format_from_cmd("hilog"), LogFormat::Unknown);
-    }
-
-    #[test]
-    fn command_matches_transport_classifies_by_tool() {
-        // logcat → Android only; hilog → HarmonyOS only; shell → both.
-        assert!(command_matches_transport(
-            "logcat -v threadtime",
-            Transport::Adb
-        ));
-        assert!(!command_matches_transport(
-            "logcat -v threadtime",
-            Transport::Hdc
-        ));
-        assert!(command_matches_transport(
-            "hilog -v time -r",
-            Transport::Hdc
-        ));
-        assert!(!command_matches_transport(
-            "hilog -v time -r",
-            Transport::Adb
-        ));
-        assert!(command_matches_transport(
-            "shell cat /proc/kmsg",
-            Transport::Adb
-        ));
-        assert!(command_matches_transport(
-            "shell cat /proc/kmsg",
-            Transport::Hdc
-        ));
     }
 
     #[test]
