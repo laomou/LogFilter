@@ -11,7 +11,7 @@ pub struct Config {
     pub view: ViewConfig,
     pub filters: FiltersConfig,
     pub colors: ColorsConfig,
-    pub adb: AdbConfig,
+    pub device: DeviceConfig,
     pub recent: RecentConfig,
 }
 
@@ -142,11 +142,11 @@ impl ColorsConfig {
     }
 }
 
-use crate::transport::Transport;
+use crate::transport::{self, Transport};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AdbConfig {
+pub struct DeviceConfig {
     pub commands: Vec<String>,
     pub adb_path: Option<String>,
     /// Path to the hdc binary (HarmonyOS). Empty/None = resolve "hdc" on PATH.
@@ -159,22 +159,13 @@ pub struct AdbConfig {
     pub selected_device: String,
 }
 
-impl Default for AdbConfig {
+impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
-            commands: vec![
-                "logcat -v threadtime".into(),
-                "logcat -v time".into(),
-                "logcat -b radio -v time".into(),
-                "logcat -b events -v time".into(),
-                // HarmonyOS hilog (select the HarmonyOS transport to run via hdc).
-                "hilog -v threadtime -r".into(),
-                "hilog -v time -r".into(),
-                "hilog -D 0x2F00 -v time".into(),
-                "hilog -D 0x2D00 -v time".into(),
-                // Kernel log — works via adb shell or hdc shell.
-                "shell cat /proc/kmsg".into(),
-            ],
+            commands: transport::BUILTIN_COMMANDS
+                .iter()
+                .map(|b| b.cmd.to_string())
+                .collect(),
             adb_path: None,
             hdc_path: None,
             transport: Transport::Adb,
@@ -234,26 +225,22 @@ fn load_raw() -> Config {
 /// way an existing config picks up new commands or sheds obsolete ones. Idempotent.
 fn ensure_builtin_commands(cfg: &mut Config) {
     // Drop the obsolete standalone `hilog`: earlier builds injected it, but it's
-    // now superseded by the specific hilog commands below.
-    cfg.adb.commands.retain(|c| c != "hilog");
+    // now superseded by the specific hilog commands in BUILTIN_COMMANDS.
+    cfg.device.commands.retain(|c| c != "hilog");
 
-    for cmd in [
-        "hilog -v threadtime -r",
-        "hilog -v time -r",
-        "hilog -D 0x2F00 -v time",
-        "hilog -D 0x2D00 -v time",
-    ] {
-        if !cfg.adb.commands.iter().any(|c| c == cmd) {
-            cfg.adb.commands.push(cmd.to_string());
+    // Add any built-in command an older config is missing.
+    for b in transport::BUILTIN_COMMANDS {
+        if !cfg.device.commands.iter().any(|c| c == b.cmd) {
+            cfg.device.commands.push(b.cmd.to_string());
         }
     }
 
-    // Keep the kernel-log command last: injecting the hilog commands above (or an
-    // older saved order) can otherwise strand it in the middle of the dropdown.
+    // Keep the kernel-log command last: injecting the commands above (or an older
+    // saved order) can otherwise strand it in the middle of the dropdown.
     const KMSG: &str = "shell cat /proc/kmsg";
-    if let Some(pos) = cfg.adb.commands.iter().position(|c| c == KMSG) {
-        let kmsg = cfg.adb.commands.remove(pos);
-        cfg.adb.commands.push(kmsg);
+    if let Some(pos) = cfg.device.commands.iter().position(|c| c == KMSG) {
+        let kmsg = cfg.device.commands.remove(pos);
+        cfg.device.commands.push(kmsg);
     }
 }
 
@@ -440,7 +427,7 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
                 }
             }
             if !cmds.is_empty() {
-                cfg.adb.commands = cmds;
+                cfg.device.commands = cmds;
             }
         }
     }
@@ -505,16 +492,16 @@ mod tests {
     fn ensure_builtin_commands_injects_hilog_into_old_config() {
         // An older saved config without the hilog command should get it added.
         let mut cfg = Config::default();
-        cfg.adb.commands = vec!["logcat -v threadtime".into()];
+        cfg.device.commands = vec!["logcat -v threadtime".into()];
         ensure_builtin_commands(&mut cfg);
         assert!(
-            cfg.adb.commands.iter().any(|c| c.contains("hilog")),
+            cfg.device.commands.iter().any(|c| c.contains("hilog")),
             "hilog command added"
         );
         // Idempotent — a second call doesn't duplicate.
-        let n = cfg.adb.commands.len();
+        let n = cfg.device.commands.len();
         ensure_builtin_commands(&mut cfg);
-        assert_eq!(cfg.adb.commands.len(), n, "no duplicate on re-run");
+        assert_eq!(cfg.device.commands.len(), n, "no duplicate on re-run");
     }
 
     #[test]
@@ -522,18 +509,18 @@ mod tests {
         // Config from an earlier build: obsolete bare `hilog`, and the kernel-log
         // command stranded before the injected hilog commands.
         let mut cfg = Config::default();
-        cfg.adb.commands = vec![
+        cfg.device.commands = vec![
             "logcat -v threadtime".into(),
             "hilog".into(),
             "shell cat /proc/kmsg".into(),
         ];
         ensure_builtin_commands(&mut cfg);
         assert!(
-            !cfg.adb.commands.iter().any(|c| c == "hilog"),
+            !cfg.device.commands.iter().any(|c| c == "hilog"),
             "standalone hilog removed"
         );
         assert_eq!(
-            cfg.adb.commands.last().map(String::as_str),
+            cfg.device.commands.last().map(String::as_str),
             Some("shell cat /proc/kmsg"),
             "kernel-log command stays last"
         );
@@ -541,17 +528,17 @@ mod tests {
 
     #[test]
     fn transport_roundtrips_and_defaults_to_adb() {
-        assert_eq!(AdbConfig::default().transport, Transport::Adb);
-        // An older config without the transport field loads as adb.
-        let old: Config = toml::from_str("[adb]\n").unwrap();
-        assert_eq!(old.adb.transport, Transport::Adb);
+        assert_eq!(DeviceConfig::default().transport, Transport::Adb);
+        // A config without the transport field loads as adb.
+        let old: Config = toml::from_str("[device]\n").unwrap();
+        assert_eq!(old.device.transport, Transport::Adb);
         // Round-trips hdc + the hdc path.
         let mut cfg = Config::default();
-        cfg.adb.transport = Transport::Hdc;
-        cfg.adb.hdc_path = Some("/opt/harmony/hdc".into());
+        cfg.device.transport = Transport::Hdc;
+        cfg.device.hdc_path = Some("/opt/harmony/hdc".into());
         let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        assert_eq!(back.adb.transport, Transport::Hdc);
-        assert_eq!(back.adb.hdc_path.as_deref(), Some("/opt/harmony/hdc"));
+        assert_eq!(back.device.transport, Transport::Hdc);
+        assert_eq!(back.device.hdc_path.as_deref(), Some("/opt/harmony/hdc"));
     }
 
     #[test]
@@ -562,16 +549,16 @@ mod tests {
         ];
         cfg.filters.find_on = Some(false);
         cfg.filters.highlight_on = Some(true);
-        cfg.adb.selected_cmd = "logcat -b radio -v time".into();
-        cfg.adb.selected_device = "emulator-5554".into();
+        cfg.device.selected_cmd = "logcat -b radio -v time".into();
+        cfg.device.selected_device = "emulator-5554".into();
 
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.view.columns_visible, cfg.view.columns_visible);
         assert_eq!(back.filters.find_on, Some(false));
         assert_eq!(back.filters.highlight_on, Some(true));
-        assert_eq!(back.adb.selected_cmd, "logcat -b radio -v time");
-        assert_eq!(back.adb.selected_device, "emulator-5554");
+        assert_eq!(back.device.selected_cmd, "logcat -b radio -v time");
+        assert_eq!(back.device.selected_device, "emulator-5554");
     }
 
     #[test]
@@ -585,7 +572,7 @@ mod tests {
             cfg.view.columns_visible,
             ViewConfig::default().columns_visible
         );
-        assert_eq!(cfg.adb.selected_cmd, "");
+        assert_eq!(cfg.device.selected_cmd, "");
     }
 
     #[test]
@@ -593,7 +580,7 @@ mod tests {
         let dir = tempdir_new();
         let path = dir.join("rt_config.toml");
         let mut cfg = Config::default();
-        cfg.adb.selected_device = "dev1".into();
+        cfg.device.selected_device = "dev1".into();
         cfg.view.columns_visible[6] = true; // show UID
 
         write_config(&path, &cfg).unwrap();
@@ -603,7 +590,7 @@ mod tests {
             "temp file should be renamed away, not left behind"
         );
         let back = read_config(&path).expect("written config parses");
-        assert_eq!(back.adb.selected_device, "dev1");
+        assert_eq!(back.device.selected_device, "dev1");
         assert!(back.view.columns_visible[6]);
 
         let _ = std::fs::remove_file(&path);
