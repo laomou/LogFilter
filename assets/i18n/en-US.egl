@@ -97,16 +97,16 @@ sh_alt_click = Show only this tag / exclude this tag
 
 # formatted status messages
 status_loaded = Loaded {path} — {n} lines
-status_adb_started = adb {cmd} started
-status_adb_start_failed = adb start failed: {e}
-status_adb_stopped = adb stopped
-status_adb_paused = adb paused
-status_adb_resumed = adb resumed
-status_adb_devices = adb devices: {n} device(s)
-status_adb_devices_zero = no devices
-status_adb_devices_failed = adb devices failed: {e}
-status_adb_ended = adb session ended
-status_adb_ended_err = adb session ended: {e}
+status_dev_started = {tool} {cmd} started
+status_dev_start_failed = {tool} start failed: {e}
+status_dev_stopped = {tool} stopped
+status_dev_paused = {tool} paused
+status_dev_resumed = {tool} resumed
+status_dev_devices = {tool} devices: {n} device(s)
+status_dev_devices_zero = no devices
+status_dev_devices_failed = {tool} devices failed: {e}
+status_dev_ended = {tool} session ended
+status_dev_ended_err = {tool} session ended: {e}
 status_load_truncated = File load truncated by a read error: {e}
 status_failed_open = Failed to open: {e}
 status_failed_open_dropped = Failed to open dropped file: {e}

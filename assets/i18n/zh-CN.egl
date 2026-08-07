@@ -97,16 +97,16 @@ sh_alt_click = 仅显示此标签 / 排除此标签
 
 # formatted status messages
 status_loaded = 已加载 {path} — {n} 行
-status_adb_started = adb {cmd} 已启动
-status_adb_start_failed = adb 启动失败: {e}
-status_adb_stopped = adb 已停止
-status_adb_paused = adb 已暂停
-status_adb_resumed = adb 已恢复
-status_adb_devices = adb 设备: {n} 个
-status_adb_devices_zero = 无设备
-status_adb_devices_failed = adb 设备列表失败: {e}
-status_adb_ended = adb 会话已结束
-status_adb_ended_err = adb 会话已结束: {e}
+status_dev_started = {tool} {cmd} 已启动
+status_dev_start_failed = {tool} 启动失败: {e}
+status_dev_stopped = {tool} 已停止
+status_dev_paused = {tool} 已暂停
+status_dev_resumed = {tool} 已恢复
+status_dev_devices = {tool} 设备: {n} 个
+status_dev_devices_zero = 无设备
+status_dev_devices_failed = {tool} 设备列表失败: {e}
+status_dev_ended = {tool} 会话已结束
+status_dev_ended_err = {tool} 会话已结束: {e}
 status_load_truncated = 文件加载因读取错误中断: {e}
 status_failed_open = 打开失败: {e}
 status_failed_open_dropped = 打开拖入文件失败: {e}

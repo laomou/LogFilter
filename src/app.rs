@@ -807,10 +807,10 @@ impl App {
         ) {
             Ok(s) => {
                 self.adb_session = Some(s);
-                self.status = tr!("status_adb_started", { cmd: &self.selected_cmd });
+                self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
             }
             Err(e) => {
-                self.status = tr!("status_adb_start_failed", { e: &format!("{}", e) });
+                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
             }
         }
     }
@@ -818,7 +818,7 @@ impl App {
     fn adb_stop(&mut self) {
         if let Some(mut s) = self.adb_session.take() {
             s.stop();
-            self.status = tr!("status_adb_stopped");
+            self.status = tr!("status_dev_stopped", { tool: self.transport.binary() });
         }
     }
 
@@ -827,9 +827,9 @@ impl App {
             let new = !s.is_paused();
             s.set_paused(new);
             self.status = if new {
-                tr!("status_adb_paused")
+                tr!("status_dev_paused", { tool: self.transport.binary() })
             } else {
-                tr!("status_adb_resumed")
+                tr!("status_dev_resumed", { tool: self.transport.binary() })
             };
         }
     }
@@ -1066,7 +1066,7 @@ impl App {
             })
         {
             self.device_refresh_rx = None;
-            self.status = tr!("status_adb_devices_failed", { e: &format!("{e}") });
+            self.status = tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &format!("{e}") });
         }
     }
 
@@ -1086,14 +1086,14 @@ impl App {
                     self.selected_device = String::new();
                 }
                 self.status = if n == 0 {
-                    tr!("status_adb_devices_zero")
+                    tr!("status_dev_devices_zero")
                 } else {
-                    tr!("status_adb_devices", { n: n })
+                    tr!("status_dev_devices", { tool: self.transport.binary(), n: n })
                 };
             }
             Err(e) => {
                 self.adb_devices.clear();
-                self.status = tr!("status_adb_devices_failed", { e: &e });
+                self.status = tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
             }
         }
     }
@@ -1113,7 +1113,8 @@ impl App {
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.device_refresh_rx = None;
-                self.status = tr!("status_adb_devices_failed", {
+                self.status = tr!("status_dev_devices_failed", {
+                    tool: self.transport.binary(),
                     e: &"device probe terminated unexpectedly".to_string()
                 });
             }
@@ -2192,9 +2193,9 @@ impl eframe::App for App {
             s.reap();
             let err = s.stderr_text();
             self.status = if err.is_empty() {
-                tr!("status_adb_ended")
+                tr!("status_dev_ended", { tool: self.transport.binary() })
             } else {
-                tr!("status_adb_ended_err", { e: &err })
+                tr!("status_dev_ended_err", { tool: self.transport.binary(), e: &err })
             };
         }
 
