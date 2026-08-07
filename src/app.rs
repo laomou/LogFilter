@@ -1,11 +1,11 @@
-use crate::adb;
-use crate::config::{self, parse_color, Config, Transport};
+use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use crate::io::{read_appended, send_decoded_lines, send_utf8_lines, Tail};
 use crate::lock::{MutexExt, RwLockExt};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
+use crate::transport::{self, Transport};
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
@@ -58,7 +58,7 @@ pub struct App {
 
     // adb
     pub line_tx: Sender<(u64, String)>,
-    pub adb_session: Option<adb::Session>,
+    pub adb_session: Option<transport::Session>,
     pub adb_devices: Vec<String>,
     pub selected_device: String,
     pub selected_cmd: String,
@@ -781,9 +781,9 @@ impl App {
             None
         } else {
             // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
-            Some(adb::device_serial(&self.selected_device))
+            Some(transport::device_serial(&self.selected_device))
         };
-        match adb::Session::start(
+        match transport::Session::start(
             self.transport,
             self.transport_override().as_deref(),
             device,
@@ -1038,14 +1038,14 @@ impl App {
         if self.device_refresh_rx.is_some() {
             return;
         }
-        let transport = self.transport;
+        let tsp = self.transport;
         let override_path = self.transport_override();
         let (tx, rx) = bounded(1);
         self.device_refresh_rx = Some(rx);
         if let Err(e) = thread::Builder::new()
             .name("adb-devices".into())
             .spawn(move || {
-                let result = adb::list_devices(transport, override_path.as_deref())
+                let result = transport::list_devices(tsp, override_path.as_deref())
                     .map_err(|e| e.to_string());
                 let _ = tx.send(result);
                 ctx.request_repaint();

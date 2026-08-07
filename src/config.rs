@@ -142,45 +142,7 @@ impl ColorsConfig {
     }
 }
 
-/// Device-connector backend. adb (Android) and hdc (HarmonyOS) differ in the
-/// binary name, the command that lists devices, and the flag that selects one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum Transport {
-    #[default]
-    Adb,
-    Hdc,
-}
-
-impl Transport {
-    /// Default binary name, resolved against PATH unless a path override is set.
-    pub fn binary(self) -> &'static str {
-        match self {
-            Transport::Adb => "adb",
-            Transport::Hdc => "hdc",
-        }
-    }
-    /// Args that list connected devices (`adb devices` / `hdc list targets`).
-    pub fn list_args(self) -> &'static [&'static str] {
-        match self {
-            Transport::Adb => &["devices"],
-            Transport::Hdc => &["list", "targets"],
-        }
-    }
-    /// Flag selecting a specific device by serial/connect-key.
-    pub fn device_flag(self) -> &'static str {
-        match self {
-            Transport::Adb => "-s",
-            Transport::Hdc => "-t",
-        }
-    }
-    /// Human-readable label for the transport picker.
-    pub fn label(self) -> &'static str {
-        match self {
-            Transport::Adb => "Android (adb)",
-            Transport::Hdc => "HarmonyOS (hdc)",
-        }
-    }
-}
+use crate::transport::Transport;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

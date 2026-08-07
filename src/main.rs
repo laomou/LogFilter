@@ -3,7 +3,6 @@
     windows_subsystem = "windows"
 )]
 
-mod adb;
 mod app;
 mod config;
 mod filter;
@@ -12,6 +11,7 @@ mod io;
 mod lock;
 mod model;
 mod parser;
+mod transport;
 
 use std::path::PathBuf;
 

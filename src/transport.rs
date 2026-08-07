@@ -1,12 +1,54 @@
-use crate::config::Transport;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Device-connector backend. adb (Android) and hdc (HarmonyOS) differ only in
+/// the binary name, the command that lists devices, and the flag that selects
+/// one — everything else (streaming, pause buffering, stderr) is shared, so they
+/// live in one module behind this enum rather than separate adb.rs/hdc.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Transport {
+    #[default]
+    Adb,
+    Hdc,
+}
+
+impl Transport {
+    /// Default binary name, resolved against PATH unless a path override is set.
+    pub fn binary(self) -> &'static str {
+        match self {
+            Transport::Adb => "adb",
+            Transport::Hdc => "hdc",
+        }
+    }
+    /// Args that list connected devices (`adb devices` / `hdc list targets`).
+    pub fn list_args(self) -> &'static [&'static str] {
+        match self {
+            Transport::Adb => &["devices"],
+            Transport::Hdc => &["list", "targets"],
+        }
+    }
+    /// Flag selecting a specific device by serial/connect-key.
+    pub fn device_flag(self) -> &'static str {
+        match self {
+            Transport::Adb => "-s",
+            Transport::Hdc => "-t",
+        }
+    }
+    /// Human-readable label for the transport picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Transport::Adb => "Android (adb)",
+            Transport::Hdc => "HarmonyOS (hdc)",
+        }
+    }
+}
 
 /// Windows CREATE_NO_WINDOW: suppresses the black cmd.exe window that would
 /// otherwise flash for every child process when running as a GUI (windows
