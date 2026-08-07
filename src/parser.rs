@@ -329,6 +329,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_harmonyos_hilog_output() {
+        // Verbatim lines from `hdc hilog` on a real HarmonyOS device (all -v
+        // variants emit pid+tid and a `A#####/tag` field). The tag can be a
+        // multi-segment path and the message can contain `:` and `[...]`.
+        let (e, f) = parse_line(
+            "08-07 12:02:47.453 23285 23285 W A06666/AppGalleryService/AG/AppGallery: \
+             [AppRunModeImpl]:isAgreedFromSettings cache, return from:ServiceInstance"
+                .to_string(),
+        );
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.date(), "08-07");
+        assert_eq!(e.time(), "12:02:47.453");
+        assert_eq!(e.pid(), "23285");
+        assert_eq!(e.tid(), "23285");
+        assert_eq!(e.level, LevelMask::W);
+        assert_eq!(e.tag(), "AppGalleryService/AG/AppGallery");
+        assert_eq!(
+            e.message(),
+            "[AppRunModeImpl]:isAgreedFromSettings cache, return from:ServiceInstance"
+        );
+
+        // Package-name-style tag.
+        let (e, f) = parse_line(
+            "08-07 12:02:47.772 23643 23643 I \
+             A02F08/com.huawei.hmos.brid/Security_BRID_Service: local RiskFactor is valid."
+                .to_string(),
+        );
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.tag(), "com.huawei.hmos.brid/Security_BRID_Service");
+        assert_eq!(e.message(), "local RiskFactor is valid.");
+
+        // Message leads with bracketed hex trace ids — must not confuse tag/domain.
+        let (e, f) = parse_line(
+            "08-07 12:07:58.900 32181 32181 I A0A5A5/com.huawei.hmos.hiviewcare/Diagnosis: \
+             [a92ab15a1ecb690 4ad1ee 3d06e79][HCWatchCloudRegister]allWatchInfo size is 0"
+                .to_string(),
+        );
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.tag(), "com.huawei.hmos.hiviewcare/Diagnosis");
+        assert_eq!(
+            e.message(),
+            "[a92ab15a1ecb690 4ad1ee 3d06e79][HCWatchCloudRegister]allWatchInfo size is 0"
+        );
+    }
+
+    #[test]
     fn android_threadtime_not_misparsed_as_hilog() {
         // A plain Android tag has no "hexdomain/" prefix, so HiLog must not claim
         // it — it stays ThreadTime with the whole tag intact.
