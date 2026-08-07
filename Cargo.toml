@@ -1,6 +1,6 @@
 [package]
 name = "logfilter"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Desktop viewer/filter for Android (logcat) and HarmonyOS (hilog) logs"
 license = "Apache-2.0"
