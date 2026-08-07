@@ -170,6 +170,14 @@ impl Session {
                         tx.send((epoch, l)).is_ok()
                     })
                 });
+                // Stream ended (EOF / killed) — flush anything still buffered from
+                // a pause that was never resumed, so those lines aren't lost when
+                // the device disconnects or a finite `logcat -d` dump ends mid-pause.
+                for line in buffer.drain(..) {
+                    if tx.send((epoch, line)).is_err() {
+                        break;
+                    }
+                }
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
                 ended_thr.store(true, Ordering::Release);
@@ -524,6 +532,36 @@ mod tests {
             buffer.iter().cloned().collect::<Vec<_>>(),
             vec!["y", "z", "w"],
             "cap=3 drops the oldest ('x')"
+        );
+    }
+
+    #[test]
+    fn buffered_lines_flush_when_stream_ends_while_paused() {
+        // Pause before the child emits, so every line is buffered; then the child
+        // exits. The buffer must be flushed on EOF, not dropped with the thread.
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let mut session = Session::start(
+            Some("/bin/sh"),
+            None,
+            "-c 'sleep 0.1; printf \"a\\nb\\nc\\n\"'",
+            tx,
+            1,
+        )
+        .expect("shell-backed session should start");
+        session.set_paused(true);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !session.has_ended() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(session.has_ended(), "child should exit");
+        session.reap();
+
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(
+            lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "lines buffered while paused must survive stream-end"
         );
     }
 }
