@@ -130,9 +130,10 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                         span(&c, "pid"),
                         span(&c, "tid"),
                         EMPTY,
-                        // Tag column shows just the tag (after the domain/), so
-                        // tag filtering stays clean; the numeric domain is dropped.
-                        trim_span(s, span(&c, "tag")),
+                        // Tag column shows the full `domain/tag` (e.g.
+                        // `I02C01/MyTag`) — the HarmonyOS domain identifies the
+                        // subsystem, so keep it visible rather than dropping it.
+                        trim_span(s, (span(&c, "domain").0, span(&c, "tag").1)),
                         span(&c, "msg"),
                     ],
                 )
@@ -313,7 +314,7 @@ mod tests {
         assert_eq!(e.pid(), "1234");
         assert_eq!(e.tid(), "5678");
         assert_eq!(e.level, LevelMask::I);
-        assert_eq!(e.tag(), "MyApp", "domain stripped, clean tag");
+        assert_eq!(e.tag(), "A03D00/MyApp", "full domain/tag shown");
         assert_eq!(e.message(), "key frame id: 0");
     }
 
@@ -325,7 +326,7 @@ mod tests {
         assert_eq!(f, LogFormat::HiLog);
         assert_eq!(e.time(), "15:43:53.405123");
         assert_eq!(e.level, LevelMask::W);
-        assert_eq!(e.tag(), "HiSysEvent");
+        assert_eq!(e.tag(), "C01719/HiSysEvent");
         assert_eq!(e.message(), "warn body");
     }
 
@@ -345,7 +346,7 @@ mod tests {
         assert_eq!(e.pid(), "23285");
         assert_eq!(e.tid(), "23285");
         assert_eq!(e.level, LevelMask::W);
-        assert_eq!(e.tag(), "AppGalleryService/AG/AppGallery");
+        assert_eq!(e.tag(), "A06666/AppGalleryService/AG/AppGallery");
         assert_eq!(
             e.message(),
             "[AppRunModeImpl]:isAgreedFromSettings cache, return from:ServiceInstance"
@@ -358,7 +359,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(f, LogFormat::HiLog);
-        assert_eq!(e.tag(), "com.huawei.hmos.brid/Security_BRID_Service");
+        assert_eq!(e.tag(), "A02F08/com.huawei.hmos.brid/Security_BRID_Service");
         assert_eq!(e.message(), "local RiskFactor is valid.");
 
         // Message leads with bracketed hex trace ids — must not confuse tag/domain.
@@ -368,7 +369,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(f, LogFormat::HiLog);
-        assert_eq!(e.tag(), "com.huawei.hmos.hiviewcare/Diagnosis");
+        assert_eq!(e.tag(), "A0A5A5/com.huawei.hmos.hiviewcare/Diagnosis");
         assert_eq!(
             e.message(),
             "[a92ab15a1ecb690 4ad1ee 3d06e79][HCWatchCloudRegister]allWatchInfo size is 0"
@@ -384,7 +385,7 @@ mod tests {
         );
         assert_eq!(f, LogFormat::HiLog);
         assert_eq!(e.pid(), "0");
-        assert_eq!(e.tag(), "HiLog", "type-letter domain (I00000) stripped");
+        assert_eq!(e.tag(), "I00000/HiLog", "type-letter domain kept in tag");
         assert_eq!(e.message(), "========Zeroth log of type: init");
 
         let (e, f) = parse_line(
@@ -393,7 +394,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(f, LogFormat::HiLog);
-        assert_eq!(e.tag(), "hmos_cust_carrier_mount/CustCarrierMount");
+        assert_eq!(e.tag(), "I02C01/hmos_cust_carrier_mount/CustCarrierMount");
         assert_eq!(e.message(), "MountCarrierToShared start");
     }
 
