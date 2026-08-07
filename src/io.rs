@@ -55,7 +55,11 @@ pub fn send_utf8_lines(
     if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
         // UTF-16 BOM detected: pick LE/BE and delegate to the decoded path.
         let is_le = bom.starts_with(&[0xFF, 0xFE]);
-        let file2 = reader.into_inner();
+        let mut file2 = reader.into_inner();
+        // fill_buf() advanced the file position (up to the BufReader capacity)
+        // and into_inner() discards that buffer, so rewind — otherwise the
+        // delegate reads from ~8 KiB in and the file's first chunk is skipped.
+        file2.seek(SeekFrom::Start(0))?;
         let enc = if is_le {
             encoding_rs::UTF_16LE
         } else {
@@ -185,7 +189,14 @@ fn send_decoded_lines_with_enc(
     // All encodings here tail incrementally: UTF-8 and the byte-safe legacy
     // codepages split on raw `\n`, and UTF-16 is handled specially in
     // `read_appended` (decode code units, split on the '\n' character).
-    let tail_for = |bytes: u64| Tail::Append { offset: bytes, enc };
+    let is_utf16 = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
+    let tail_for = |bytes: u64| {
+        // UTF-16 tails by whole code units, so a base offset caught mid-unit
+        // (odd — the file was flushed half a code unit) would misalign every
+        // later read and stall the tail. Round down to a whole code unit.
+        let offset = if is_utf16 { bytes & !1 } else { bytes };
+        Tail::Append { offset, enc }
+    };
     loop {
         let n = reader.read(&mut raw_buf)?;
         if n == 0 {
@@ -267,7 +278,10 @@ pub fn read_appended(
     // reloading the whole file on every size change.)
     if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
         let usable = raw.len() & !1; // whole code units only; hold back a stray byte
-        let (text, _, _) = enc.decode(&raw[..usable]);
+                                     // decode_without_bom_handling: a plain decode() would BOM-sniff the chunk
+                                     // and, if it happens to start with BOM-like bytes (a real U+FEFF char, or
+                                     // 0xFFFE), drop a char or switch encoding — drifting the byte offset.
+        let (text, _) = enc.decode_without_bom_handling(&raw[..usable]);
         let Some(nl) = text.rfind('\n') else {
             return Ok(Appended {
                 offset,
@@ -412,10 +426,17 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        // send_utf8_lines detects UTF-16 BOM and delegates to decoded path.
-        // Just confirm it doesn't panic; correct decoding tested after PR #21 merge.
-        let _ = send_utf8_lines(file, tx, 1, epoch);
-        let _lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        // send_utf8_lines detects the UTF-16 BOM and delegates to the decoded
+        // path, which must read from the *start* of the file (the BOM detection
+        // uses fill_buf, which advances the position — the delegate has to rewind).
+        let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(
+            lines,
+            vec!["hello".to_string(), "world".to_string()],
+            "UTF-16 content must be decoded from the start, not skipped"
+        );
+        assert_eq!(tail.encoding_name(), "UTF-16LE");
         let _ = std::fs::remove_file(&tmp);
     }
 
