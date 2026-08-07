@@ -1,7 +1,7 @@
 # LogFilter
 
+[![crates.io](https://img.shields.io/crates/v/logfilter.svg?logo=rust)](https://crates.io/crates/logfilter)
 [![CI](https://github.com/laomou/LogFilter/actions/workflows/ci.yml/badge.svg)](https://github.com/laomou/LogFilter/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/laomou/LogFilter?logo=github&color=blue)](https://github.com/laomou/LogFilter/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 [English](README.md)
@@ -22,10 +22,10 @@ LogFilter 是一款用 Rust 和 egui 开发的桌面端日志查看与过滤工�
 
 ## 安装
 
-装好 Rust 工具链后，从源码构建并安装 `logfilter` 可执行文件：
+用 Cargo 安装最新发布版（需要 Rust 工具链）：
 
 ```sh
-cargo install --git https://github.com/laomou/LogFilter
+cargo install logfilter
 ```
 
 或从 [releases 页面](https://github.com/laomou/LogFilter/releases) 下载 Windows / Linux / macOS 预编译包。

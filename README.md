@@ -1,7 +1,7 @@
 # LogFilter
 
+[![crates.io](https://img.shields.io/crates/v/logfilter.svg?logo=rust)](https://crates.io/crates/logfilter)
 [![CI](https://github.com/laomou/LogFilter/actions/workflows/ci.yml/badge.svg)](https://github.com/laomou/LogFilter/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/laomou/LogFilter?logo=github&color=blue)](https://github.com/laomou/LogFilter/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 [中文](README_zh.md)
@@ -22,10 +22,10 @@ LogFilter is a desktop viewer and filter for Android (logcat via adb) and Harmon
 
 ## Install
 
-With a Rust toolchain installed, build and install the `logfilter` binary from source:
+Install the latest release with Cargo (needs a Rust toolchain):
 
 ```sh
-cargo install --git https://github.com/laomou/LogFilter
+cargo install logfilter
 ```
 
 Or download a prebuilt binary for Windows / Linux / macOS from the [releases page](https://github.com/laomou/LogFilter/releases).
