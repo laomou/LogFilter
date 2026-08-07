@@ -37,3 +37,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+
+  publish-dry-run:
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # Verify the crate is publishable (packaging + a clean build of the
+      # packaged sources) without uploading. The real publish runs in
+      # release.yml on a version tag.
+      - run: cargo publish --dry-run --locked
