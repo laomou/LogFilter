@@ -1,20 +1,34 @@
 # LogFilter
 
+[![CI](https://github.com/laomou/LogFilter/actions/workflows/ci.yml/badge.svg)](https://github.com/laomou/LogFilter/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/laomou/LogFilter?logo=github&color=blue)](https://github.com/laomou/LogFilter/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 [中文](README_zh.md)
 
-LogFilter is a desktop Android logcat viewer and filter written in Rust with egui, focused on opening large log files, streaming adb output, and quickly narrowing logs by level, process, thread, tag, and message text.
+LogFilter is a desktop viewer and filter for Android (logcat via adb) and HarmonyOS (hilog via hdc) logs, written in Rust with egui, focused on opening large log files, streaming device output, and quickly narrowing logs by level, process, thread, tag, and message text.
 
 ## Features
 
 - Open local log files, including drag-and-drop and recent-file history.
-- Stream logs from adb with selectable device and command presets.
-- Parse common Android log formats: `threadtime`, `time`, `brief`, and kernel-style lines.
+- Stream logs from a device over adb (Android) or hdc (HarmonyOS), with selectable device and command presets.
+- Parse common Android logcat formats (`threadtime`, `time`, `brief`, kernel) and HarmonyOS `hilog`.
 - Filter by log level, PID, TID, tag, message text, bookmarks, and errors.
 - Highlight matching words separately from filtering.
 - Toggle bookmarks by double-clicking rows and navigate via the right-side indicator.
 - Save the currently filtered result to a timestamped text file.
-- Customize visible columns, font size, table font, language, colors, encoding, and adb command presets.
+- Customize visible columns, font size, table font, language, colors, encoding, and device command presets.
 - Supports English and Chinese UI text.
+
+## Install
+
+With a Rust toolchain installed, build and install the `logfilter` binary from source:
+
+```sh
+cargo install --git https://github.com/laomou/LogFilter
+```
+
+Or download a prebuilt binary for Windows / Linux / macOS from the [releases page](https://github.com/laomou/LogFilter/releases).
 
 ## Build
 
