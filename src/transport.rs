@@ -514,12 +514,27 @@ mod tests {
 
     #[test]
     fn parse_hdc_targets_lists_keys_and_handles_empty() {
-        assert_eq!(parse_hdc_targets("[Empty]\n"), Vec::<String>::new());
+        // Real hdc emits CRLF line endings and prints `[Empty]` with no device.
+        assert_eq!(parse_hdc_targets("[Empty]\r\n"), Vec::<String>::new());
         assert_eq!(
-            parse_hdc_targets("key123\nabc-def\n"),
+            parse_hdc_targets("key123\r\nabc-def\r\n"),
             vec!["key123".to_string(), "abc-def".to_string()]
         );
         assert_eq!(parse_hdc_targets("  \n key1 \n"), vec!["key1".to_string()]);
+    }
+
+    /// End-to-end check against a real hdc binary. Ignored by default; run with:
+    /// `HDC_BIN=/path/to/hdc LD_LIBRARY_PATH=/path/to/hdc-libs \
+    ///  cargo test -- --ignored real_hdc_list_devices --nocapture`
+    /// With no device connected hdc prints `[Empty]`, so the parsed list is empty.
+    #[test]
+    #[ignore = "requires a real hdc binary; set HDC_BIN"]
+    fn real_hdc_list_devices() {
+        let Ok(bin) = std::env::var("HDC_BIN") else {
+            return;
+        };
+        let devices = list_devices(Transport::Hdc, Some(&bin)).expect("`hdc list targets` runs");
+        eprintln!("real hdc reported devices: {devices:?}");
     }
 
     #[test]
