@@ -175,6 +175,32 @@ impl Default for DeviceConfig {
     }
 }
 
+impl DeviceConfig {
+    /// The command dropdown list for a backend.
+    pub fn commands(&self, transport: Transport) -> &[String] {
+        match transport {
+            Transport::Adb => &self.adb_commands,
+            Transport::Hdc => &self.hdc_commands,
+        }
+    }
+
+    /// Mutable command list for a backend (to inject missing built-ins).
+    fn commands_mut(&mut self, transport: Transport) -> &mut Vec<String> {
+        match transport {
+            Transport::Adb => &mut self.adb_commands,
+            Transport::Hdc => &mut self.hdc_commands,
+        }
+    }
+
+    /// The user's explicit binary-path override for a backend, if any.
+    pub fn binary_override(&self, transport: Transport) -> Option<&str> {
+        match transport {
+            Transport::Adb => self.adb_path.as_deref(),
+            Transport::Hdc => self.hdc_path.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecentConfig {
@@ -226,10 +252,7 @@ fn load_raw() -> Config {
 fn ensure_builtin_commands(cfg: &mut Config) {
     // Add any built-in command an older config is missing, to its backend's list.
     for b in transport::BUILTIN_COMMANDS {
-        let list = match b.transport {
-            Transport::Adb => &mut cfg.device.adb_commands,
-            Transport::Hdc => &mut cfg.device.hdc_commands,
-        };
+        let list = cfg.device.commands_mut(b.transport);
         if !list.iter().any(|c| c == b.cmd) {
             list.push(b.cmd.to_string());
         }

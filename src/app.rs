@@ -24,7 +24,7 @@ pub struct App {
     pub model: Arc<RwLock<Model>>,
     pub shared_filter: Arc<RwLock<FilterSpec>>,
     pub gen: Arc<AtomicU64>,
-    /// Monotonic id of the current line source (file load or adb session). Each
+    /// Monotonic id of the current line source (file load or device session). Each
     /// new load/adb-run bumps it; the ingest thread drops any queued line whose
     /// epoch != this, so a superseded load can't interleave into the new one.
     pub source_epoch: Arc<AtomicU64>,
@@ -56,18 +56,19 @@ pub struct App {
     // Populated once at startup via list_user_font_stems().
     pub user_font_stems: Vec<(String, String)>,
 
-    // adb
+    // device session (adb / hdc)
     pub line_tx: Sender<(u64, String)>,
-    pub adb_session: Option<transport::Session>,
-    pub adb_devices: Vec<String>,
+    pub session: Option<transport::Session>,
+    pub devices: Vec<String>,
     pub selected_device: String,
     pub selected_cmd: String,
     /// Device-connector backend (adb / hdc). Chosen in the toolbar, persisted.
     pub transport: Transport,
     pub auto_scroll: bool,
-    /// Result channel for an in-flight `adb devices` probe. Keeping the probe
-    /// off the UI thread prevents startup and the refresh button from freezing
-    /// the window when adb is slow or unavailable.
+    /// Result channel for an in-flight device-list probe (`adb devices` /
+    /// `hdc list targets`). Keeping the probe off the UI thread prevents startup
+    /// and the refresh button from freezing the window when the connector is
+    /// slow or unavailable.
     device_refresh_rx: Option<Receiver<Result<Vec<String>, String>>>,
 
     /// egui context, kept so background loaders/tail pollers can request a
@@ -80,7 +81,7 @@ pub struct App {
     /// Encoding actually used for the current file load, resolved by the loader
     /// (notably "Local" → the sniffed UTF-8/legacy codepage). Shown in the status
     /// bar so the user sees the real encoding, not just their menu choice.
-    /// `None` until the initial read finishes (or when the source is adb).
+    /// `None` until the initial read finishes (or when the source is a device session).
     detected_encoding: Arc<Mutex<Option<String>>>,
 
     // Per-frame caches: recomputed lazily when source data changes.
@@ -293,7 +294,7 @@ impl App {
         let mut app = Self::from_ctx(&cc.egui_ctx, cfg, initial_file);
         // Pre-populate the device combo on startup so the user doesn't have to
         // click ↻ once before they can pick a device. Skipped in the test-only
-        // constructor since it shells out to adb.
+        // constructor since it shells out to the device connector.
         app.refresh_devices(cc.egui_ctx.clone());
         app
     }
@@ -301,7 +302,7 @@ impl App {
     /// Core constructor shared by the production `new` and the test harness.
     /// Takes an `egui::Context` (not the eframe `CreationContext`) and an
     /// already-loaded `Config` so tests can inject a default config without
-    /// touching the user's real config file or spawning an adb probe.
+    /// touching the user's real config file or spawning a device probe.
     fn from_ctx(ctx: &egui::Context, cfg: Config, initial_file: Option<PathBuf>) -> Self {
         apply_theme(ctx, &cfg.view.theme);
         tune_table_visuals(ctx);
@@ -328,11 +329,9 @@ impl App {
         let selected_cmd = if !cfg.device.selected_cmd.is_empty() {
             cfg.device.selected_cmd.clone()
         } else {
-            let cmds = match transport {
-                Transport::Adb => &cfg.device.adb_commands,
-                Transport::Hdc => &cfg.device.hdc_commands,
-            };
-            cmds.first()
+            cfg.device
+                .commands(transport)
+                .first()
                 .cloned()
                 .unwrap_or_else(|| "logcat -v threadtime".into())
         };
@@ -377,8 +376,8 @@ impl App {
             last_window_size: None,
             user_font_stems: font_stems,
             line_tx,
-            adb_session: None,
-            adb_devices: Vec::new(),
+            session: None,
+            devices: Vec::new(),
             selected_device,
             selected_cmd,
             transport,
@@ -423,7 +422,7 @@ impl App {
     }
 
     /// Test-only constructor: builds an `App` on the given egui context with a
-    /// default `Config`, skipping config-file I/O and the adb device probe so
+    /// default `Config`, skipping config-file I/O and the device probe so
     /// UI tests run hermetically.
     #[cfg(test)]
     pub fn new_for_test(ctx: &egui::Context) -> Self {
@@ -436,8 +435,8 @@ impl App {
         // duplicate open in the reader thread.
         let file = std::fs::File::open(path)?;
 
-        // Stop any adb session so its lines don't interleave with the file.
-        self.adb_stop();
+        // Stop any device session so its lines don't interleave with the file.
+        self.stop_session();
 
         // Claim a fresh source epoch *before* clearing so any lines still queued
         // from a previous load/adb are dropped by the ingest thread. Write the
@@ -750,14 +749,16 @@ fn detect_format_from_cmd(cmd: &str) -> LogFormat {
 impl App {
     /// Binary path override for the current transport (adb_path / hdc_path).
     fn transport_override(&self) -> Option<String> {
-        match self.transport {
-            Transport::Adb => self.cfg.device.adb_path.clone(),
-            Transport::Hdc => self.cfg.device.hdc_path.clone(),
-        }
+        self.cfg
+            .device
+            .binary_override(self.transport)
+            .map(str::to_string)
     }
 
-    fn adb_run(&mut self) {
-        self.adb_stop();
+    /// Start (or restart) a streaming session for the selected transport, device,
+    /// and command, replacing any session or file tail currently feeding the view.
+    fn run_session(&mut self) {
+        self.stop_session();
         // Write the format hint before bumping the epoch so the ingest thread
         // never races between seeing the new epoch and reading a stale hint.
         *self.source_format_hint.lock_recover() = detect_format_from_cmd(&self.selected_cmd);
@@ -793,7 +794,7 @@ impl App {
             epoch,
         ) {
             Ok(s) => {
-                self.adb_session = Some(s);
+                self.session = Some(s);
                 self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
             }
             Err(e) => {
@@ -802,15 +803,15 @@ impl App {
         }
     }
 
-    fn adb_stop(&mut self) {
-        if let Some(mut s) = self.adb_session.take() {
+    fn stop_session(&mut self) {
+        if let Some(mut s) = self.session.take() {
             s.stop();
             self.status = tr!("status_dev_stopped", { tool: self.transport.binary() });
         }
     }
 
-    fn adb_pause_toggle(&mut self) {
-        if let Some(s) = &self.adb_session {
+    fn toggle_pause(&mut self) {
+        if let Some(s) = &self.session {
             let new = !s.is_paused();
             s.set_paused(new);
             self.status = if new {
@@ -826,12 +827,12 @@ impl App {
         // feeding this cleared view — otherwise the tail poller would keep
         // appending new lines into a table the user just emptied.
         //
-        // Exception: while an adb session is live, keep the epoch — the session
+        // Exception: while a device session is live, keep the epoch — the session
         // bakes it into every line it emits, so bumping here would make all of
         // its *future* lines be dropped by the ingest thread, silently killing
         // the stream. Clearing during capture should empty the view yet keep new
-        // lines flowing. (adb_run supersedes any file-tail, so none is active.)
-        if self.adb_session.is_none() {
+        // lines flowing. (run_session supersedes any file-tail, so none is active.)
+        if self.session.is_none() {
             self.source_epoch.fetch_add(1, Ordering::AcqRel);
         }
         {
@@ -1044,7 +1045,7 @@ impl App {
         let (tx, rx) = bounded(1);
         self.device_refresh_rx = Some(rx);
         if let Err(e) = thread::Builder::new()
-            .name("adb-devices".into())
+            .name("device-list".into())
             .spawn(move || {
                 let result = transport::list_devices(tsp, override_path.as_deref())
                     .map_err(|e| e.to_string());
@@ -1063,12 +1064,12 @@ impl App {
         match result {
             Ok(list) => {
                 let n = list.len();
-                self.adb_devices = list;
+                self.devices = list;
                 // Preserve current selection if still present; otherwise pick
                 // first device but never overwrite an explicit user choice
                 // unless it disappeared.
                 if !self.selected_device.is_empty()
-                    && !self.adb_devices.iter().any(|d| d == &self.selected_device)
+                    && !self.devices.iter().any(|d| d == &self.selected_device)
                 {
                     self.selected_device = String::new();
                 }
@@ -1079,7 +1080,7 @@ impl App {
                 };
             }
             Err(e) => {
-                self.adb_devices.clear();
+                self.devices.clear();
                 self.status =
                     tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
             }
@@ -2170,14 +2171,14 @@ impl eframe::App for App {
             self.status = tr!("status_load_truncated", { e: &msg });
         }
 
-        // Detect an adb session that ended on its own (device unplugged, adb
+        // Detect a device session that ended on its own (device unplugged, adb
         // exited, bad command) so the UI stops showing it as live and surfaces
         // any captured stderr instead of a silently frozen stream.
-        if self.adb_session.as_ref().is_some_and(|s| s.has_ended()) {
+        if self.session.as_ref().is_some_and(|s| s.has_ended()) {
             // The session ended on its own (stdout closed). Reap it first — that
             // joins the stderr worker so the captured failure reason is complete,
             // instead of racing the stdout/stderr close and losing it.
-            let mut s = self.adb_session.take().expect("checked is_some above");
+            let mut s = self.session.take().expect("checked is_some above");
             s.reap();
             let err = s.stderr_text();
             self.status = if err.is_empty() {
@@ -2522,7 +2523,7 @@ impl App {
 
             // Row 3: transport + adb/hdc toolbar + Goto + Auto-scroll
             ui.horizontal_wrapped(|ui| {
-                let running = self.adb_session.is_some();
+                let running = self.session.is_some();
                 // Transport picker: adb (Android) vs hdc (HarmonyOS). Switching
                 // changes the binary, the device-list command, and the -s/-t flag.
                 let mut new_transport = self.transport;
@@ -2545,24 +2546,18 @@ impl App {
                     // Devices/keys differ per backend — drop the stale selection
                     // and re-probe with the new transport's list command.
                     self.selected_device.clear();
-                    self.adb_devices.clear();
+                    self.devices.clear();
                     // Also switch the command to one for the new backend (e.g.
                     // hilog for HarmonyOS) instead of leaving a logcat command
                     // selected that hdc can't run.
-                    let new_cmds = match new_transport {
-                        Transport::Adb => &self.cfg.device.adb_commands,
-                        Transport::Hdc => &self.cfg.device.hdc_commands,
-                    };
+                    let new_cmds = self.cfg.device.commands(new_transport);
                     if !new_cmds.iter().any(|c| c == &self.selected_cmd) {
                         self.selected_cmd = new_cmds.first().cloned().unwrap_or_default();
                     }
                     self.refresh_devices(ctx.clone());
                 }
                 ui.separator();
-                let cmds = match self.transport {
-                    Transport::Adb => self.cfg.device.adb_commands.clone(),
-                    Transport::Hdc => self.cfg.device.hdc_commands.clone(),
-                };
+                let cmds = self.cfg.device.commands(self.transport).to_vec();
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")
                     .selected_text(&self.selected_cmd)
@@ -2573,7 +2568,7 @@ impl App {
                         }
                     });
                 ui.label(tr!("device"));
-                let devices = self.adb_devices.clone();
+                let devices = self.devices.clone();
                 egui::ComboBox::from_id_salt("device")
                     .selected_text(if self.selected_device.is_empty() {
                         tr!("device_any")
@@ -2604,10 +2599,10 @@ impl App {
                     .button(if running { tr!("restart") } else { tr!("run") })
                     .clicked()
                 {
-                    self.adb_run();
+                    self.run_session();
                 }
                 let pause_label = self
-                    .adb_session
+                    .session
                     .as_ref()
                     .map(|s| {
                         if s.is_paused() {
@@ -2621,13 +2616,13 @@ impl App {
                     .add_enabled(running, egui::Button::new(pause_label))
                     .clicked()
                 {
-                    self.adb_pause_toggle();
+                    self.toggle_pause();
                 }
                 if ui
                     .add_enabled(running, egui::Button::new(tr!("stop")))
                     .clicked()
                 {
-                    self.adb_stop();
+                    self.stop_session();
                 }
                 if ui.button(tr!("clear")).clicked() {
                     self.clear();
@@ -3571,7 +3566,7 @@ mod tests {
 
         app.apply_devices_result(Ok(vec!["other".into(), "keep".into()]));
 
-        assert_eq!(app.adb_devices, vec!["other", "keep"]);
+        assert_eq!(app.devices, vec!["other", "keep"]);
         assert_eq!(app.selected_device, "keep");
     }
 
@@ -3585,7 +3580,7 @@ mod tests {
 
         app.poll_device_refresh();
 
-        assert_eq!(app.adb_devices, vec!["serial-1"]);
+        assert_eq!(app.devices, vec!["serial-1"]);
         assert!(app.device_refresh_rx.is_none());
     }
 }
@@ -3888,14 +3883,14 @@ mod ui_tests {
 
     #[test]
     fn clear_in_file_mode_bumps_epoch_to_stop_tail() {
-        // With no adb session, Clear must bump the source epoch so the file-tail
+        // With no device session, Clear must bump the source epoch so the file-tail
         // poller stops feeding the just-emptied view. (The adb-live branch, which
         // must NOT bump so the live stream survives, needs a real Session and is
         // covered by review rather than a unit test.)
         let mut h = harness();
         h.run();
         inject(h.state_mut(), 10);
-        assert!(h.state().adb_session.is_none());
+        assert!(h.state().session.is_none());
         let before = h.state().source_epoch.load(Ordering::Acquire);
         h.state_mut().clear();
         let after = h.state().source_epoch.load(Ordering::Acquire);
@@ -4232,7 +4227,7 @@ mod ui_tests {
     // ─── adb Run / Pause / Stop lifecycle ────────────────────────────────
 
     #[test]
-    fn adb_run_clears_model_and_selection() {
+    fn run_session_clears_model_and_selection() {
         let mut h = harness();
         h.run();
         inject(h.state_mut(), 50);
@@ -4242,7 +4237,7 @@ mod ui_tests {
         assert!(!h.state().model.read().unwrap().entries.is_empty());
         assert!(!h.state().selected_rows.is_empty());
 
-        h.state_mut().adb_run();
+        h.state_mut().run_session();
         // Regardless of whether adb spawned, model and selection must be cleared
         assert!(h.state().model.read().unwrap().entries.is_empty());
         assert!(h.state().selected_rows.is_empty());
@@ -4250,7 +4245,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn adb_run_preserves_column_filters() {
+    fn run_session_preserves_column_filters() {
         use crate::model::LevelMask;
         let mut h = harness();
         h.run();
@@ -4263,7 +4258,7 @@ mod ui_tests {
         h.state_mut().ui.disallowed_tags.insert("Tag1".to_string());
 
         // Run/Restart re-monitors the same source: filters must survive.
-        h.state_mut().adb_run();
+        h.state_mut().run_session();
 
         assert_eq!(h.state().ui.allowed_levels, Some(LevelMask::E));
         assert_eq!(
@@ -4282,20 +4277,20 @@ mod ui_tests {
     }
 
     #[test]
-    fn adb_stop_when_no_session_is_noop() {
+    fn stop_session_when_no_session_is_noop() {
         let mut h = harness();
         h.run();
-        assert!(h.state().adb_session.is_none());
-        h.state_mut().adb_stop();
+        assert!(h.state().session.is_none());
+        h.state_mut().stop_session();
         // No panic, status unchanged
     }
 
     #[test]
-    fn adb_pause_toggle_when_no_session_is_noop() {
+    fn toggle_pause_when_no_session_is_noop() {
         let mut h = harness();
         h.run();
-        assert!(h.state().adb_session.is_none());
-        h.state_mut().adb_pause_toggle();
+        assert!(h.state().session.is_none());
+        h.state_mut().toggle_pause();
         // No panic
     }
 
