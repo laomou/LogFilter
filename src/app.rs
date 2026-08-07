@@ -1093,7 +1093,8 @@ impl App {
             }
             Err(e) => {
                 self.adb_devices.clear();
-                self.status = tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
+                self.status =
+                    tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
             }
         }
     }
