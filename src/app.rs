@@ -1,5 +1,5 @@
 use crate::adb;
-use crate::config::{self, parse_color, Config};
+use crate::config::{self, parse_color, Config, Transport};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use crate::io::{read_appended, send_decoded_lines, send_utf8_lines, Tail};
@@ -62,6 +62,8 @@ pub struct App {
     pub adb_devices: Vec<String>,
     pub selected_device: String,
     pub selected_cmd: String,
+    /// Device-connector backend (adb / hdc). Chosen in the toolbar, persisted.
+    pub transport: Transport,
     pub auto_scroll: bool,
     /// Result channel for an in-flight `adb devices` probe. Keeping the probe
     /// off the UI thread prevents startup and the refresh button from freezing
@@ -332,6 +334,7 @@ impl App {
                 .unwrap_or_else(|| "logcat -v threadtime".into())
         };
         let selected_device = cfg.adb.selected_device.clone();
+        let transport = cfg.adb.transport;
         // Prime caches from the initial config so the first frame doesn't reallocate.
         let init_hl_raw = if ui.highlight_on {
             ui.highlight.clone()
@@ -376,6 +379,7 @@ impl App {
             adb_devices: Vec::new(),
             selected_device,
             selected_cmd,
+            transport,
             auto_scroll: true,
             device_refresh_rx: None,
             ctx: ctx.clone(),
@@ -743,6 +747,14 @@ fn detect_format_from_cmd(cmd: &str) -> LogFormat {
 }
 
 impl App {
+    /// Binary path override for the current transport (adb_path / hdc_path).
+    fn transport_override(&self) -> Option<String> {
+        match self.transport {
+            Transport::Adb => self.cfg.adb.adb_path.clone(),
+            Transport::Hdc => self.cfg.adb.hdc_path.clone(),
+        }
+    }
+
     fn adb_run(&mut self) {
         self.adb_stop();
         // Write the format hint before bumping the epoch so the ingest thread
@@ -772,7 +784,8 @@ impl App {
             Some(adb::device_serial(&self.selected_device))
         };
         match adb::Session::start(
-            self.cfg.adb.adb_path.as_deref(),
+            self.transport,
+            self.transport_override().as_deref(),
             device,
             &self.selected_cmd,
             self.line_tx.clone(),
@@ -1025,13 +1038,15 @@ impl App {
         if self.device_refresh_rx.is_some() {
             return;
         }
-        let adb_path = self.cfg.adb.adb_path.clone();
+        let transport = self.transport;
+        let override_path = self.transport_override();
         let (tx, rx) = bounded(1);
         self.device_refresh_rx = Some(rx);
         if let Err(e) = thread::Builder::new()
             .name("adb-devices".into())
             .spawn(move || {
-                let result = adb::list_devices(adb_path.as_deref()).map_err(|e| e.to_string());
+                let result = adb::list_devices(transport, override_path.as_deref())
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(result);
                 ctx.request_repaint();
             })
@@ -2197,6 +2212,7 @@ impl eframe::App for App {
         // Persist the last-used adb command/device so the next launch restores it.
         self.cfg.adb.selected_cmd = self.selected_cmd.clone();
         self.cfg.adb.selected_device = self.selected_device.clone();
+        self.cfg.adb.transport = self.transport;
         // On exit there's no UI left to surface a status, but a failed save
         // silently loses the user's window size / filters / column widths /
         // recent files. Log it so it's at least diagnosable rather than invisible.
@@ -2501,9 +2517,35 @@ impl App {
                     .changed();
             });
 
-            // Row 3: adb toolbar + Goto + Auto-scroll
+            // Row 3: transport + adb/hdc toolbar + Goto + Auto-scroll
             ui.horizontal_wrapped(|ui| {
                 let running = self.adb_session.is_some();
+                // Transport picker: adb (Android) vs hdc (HarmonyOS). Switching
+                // changes the binary, the device-list command, and the -s/-t flag.
+                let mut new_transport = self.transport;
+                egui::ComboBox::from_id_salt("transport")
+                    .selected_text(self.transport.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut new_transport,
+                            Transport::Adb,
+                            Transport::Adb.label(),
+                        );
+                        ui.selectable_value(
+                            &mut new_transport,
+                            Transport::Hdc,
+                            Transport::Hdc.label(),
+                        );
+                    });
+                if new_transport != self.transport {
+                    self.transport = new_transport;
+                    // Devices/keys differ per backend — drop the stale selection
+                    // and re-probe with the new transport's list command.
+                    self.selected_device.clear();
+                    self.adb_devices.clear();
+                    self.refresh_devices(ctx.clone());
+                }
+                ui.separator();
                 let cmds = self.cfg.adb.commands.clone();
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")

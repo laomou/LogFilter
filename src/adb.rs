@@ -1,3 +1,4 @@
+use crate::config::Transport;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use std::io::{BufRead, BufReader, Read};
@@ -13,10 +14,10 @@ use std::thread;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Build a Command for `adb` that suppresses console popups on Windows.
-fn adb_command(override_path: Option<&str>) -> Command {
+/// Build a Command for the transport's binary, suppressing console popups on Windows.
+fn transport_command(transport: Transport, override_path: Option<&str>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(adb_binary(override_path));
+    let mut cmd = Command::new(binary_path(transport, override_path));
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -25,12 +26,11 @@ fn adb_command(override_path: Option<&str>) -> Command {
     cmd
 }
 
-/// Locate the `adb` executable. If the user set an explicit path in config,
-/// use that. Otherwise return the bare name and let `std::process::Command`
-/// resolve it against PATH (Rust searches PATHEXT on Windows, so `adb`,
-/// `adb.exe`, and `adb.bat` are all handled). Windows-only fallback: the
-/// Android Studio default install location.
-pub fn adb_binary(override_path: Option<&str>) -> PathBuf {
+/// Locate the transport's executable (adb / hdc). If the user set an explicit
+/// path in config, use that. Otherwise return the bare name and let
+/// `std::process::Command` resolve it against PATH (Rust searches PATHEXT on
+/// Windows). Windows-only fallback for adb: the Android Studio install location.
+pub fn binary_path(transport: Transport, override_path: Option<&str>) -> PathBuf {
     if let Some(p) = override_path {
         let pb = PathBuf::from(p);
         if pb.exists() {
@@ -39,31 +39,48 @@ pub fn adb_binary(override_path: Option<&str>) -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let candidate = PathBuf::from(local).join("Android/Sdk/platform-tools/adb.exe");
-            if candidate.exists() {
-                return candidate;
+        if transport == Transport::Adb {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let candidate = PathBuf::from(local).join("Android/Sdk/platform-tools/adb.exe");
+                if candidate.exists() {
+                    return candidate;
+                }
             }
         }
     }
-    PathBuf::from("adb")
+    PathBuf::from(transport.binary())
 }
 
-pub fn list_devices(adb_override: Option<&str>) -> Result<Vec<String>> {
-    let out = adb_command(adb_override)
-        .arg("devices")
+pub fn list_devices(transport: Transport, override_path: Option<&str>) -> Result<Vec<String>> {
+    let bin = transport.binary();
+    let out = transport_command(transport, override_path)
+        .args(transport.list_args())
         .output()
-        .map_err(|e| anyhow!("failed to spawn `adb devices`: {} (is adb on PATH?)", e))?;
+        .map_err(|e| anyhow!("failed to spawn `{bin}`: {e} (is {bin} on PATH?)"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!(
-            "`adb devices` exited with {:?}: {}",
+            "`{bin} {}` exited with {:?}: {}",
+            transport.list_args().join(" "),
             out.status.code(),
             stderr.trim()
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_device_lines(&text))
+    Ok(match transport {
+        Transport::Adb => parse_device_lines(&text),
+        Transport::Hdc => parse_hdc_targets(&text),
+    })
+}
+
+/// Parse `hdc list targets` output: one connect key per line, or `[Empty]` when
+/// no device is attached.
+fn parse_hdc_targets(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "[Empty]")
+        .map(String::from)
+        .collect()
 }
 
 /// Parse `adb devices` output into display entries. A ready device is just its
@@ -120,20 +137,21 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawn `adb [-s serial] <cmd_args...>` and stream stdout lines into `tx`,
-    /// each tagged with `epoch` so the ingest side can drop lines from a
-    /// superseded source. Blank lines are preserved; the reader thread exits
-    /// when stdout closes.
+    /// Spawn `<binary> [device-flag serial] <cmd_args...>` and stream stdout
+    /// lines into `tx`, each tagged with `epoch` so the ingest side can drop
+    /// lines from a superseded source. Blank lines are preserved; the reader
+    /// thread exits when stdout closes.
     pub fn start(
-        adb_override: Option<&str>,
+        transport: Transport,
+        override_path: Option<&str>,
         device: Option<&str>,
         cmd: &str,
         tx: Sender<(u64, String)>,
         epoch: u64,
     ) -> Result<Self> {
-        let mut command = adb_command(adb_override);
+        let mut command = transport_command(transport, override_path);
         if let Some(d) = device {
-            command.arg("-s").arg(d);
+            command.arg(transport.device_flag()).arg(d);
         }
         // Split the command string respecting shell quoting (e.g. `logcat -s "My Tag"`).
         // Falls back to simple whitespace split if the string is not valid shell syntax.
@@ -145,9 +163,12 @@ impl Session {
         // Capture stderr so device/command errors are visible instead of being
         // inherited into the parent's console (invisible in a GUI build).
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn adb: {} (is adb on PATH?)", e))?;
+        let mut child = command.spawn().map_err(|e| {
+            anyhow!(
+                "failed to spawn {}: {e} (is it on PATH?)",
+                transport.binary()
+            )
+        })?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused_thr = paused.clone();
@@ -382,9 +403,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_hdc_targets_lists_keys_and_handles_empty() {
+        assert_eq!(parse_hdc_targets("[Empty]\n"), Vec::<String>::new());
+        assert_eq!(
+            parse_hdc_targets("key123\nabc-def\n"),
+            vec!["key123".to_string(), "abc-def".to_string()]
+        );
+        assert_eq!(parse_hdc_targets("  \n key1 \n"), vec!["key1".to_string()]);
+    }
+
+    #[test]
+    fn transport_binary_list_args_and_device_flag() {
+        assert_eq!(Transport::Adb.binary(), "adb");
+        assert_eq!(Transport::Hdc.binary(), "hdc");
+        assert_eq!(Transport::Adb.device_flag(), "-s");
+        assert_eq!(Transport::Hdc.device_flag(), "-t");
+        assert_eq!(Transport::Adb.list_args(), ["devices"]);
+        assert_eq!(Transport::Hdc.list_args(), ["list", "targets"]);
+    }
+
+    #[test]
     fn stop_reaps_stdout_and_stderr_workers() {
         let (tx, rx) = crossbeam_channel::bounded(4);
         let mut session = Session::start(
+            Transport::Adb,
             Some("/bin/sh"),
             None,
             "-c 'printf output; printf error >&2'",
@@ -418,6 +460,7 @@ mod tests {
         // this is the path the UI takes when has_ended() flips.
         let (tx, _rx) = crossbeam_channel::bounded(4);
         let mut session = Session::start(
+            Transport::Adb,
             Some("/bin/sh"),
             None,
             "-c 'printf \"device offline\" >&2'",
@@ -541,6 +584,7 @@ mod tests {
         // exits. The buffer must be flushed on EOF, not dropped with the thread.
         let (tx, rx) = crossbeam_channel::bounded(16);
         let mut session = Session::start(
+            Transport::Adb,
             Some("/bin/sh"),
             None,
             "-c 'sleep 0.1; printf \"a\\nb\\nc\\n\"'",
