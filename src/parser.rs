@@ -13,17 +13,18 @@ fn re_threadtime() -> &'static Regex {
 }
 
 /// HarmonyOS `hilog`: `MM-DD HH:MM:SS.sss PID TID Level Domain/Tag: message`.
-/// Differs from threadtime by the `Domain/Tag` field (hex domain + `/` + tag)
-/// and a fractional-second part that may be 3–9 digits (ms/µs/ns). The domain is
-/// required to be ≥5 hex digits (real hilog domains are 5–7) so this doesn't
-/// claim Android tags that merely start with a short hex word then a slash
-/// (e.g. `DB/query`); any that still slip through fall back to lossless
-/// ThreadTime. Safe to try before threadtime.
+/// Differs from threadtime by the `Domain/Tag` field and a fractional-second
+/// part that may be 3–9 digits (ms/µs/ns). The domain is a log-type letter
+/// (`A`=app, `C`=core, `I`=init/system, …) followed by hex digits, e.g.
+/// `A06666`, `C01719`, `I00000`. Requiring an uppercase letter + ≥4 hex digits
+/// means this doesn't claim an Android tag that merely starts with a short hex
+/// word then a slash (e.g. `DB/query`); any that still slip through fall back to
+/// lossless ThreadTime. Safe to try before threadtime.
 fn re_hilog() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<domain>[0-9A-Fa-f]{5,})/(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<domain>[A-Z][0-9A-Fa-f]{4,})/(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -372,6 +373,28 @@ mod tests {
             e.message(),
             "[a92ab15a1ecb690 4ad1ee 3d06e79][HCWatchCloudRegister]allWatchInfo size is 0"
         );
+
+        // Init/system logs use a non-hex type-letter domain (`I…`), and pid/tid
+        // can be 0 during early boot. Regression: the old hex-only domain pattern
+        // rejected these, so they fell through to ThreadTime with the domain glued
+        // into the tag.
+        let (e, f) = parse_line(
+            "08-07 13:33:33.641     0     0 I I00000/HiLog: ========Zeroth log of type: init"
+                .to_string(),
+        );
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.pid(), "0");
+        assert_eq!(e.tag(), "HiLog", "type-letter domain (I00000) stripped");
+        assert_eq!(e.message(), "========Zeroth log of type: init");
+
+        let (e, f) = parse_line(
+            "08-07 13:33:33.556   532   532 I \
+             I02C01/hmos_cust_carrier_mount/CustCarrierMount: MountCarrierToShared start"
+                .to_string(),
+        );
+        assert_eq!(f, LogFormat::HiLog);
+        assert_eq!(e.tag(), "hmos_cust_carrier_mount/CustCarrierMount");
+        assert_eq!(e.message(), "MountCarrierToShared start");
     }
 
     #[test]
