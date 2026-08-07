@@ -2490,35 +2490,44 @@ impl App {
                 dirty |= r.changed();
             });
 
-            // Row 2: Remove | Highlight
+            // Row 2: Remove | Highlight | Bookmarks-only, all on one line.
+            // Bookmarks-only is right-anchored, so egui reserves exactly its
+            // natural size — it can never be clipped, at any font size / locale,
+            // with no manual width math — while the two inputs fill the space to
+            // its left.
             ui.horizontal(|ui| {
-                let avail = ui.available_width();
-                let text_w = (avail / 2.0 - 100.0).max(120.0);
-                dirty |= ui.checkbox(&mut self.ui.remove_on, tr!("remove")).changed();
-                dirty |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.ui.remove)
-                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                            .desired_width(text_w),
-                    )
-                    .changed();
-                ui.separator();
-                // Highlight is purely visual — it never changes which rows are
-                // shown, so it must NOT feed `dirty`/notify_filter (that clears the
-                // row selection and forces a full refilter). refresh_highlight_caches()
-                // picks up the new tokens every frame, so the edit shows up on its own.
-                ui.checkbox(&mut self.ui.highlight_on, tr!("highlight"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.ui.highlight)
-                        .id(egui::Id::new("filter_highlight_edit"))
-                        .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
-                        .desired_width(text_w),
-                );
-                ui.separator();
-                dirty |= ui
-                    .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
-                    .on_hover_text(tr!("bookmarks_only_hover"))
-                    .changed();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    dirty |= ui
+                        .checkbox(&mut self.ui.bookmarks_only, tr!("bookmarks_only"))
+                        .on_hover_text(tr!("bookmarks_only_hover"))
+                        .changed();
+                    ui.separator();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let text_w = (ui.available_width() / 2.0 - 100.0).max(120.0);
+                        dirty |= ui.checkbox(&mut self.ui.remove_on, tr!("remove")).changed();
+                        dirty |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.ui.remove)
+                                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                                    .desired_width(text_w),
+                            )
+                            .changed();
+                        ui.separator();
+                        // Highlight is purely visual — it must NOT feed
+                        // `dirty`/notify_filter (that clears the row selection and
+                        // forces a full refilter); refresh_highlight_caches() picks
+                        // up the new tokens every frame on its own.
+                        ui.checkbox(&mut self.ui.highlight_on, tr!("highlight"));
+                        // Fill the rest so there's no dead space before the
+                        // right-anchored Bookmarks-only checkbox.
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ui.highlight)
+                                .id(egui::Id::new("filter_highlight_edit"))
+                                .font(egui::FontId::new(13.0, egui::FontFamily::Monospace))
+                                .desired_width(ui.available_width()),
+                        );
+                    });
+                });
             });
 
             // Row 3: transport + adb/hdc toolbar + Goto + Auto-scroll
