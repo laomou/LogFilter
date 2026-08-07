@@ -296,7 +296,7 @@ impl Session {
         let ended = Arc::new(AtomicBool::new(false));
         let ended_thr = ended.clone();
         let handle = thread::Builder::new()
-            .name("adb-reader".into())
+            .name("device-reader".into())
             .spawn(move || {
                 // Cap on lines held while paused: keeps memory bounded on a long
                 // pause under a heavy log rate (~a few MB at this size).
@@ -332,7 +332,7 @@ impl Session {
             let buf = stderr_buf.clone();
             Some(
                 thread::Builder::new()
-                    .name("adb-stderr".into())
+                    .name("device-stderr".into())
                     .spawn(move || {
                         let mut s = String::new();
                         if es.read_to_string(&mut s).is_ok() && !s.is_empty() {
