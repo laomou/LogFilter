@@ -3581,7 +3581,7 @@ mod tests {
 
     #[test]
     fn command_matches_transport_classifies_by_tool() {
-        // logcat → Android only; hilog → HarmonyOS only; shell → both.
+        // logcat → Android only; hilog → HarmonyOS only; kmsg → Android only.
         assert!(command_matches_transport(
             "logcat -v threadtime",
             Transport::Adb
@@ -3602,7 +3602,7 @@ mod tests {
             "shell cat /proc/kmsg",
             Transport::Adb
         ));
-        assert!(command_matches_transport(
+        assert!(!command_matches_transport(
             "shell cat /proc/kmsg",
             Transport::Hdc
         ));

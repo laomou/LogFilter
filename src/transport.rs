@@ -107,7 +107,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         cmd: "shell cat /proc/kmsg",
-        transport: None,
+        // Android-only: HarmonyOS has no /proc/kmsg (hdc reports "No such file").
+        transport: Some(Transport::Adb),
         format: LogFormat::Kernel,
     },
 ];
