@@ -324,17 +324,17 @@ impl App {
         let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
         // Restore the last-used adb command/device; fall back to the first
         // configured command / "(any)" device when not previously saved.
-        let selected_cmd = if !cfg.adb.selected_cmd.is_empty() {
-            cfg.adb.selected_cmd.clone()
+        let selected_cmd = if !cfg.device.selected_cmd.is_empty() {
+            cfg.device.selected_cmd.clone()
         } else {
-            cfg.adb
+            cfg.device
                 .commands
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "logcat -v threadtime".into())
         };
-        let selected_device = cfg.adb.selected_device.clone();
-        let transport = cfg.adb.transport;
+        let selected_device = cfg.device.selected_device.clone();
+        let transport = cfg.device.transport;
         // Prime caches from the initial config so the first frame doesn't reallocate.
         let init_hl_raw = if ui.highlight_on {
             ui.highlight.clone()
@@ -723,11 +723,25 @@ fn follow_file(
 }
 
 /// Infer the expected log format from an adb command string.
-/// The `-v <fmt>` flag selects the format; `/kmsg` path means kernel format.
+/// Whether a command belongs to `t`'s dropdown: a `hilog` command is
+/// HarmonyOS-only, a `logcat` command is Android-only, and anything else
+/// (`shell cat /proc/kmsg`, custom shell commands) runs on either backend.
+/// Whether a command should appear in the dropdown for the given transport.
+/// Built-in commands carry their transport (see [`transport::BUILTIN_COMMANDS`]);
+/// a `None` transport (e.g. a shell command) and any unrecognized command show
+/// under every backend.
+fn command_matches_transport(cmd: &str, t: Transport) -> bool {
+    match transport::builtin_command(cmd) {
+        Some(b) => b.transport.is_none_or(|bt| bt == t),
+        None => true,
+    }
+}
+
+/// The log format a command produces. Built-in commands carry it explicitly;
+/// for anything else, fall back to the `-v <fmt>` flag (`/kmsg` → kernel).
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
-    // HarmonyOS `hilog` (run via hdc) → HiLog format.
-    if cmd.contains("hilog") {
-        return LogFormat::HiLog;
+    if let Some(b) = transport::builtin_command(cmd) {
+        return b.format;
     }
     if cmd.contains("/kmsg") {
         return LogFormat::Kernel;
@@ -750,8 +764,8 @@ impl App {
     /// Binary path override for the current transport (adb_path / hdc_path).
     fn transport_override(&self) -> Option<String> {
         match self.transport {
-            Transport::Adb => self.cfg.adb.adb_path.clone(),
-            Transport::Hdc => self.cfg.adb.hdc_path.clone(),
+            Transport::Adb => self.cfg.device.adb_path.clone(),
+            Transport::Hdc => self.cfg.device.hdc_path.clone(),
         }
     }
 
@@ -2210,9 +2224,9 @@ impl eframe::App for App {
         }
         self.cfg.view.columns = self.cached_col_widths;
         // Persist the last-used adb command/device so the next launch restores it.
-        self.cfg.adb.selected_cmd = self.selected_cmd.clone();
-        self.cfg.adb.selected_device = self.selected_device.clone();
-        self.cfg.adb.transport = self.transport;
+        self.cfg.device.selected_cmd = self.selected_cmd.clone();
+        self.cfg.device.selected_device = self.selected_device.clone();
+        self.cfg.device.transport = self.transport;
         // On exit there's no UI left to surface a status, but a failed save
         // silently loses the user's window size / filters / column widths /
         // recent files. Log it so it's at least diagnosable rather than invisible.
@@ -2543,16 +2557,34 @@ impl App {
                     // and re-probe with the new transport's list command.
                     self.selected_device.clear();
                     self.adb_devices.clear();
+                    // Also switch the command to one that matches the new backend
+                    // (e.g. hilog for HarmonyOS) instead of leaving a logcat
+                    // command selected that hdc can't run.
+                    if !command_matches_transport(&self.selected_cmd, new_transport) {
+                        self.selected_cmd = self
+                            .cfg
+                            .device
+                            .commands
+                            .iter()
+                            .find(|c| command_matches_transport(c, new_transport))
+                            .cloned()
+                            .unwrap_or_default();
+                    }
                     self.refresh_devices(ctx.clone());
                 }
                 ui.separator();
-                let cmds = self.cfg.adb.commands.clone();
+                let cmds = self.cfg.device.commands.clone();
+                let transport = self.transport;
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")
                     .selected_text(&self.selected_cmd)
                     .width(220.0)
                     .show_ui(ui, |ui| {
-                        for c in &cmds {
+                        // Only show commands for the current backend.
+                        for c in cmds
+                            .iter()
+                            .filter(|c| command_matches_transport(c, transport))
+                        {
                             ui.selectable_value(&mut self.selected_cmd, c.clone(), c);
                         }
                     });
@@ -3534,8 +3566,46 @@ mod tests {
             detect_format_from_cmd("logcat -v nonsense"),
             LogFormat::Unknown
         );
-        assert_eq!(detect_format_from_cmd("hilog"), LogFormat::HiLog);
-        assert_eq!(detect_format_from_cmd("shell hilog"), LogFormat::HiLog);
+        // Real (built-in) hilog commands resolve to HiLog via the command table.
+        assert_eq!(
+            detect_format_from_cmd("hilog -v threadtime -r"),
+            LogFormat::HiLog
+        );
+        assert_eq!(
+            detect_format_from_cmd("hilog -D 0x2F00 -v time"),
+            LogFormat::HiLog
+        );
+        // A bare, non-shipped string isn't in the table and has no -v flag → Unknown.
+        assert_eq!(detect_format_from_cmd("hilog"), LogFormat::Unknown);
+    }
+
+    #[test]
+    fn command_matches_transport_classifies_by_tool() {
+        // logcat → Android only; hilog → HarmonyOS only; shell → both.
+        assert!(command_matches_transport(
+            "logcat -v threadtime",
+            Transport::Adb
+        ));
+        assert!(!command_matches_transport(
+            "logcat -v threadtime",
+            Transport::Hdc
+        ));
+        assert!(command_matches_transport(
+            "hilog -v time -r",
+            Transport::Hdc
+        ));
+        assert!(!command_matches_transport(
+            "hilog -v time -r",
+            Transport::Adb
+        ));
+        assert!(command_matches_transport(
+            "shell cat /proc/kmsg",
+            Transport::Adb
+        ));
+        assert!(command_matches_transport(
+            "shell cat /proc/kmsg",
+            Transport::Hdc
+        ));
     }
 
     #[test]

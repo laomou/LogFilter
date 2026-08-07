@@ -1,3 +1,4 @@
+use crate::model::LogFormat;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,72 @@ impl Transport {
             Transport::Hdc => "HarmonyOS (hdc)",
         }
     }
+}
+
+/// A command shipped in the (non-editable) command dropdown, tagged with the
+/// transport it belongs to and the log format it produces. This is the single
+/// source of truth for both — the UI classifies commands by looking them up
+/// here rather than sniffing the command string for `"hilog"`/`"logcat"`.
+pub struct BuiltinCommand {
+    pub cmd: &'static str,
+    /// `None` = transport-agnostic (shown under every backend), e.g. a shell command.
+    pub transport: Option<Transport>,
+    pub format: LogFormat,
+}
+
+/// The built-in command set. Order here is the order shown in the dropdown; keep
+/// the transport-agnostic kernel-log command last.
+pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
+    BuiltinCommand {
+        cmd: "logcat -v threadtime",
+        transport: Some(Transport::Adb),
+        format: LogFormat::ThreadTime,
+    },
+    BuiltinCommand {
+        cmd: "logcat -v time",
+        transport: Some(Transport::Adb),
+        format: LogFormat::Time,
+    },
+    BuiltinCommand {
+        cmd: "logcat -b radio -v time",
+        transport: Some(Transport::Adb),
+        format: LogFormat::Time,
+    },
+    BuiltinCommand {
+        cmd: "logcat -b events -v time",
+        transport: Some(Transport::Adb),
+        format: LogFormat::Time,
+    },
+    BuiltinCommand {
+        cmd: "hilog -v threadtime -r",
+        transport: Some(Transport::Hdc),
+        format: LogFormat::HiLog,
+    },
+    BuiltinCommand {
+        cmd: "hilog -v time -r",
+        transport: Some(Transport::Hdc),
+        format: LogFormat::HiLog,
+    },
+    BuiltinCommand {
+        cmd: "hilog -D 0x2F00 -v time",
+        transport: Some(Transport::Hdc),
+        format: LogFormat::HiLog,
+    },
+    BuiltinCommand {
+        cmd: "hilog -D 0x2D00 -v time",
+        transport: Some(Transport::Hdc),
+        format: LogFormat::HiLog,
+    },
+    BuiltinCommand {
+        cmd: "shell cat /proc/kmsg",
+        transport: None,
+        format: LogFormat::Kernel,
+    },
+];
+
+/// Look up a command in [`BUILTIN_COMMANDS`] by exact match.
+pub fn builtin_command(cmd: &str) -> Option<&'static BuiltinCommand> {
+    BUILTIN_COMMANDS.iter().find(|b| b.cmd == cmd)
 }
 
 /// Windows CREATE_NO_WINDOW: suppresses the black cmd.exe window that would
