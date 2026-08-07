@@ -229,10 +229,14 @@ fn load_raw() -> Config {
     Config::default()
 }
 
-/// Ensure built-in commands introduced in newer versions are present even in an
-/// older saved config — the command combo isn't editable, so a user couldn't add
-/// them otherwise. Idempotent (won't duplicate).
+/// Reconcile an older saved config with the built-in command set introduced in
+/// newer versions — the command combo isn't user-editable, so this is the only
+/// way an existing config picks up new commands or sheds obsolete ones. Idempotent.
 fn ensure_builtin_commands(cfg: &mut Config) {
+    // Drop the obsolete standalone `hilog`: earlier builds injected it, but it's
+    // now superseded by the specific hilog commands below.
+    cfg.adb.commands.retain(|c| c != "hilog");
+
     for cmd in [
         "hilog -v threadtime -r",
         "hilog -v time -r",
@@ -242,6 +246,14 @@ fn ensure_builtin_commands(cfg: &mut Config) {
         if !cfg.adb.commands.iter().any(|c| c == cmd) {
             cfg.adb.commands.push(cmd.to_string());
         }
+    }
+
+    // Keep the kernel-log command last: injecting the hilog commands above (or an
+    // older saved order) can otherwise strand it in the middle of the dropdown.
+    const KMSG: &str = "shell cat /proc/kmsg";
+    if let Some(pos) = cfg.adb.commands.iter().position(|c| c == KMSG) {
+        let kmsg = cfg.adb.commands.remove(pos);
+        cfg.adb.commands.push(kmsg);
     }
 }
 
@@ -503,6 +515,28 @@ mod tests {
         let n = cfg.adb.commands.len();
         ensure_builtin_commands(&mut cfg);
         assert_eq!(cfg.adb.commands.len(), n, "no duplicate on re-run");
+    }
+
+    #[test]
+    fn ensure_builtin_commands_drops_bare_hilog_and_keeps_kmsg_last() {
+        // Config from an earlier build: obsolete bare `hilog`, and the kernel-log
+        // command stranded before the injected hilog commands.
+        let mut cfg = Config::default();
+        cfg.adb.commands = vec![
+            "logcat -v threadtime".into(),
+            "hilog".into(),
+            "shell cat /proc/kmsg".into(),
+        ];
+        ensure_builtin_commands(&mut cfg);
+        assert!(
+            !cfg.adb.commands.iter().any(|c| c == "hilog"),
+            "standalone hilog removed"
+        );
+        assert_eq!(
+            cfg.adb.commands.last().map(String::as_str),
+            Some("shell cat /proc/kmsg"),
+            "kernel-log command stays last"
+        );
     }
 
     #[test]
