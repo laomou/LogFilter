@@ -33,6 +33,9 @@ ttf-parser = "0.20"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [build-dependencies]
 winresource = "0.1"
 

@@ -6,6 +6,73 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume_serial: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(windows)]
+    created: u64,
+    #[cfg(not(any(unix, windows)))]
+    created: Option<SystemTime>,
+}
+
+fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `file` owns a valid Windows file handle, and `info` points to
+        // writable storage of the exact structure required by this API.
+        let ok =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) };
+        let (volume_serial, file_index) = if ok != 0 {
+            // SAFETY: a nonzero return means the API initialized `info`.
+            let info = unsafe { info.assume_init() };
+            (
+                Some(info.dwVolumeSerialNumber),
+                Some(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64),
+            )
+        } else {
+            // Some remote filesystems do not provide a file index. Keep file
+            // loading functional and use creation time as a weaker fallback.
+            (None, None)
+        };
+        Ok(FileIdentity {
+            volume_serial,
+            file_index,
+            created: metadata.creation_time(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(FileIdentity {
+            created: metadata.created().ok(),
+        })
+    }
+}
 
 /// How the tail/follow poller should pick up data appended after the initial
 /// load, decided once from the encoding chosen for that load.
@@ -14,7 +81,20 @@ pub enum Tail {
     /// UTF-8 and byte-safe legacy codepages (GBK, Shift_JIS, EUC-KR, Big5,
     /// Windows-1252) appended data is split on raw `\n`; UTF-16 is decoded into
     /// code units and split on the '\n' character (see `read_appended`).
-    Append { offset: u64, enc: &'static Encoding },
+    Append {
+        offset: u64,
+        enc: &'static Encoding,
+        identity: FileIdentity,
+    },
+    /// The initial read ended with an unterminated line. Keep showing that
+    /// provisional final line, but reload on the next file change so appended
+    /// bytes are joined to it instead of appearing as a second row.
+    ReloadOnChange {
+        loaded_len: u64,
+        modified: Option<SystemTime>,
+        enc: &'static Encoding,
+        identity: FileIdentity,
+    },
 }
 
 impl Tail {
@@ -23,7 +103,7 @@ impl Tail {
     /// user's menu choice — notably "Local" resolves to whatever was sniffed.
     pub fn encoding_name(&self) -> &'static str {
         match self {
-            Tail::Append { enc, .. } => enc.name(),
+            Tail::Append { enc, .. } | Tail::ReloadOnChange { enc, .. } => enc.name(),
         }
     }
 }
@@ -32,8 +112,8 @@ impl Tail {
 pub struct Appended {
     /// New byte offset (just past the last complete line consumed).
     pub offset: u64,
-    /// True if the file is now shorter than `offset` — rotated or truncated,
-    /// so the caller should reload from scratch rather than append.
+    /// True if the path now points to a different file, or the same file is
+    /// shorter than `offset` — the caller should reload instead of appending.
     pub truncated: bool,
 }
 
@@ -50,6 +130,7 @@ pub fn send_utf8_lines(
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
 ) -> std::io::Result<Tail> {
+    let identity = file_identity(&file)?;
     let mut reader = BufReader::new(file);
     let bom = reader.fill_buf()?;
     if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
@@ -71,13 +152,25 @@ pub fn send_utf8_lines(
     let mut buf = Vec::new();
     let mut first = true;
     let mut read_bytes: u64 = 0;
+    let mut has_partial_line = false;
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
-            return Ok(Tail::Append {
-                offset: read_bytes,
-                enc: encoding_rs::UTF_8,
+            let metadata = reader.get_ref().metadata()?;
+            return Ok(if has_partial_line {
+                Tail::ReloadOnChange {
+                    loaded_len: read_bytes,
+                    modified: metadata.modified().ok(),
+                    enc: encoding_rs::UTF_8,
+                    identity,
+                }
+            } else {
+                Tail::Append {
+                    offset: read_bytes,
+                    enc: encoding_rs::UTF_8,
+                    identity,
+                }
             });
         }
         read_bytes += n as u64;
@@ -85,7 +178,11 @@ pub fn send_utf8_lines(
             return Ok(Tail::Append {
                 offset: read_bytes,
                 enc: encoding_rs::UTF_8,
+                identity,
             });
+        }
+        if buf.last() != Some(&b'\n') {
+            has_partial_line = true;
         }
         // Fast path: valid UTF-8 -> borrow & trim on the slice, no lossy scan.
         let line: String = if let Ok(s) = std::str::from_utf8(&buf[..n]) {
@@ -112,6 +209,7 @@ pub fn send_utf8_lines(
             return Ok(Tail::Append {
                 offset: read_bytes,
                 enc: encoding_rs::UTF_8,
+                identity,
             });
         }
     }
@@ -179,6 +277,7 @@ fn send_decoded_lines_with_enc(
     source_epoch: Arc<AtomicU64>,
     enc: &'static Encoding,
 ) -> std::io::Result<Tail> {
+    let identity = file_identity(&file)?;
     let mut reader = BufReader::with_capacity(8192, file);
     let mut decoder = enc.new_decoder();
     // Accumulate decoded text across chunks so we can split into lines only when
@@ -195,7 +294,11 @@ fn send_decoded_lines_with_enc(
         // (odd — the file was flushed half a code unit) would misalign every
         // later read and stall the tail. Round down to a whole code unit.
         let offset = if is_utf16 { bytes & !1 } else { bytes };
-        Tail::Append { offset, enc }
+        Tail::Append {
+            offset,
+            enc,
+            identity,
+        }
     };
     loop {
         let n = reader.read(&mut raw_buf)?;
@@ -221,7 +324,8 @@ fn send_decoded_lines_with_enc(
     // Final flush: drain any remaining buffered bytes from the decoder.
     decode_chunk(&mut decoder, b"", true, &mut text_buf, &tx, epoch);
     // Emit any remaining text without a trailing newline as a final line.
-    if !text_buf.is_empty() {
+    let has_partial_line = !text_buf.is_empty();
+    if has_partial_line {
         if source_epoch.load(Ordering::Acquire) != epoch {
             return Ok(tail_for(read_bytes));
         }
@@ -233,7 +337,17 @@ fn send_decoded_lines_with_enc(
             return Ok(tail_for(read_bytes));
         }
     }
-    Ok(tail_for(read_bytes))
+    if has_partial_line {
+        let metadata = reader.get_ref().metadata()?;
+        Ok(Tail::ReloadOnChange {
+            loaded_len: read_bytes,
+            modified: metadata.modified().ok(),
+            enc,
+            identity,
+        })
+    } else {
+        Ok(tail_for(read_bytes))
+    }
 }
 
 /// Read bytes appended to `path` since `offset` and send each COMPLETE line
@@ -243,7 +357,8 @@ fn send_decoded_lines_with_enc(
 /// is the "strategy A" tailing behavior.
 ///
 /// Returns the new offset (advanced only past complete lines) and whether the
-/// file is now shorter than `offset` (rotated/truncated → caller should reload).
+/// file is now shorter than `offset` (truncated → caller should reload).
+#[cfg(test)]
 pub fn read_appended(
     path: &Path,
     offset: u64,
@@ -251,7 +366,24 @@ pub fn read_appended(
     tx: &Sender<(u64, String)>,
     epoch: u64,
 ) -> std::io::Result<Appended> {
+    read_appended_checked(path, offset, enc, tx, epoch, None)
+}
+
+pub(crate) fn read_appended_checked(
+    path: &Path,
+    offset: u64,
+    enc: &'static Encoding,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+    expected_identity: Option<FileIdentity>,
+) -> std::io::Result<Appended> {
     let mut file = File::open(path)?;
+    if expected_identity.is_some_and(|expected| file_identity(&file).ok() != Some(expected)) {
+        return Ok(Appended {
+            offset,
+            truncated: true,
+        });
+    }
     let len = file.seek(SeekFrom::End(0))?;
     if len < offset {
         return Ok(Appended {
@@ -323,6 +455,19 @@ pub fn read_appended(
         offset: offset + complete.len() as u64,
         truncated: false,
     })
+}
+
+pub(crate) fn file_changed_since(
+    path: &Path,
+    loaded_len: u64,
+    modified: Option<SystemTime>,
+    identity: FileIdentity,
+) -> std::io::Result<bool> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    Ok(metadata.len() != loaded_len
+        || file_identity(&file)? != identity
+        || metadata.modified().ok() != modified)
 }
 
 /// Decode all of `input`, growing `text_buf` or flushing complete lines when
@@ -689,6 +834,77 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_initial_line_is_reloaded_when_completed() {
+        let tmp = unique_tmp("partial_initial");
+        std::fs::write(&tmp, b"partial").unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let tail =
+            send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx, 1, epoch.clone()).unwrap();
+        assert_eq!(
+            rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>(),
+            vec!["partial".to_string()]
+        );
+        let (loaded_len, modified, identity) = match tail {
+            Tail::ReloadOnChange {
+                loaded_len,
+                modified,
+                identity,
+                ..
+            } => (loaded_len, modified, identity),
+            Tail::Append { .. } => panic!("unterminated line must watch for a reload"),
+        };
+        assert_eq!(loaded_len, b"partial".len() as u64);
+
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            file.write_all(b" line\n").unwrap();
+        }
+        assert!(file_changed_since(&tmp, loaded_len, modified, identity).unwrap());
+
+        // The reload sees the original prefix and appended suffix as one row.
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let _tail = send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx, 1, epoch).unwrap();
+        assert_eq!(
+            rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>(),
+            vec!["partial line".to_string()]
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn replacement_file_at_old_offset_is_detected_as_rotation() {
+        let tmp = unique_tmp("rotation_current");
+        let backup = unique_tmp("rotation_backup");
+        let initial = b"old file contents\n";
+        std::fs::write(&tmp, initial).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let tail =
+            send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx.clone(), 1, epoch).unwrap();
+        let (offset, identity) = match tail {
+            Tail::Append {
+                offset, identity, ..
+            } => (offset, identity),
+            Tail::ReloadOnChange { .. } => panic!("newline-terminated file should append"),
+        };
+
+        std::fs::rename(&tmp, &backup).unwrap();
+        let replacement = format!("new file header\n{}\n", "x".repeat(offset as usize));
+        assert!(replacement.len() as u64 >= offset);
+        std::fs::write(&tmp, replacement).unwrap();
+
+        let result =
+            read_appended_checked(&tmp, offset, encoding_rs::UTF_8, &tx, 1, Some(identity))
+                .unwrap();
+        assert!(result.truncated, "replacement must trigger a full reload");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
     fn read_appended_no_growth_is_noop() {
         let tmp = unique_tmp("nogrow");
         std::fs::write(&tmp, b"a\nb\n").unwrap();
@@ -722,10 +938,11 @@ mod tests {
         let file = std::fs::File::open(&tmp).unwrap();
         let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
         match tail {
-            Tail::Append { offset, enc } => {
+            Tail::Append { offset, enc, .. } => {
                 assert_eq!(offset, 12);
                 assert_eq!(enc.name(), "UTF-8");
             }
+            Tail::ReloadOnChange { .. } => panic!("newline-terminated file should append"),
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -735,7 +952,8 @@ mod tests {
         assert_eq!(
             Tail::Append {
                 offset: 0,
-                enc: encoding_rs::GBK
+                enc: encoding_rs::GBK,
+                identity: FileIdentity::default(),
             }
             .encoding_name(),
             "GBK"
@@ -743,7 +961,8 @@ mod tests {
         assert_eq!(
             Tail::Append {
                 offset: 0,
-                enc: encoding_rs::UTF_16LE
+                enc: encoding_rs::UTF_16LE,
+                identity: FileIdentity::default(),
             }
             .encoding_name(),
             "UTF-16LE"

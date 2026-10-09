@@ -1,7 +1,9 @@
 use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
-use crate::io::{read_appended, send_decoded_lines, send_utf8_lines, Tail};
+use crate::io::{
+    file_changed_since, read_appended_checked, send_decoded_lines, send_utf8_lines, Tail,
+};
 use crate::lock::{MutexExt, RwLockExt};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
@@ -692,12 +694,16 @@ fn follow_file(
         ctx.request_repaint();
     };
     match tail {
-        Tail::Append { mut offset, enc } => loop {
+        Tail::Append {
+            mut offset,
+            enc,
+            identity,
+        } => loop {
             thread::sleep(POLL);
             if source_epoch.load(Ordering::Acquire) != epoch {
                 return; // superseded by a newer load
             }
-            match read_appended(path, offset, enc, tx, epoch) {
+            match read_appended_checked(path, offset, enc, tx, epoch, Some(identity)) {
                 Ok(a) if a.truncated => {
                     request_reload();
                     return;
@@ -711,6 +717,21 @@ fn follow_file(
                 // Transient read error (e.g. file briefly missing during
                 // rotation): keep polling rather than giving up.
                 Err(_) => {}
+            }
+        },
+        Tail::ReloadOnChange {
+            loaded_len,
+            modified,
+            identity,
+            ..
+        } => loop {
+            thread::sleep(POLL);
+            if source_epoch.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            if let Ok(true) = file_changed_since(path, loaded_len, modified, identity) {
+                request_reload();
+                return;
             }
         },
     }
