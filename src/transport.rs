@@ -1,6 +1,6 @@
 use crate::model::LogFormat;
 use anyhow::{anyhow, Result};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -302,10 +302,17 @@ impl Session {
                 stream_lossy_lines(reader, |line| {
                     // "Pause Capture" stops *recording*, not *reading*: keep
                     // draining the kernel pipe so adb doesn't back up and the
-                    // device's logd doesn't rotate our logs away. Lines arriving
-                    // while paused are dropped rather than buffered.
-                    let paused = paused_thr.load(Ordering::Relaxed);
-                    route_line(paused, line, |l| tx.send((epoch, l)).is_ok())
+                    // device's logd doesn't rotate our logs away.
+                    if paused_thr.load(Ordering::Relaxed) {
+                        return true;
+                    }
+                    // Never wait here. The reader is the only consumer of adb's
+                    // stdout, so blocking on the log channel lets the pipe fill and
+                    // the device's logd rotate our logs away — losing an unknown
+                    // amount *on the device*. The channel is unbounded (see
+                    // `log_channel`), so this can neither block nor drop: a backlog
+                    // just lives in memory until the ingest side catches up.
+                    tx.send((epoch, line)).is_ok()
                 });
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
@@ -315,6 +322,8 @@ impl Session {
 
         // Drain stderr on its own thread into a shared buffer.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
+
+        // Drain stderr on its own thread into the buffer created above.
         let stderr_handle = if let Some(mut es) = child.stderr.take() {
             let buf = stderr_buf.clone();
             Some(
@@ -423,6 +432,25 @@ impl Drop for Session {
     }
 }
 
+/// One streamed device line, tagged with the epoch of the source session that
+/// produced it, so the ingest thread can drop lines from a superseded one.
+pub type LogLine = (u64, String);
+
+/// The channel carrying streamed device lines from the reader thread to the
+/// ingest thread.
+///
+/// Deliberately **unbounded**. The reader is the only consumer of adb's stdout, so
+/// if it ever waits for room the pipe fills and the device's `logd` rotates our
+/// logs away, losing an unknown amount *on the device*. An unbounded channel makes
+/// `send` non-blocking and infallible, so the reader always keeps draining and
+/// nothing is dropped; the trade is that a backlog lives in memory until the
+/// ingest side catches up. That side parses and appends at ~687k lines/s
+/// (measured), far above any realistic device rate, so the backlog does not
+/// actually grow — which is why no overflow mechanism is needed.
+pub fn log_channel() -> (Sender<LogLine>, Receiver<LogLine>) {
+    crossbeam_channel::unbounded()
+}
+
 /// Read `reader` line by line, decoding each line lossily (invalid UTF-8 bytes
 /// become U+FFFD) and handing it — sans trailing CR/LF — to `emit`, which returns
 /// false to stop. Returns when the stream ends or a read errors.
@@ -447,22 +475,6 @@ fn stream_lossy_lines<R: BufRead>(mut reader: R, mut emit: impl FnMut(String) ->
             break; // receiver gone
         }
     }
-}
-
-/// Route one streamed line while honoring "Pause Capture".
-///
-/// While paused the line is **not recorded**: it is dropped. The caller must keep
-/// reading regardless — draining adb's stdout is what stops the kernel pipe
-/// backing up, which would otherwise make the device's logd rotate our logs away.
-/// Pausing therefore trades a gap in this viewer for not also losing logs on the
-/// device.
-///
-/// Returns false when `send` fails (the receiver is gone), so the caller stops.
-fn route_line(paused: bool, line: String, mut send: impl FnMut(String) -> bool) -> bool {
-    if paused {
-        return true;
-    }
-    send(line)
 }
 
 #[cfg(all(test, unix))]
@@ -719,28 +731,51 @@ mod tests {
     }
 
     #[test]
-    fn route_line_drops_while_paused_and_passes_through_on_resume() {
-        let mut out: Vec<String> = Vec::new();
+    fn log_channel_never_blocks_a_producer_that_is_not_drained() {
+        // Nobody receives. A bounded channel would block (or time out) once its
+        // capacity was reached, which is exactly the pipe backup this prevents.
+        let (tx, _rx) = log_channel();
+        for i in 0..100_000 {
+            assert!(
+                tx.send_timeout(
+                    (1u64, format!("line {i}")),
+                    std::time::Duration::from_secs(5)
+                )
+                .is_ok(),
+                "the log channel must never block the device reader"
+            );
+        }
+    }
 
-        // Paused: the line is dropped, never recorded. Returning true is what
-        // keeps the reader draining the pipe.
-        assert!(route_line(true, "a".into(), |l| {
-            out.push(l);
-            true
-        }));
-        assert!(route_line(true, "b".into(), |l| {
-            out.push(l);
-            true
-        }));
-        assert!(out.is_empty(), "paused lines must not be recorded");
+    #[test]
+    fn the_reader_never_blocks_and_loses_nothing_when_nobody_drains() {
+        // 20k lines with nothing consuming them. A bounded channel would block the
+        // reader part-way through, so it would never reach EOF; the unbounded one
+        // buffers them all and loses none.
+        let (tx, rx) = log_channel();
+        let mut session = Session::start(
+            Transport::Adb,
+            Some("/bin/sh"),
+            None,
+            "-c 'yes line | head -n 20000'",
+            tx,
+            1,
+        )
+        .expect("shell-backed session should start");
 
-        // Resume: the next line goes straight through. The pause window is *not*
-        // replayed — that is the whole point of "Pause Capture".
-        route_line(false, "c".into(), |l| {
-            out.push(l);
-            true
-        });
-        assert_eq!(out, vec!["c"], "the pause window must not be backfilled");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.has_ended() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            session.has_ended(),
+            "the reader must not wait for the log channel"
+        );
+        session.reap();
+
+        let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+        assert_eq!(lines.len(), 20_000, "no line may be lost");
+        assert!(lines.iter().all(|l| l == "line"), "content must be intact");
     }
 
     #[test]
