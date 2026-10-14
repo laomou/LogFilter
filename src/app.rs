@@ -4133,6 +4133,13 @@ mod tests {
 /// (key presses, button clicks) through the full egui event → App::ui →
 /// state change pipeline. These test what actually broke before: shortcuts,
 /// selection, bookmarks, toolbar buttons.
+///
+/// Tests that drive background work (a file load, a device session) advance the
+/// harness with `Harness::step` rather than `Harness::run`: `run` keeps stepping
+/// until the app stops requesting repaints, and this app's load, ingest and filter
+/// threads legitimately request them while they work, so `run` intermittently trips
+/// its `max_steps` guard and flakes CI. `step` runs exactly one frame, and these
+/// tests already poll with their own deadline.
 #[cfg(test)]
 mod ui_tests {
     use super::*;
@@ -4769,10 +4776,10 @@ mod ui_tests {
     #[test]
     fn run_session_clears_model_and_selection() {
         let mut h = harness();
-        h.run();
+        h.step();
         inject(h.state_mut(), 50);
         h.state_mut().select_filtered_row_with_len(10, 50);
-        h.run();
+        h.step();
 
         assert!(!h.state().model.read().unwrap().entries.is_empty());
         assert!(!h.state().selected_rows.is_empty());
@@ -4788,7 +4795,7 @@ mod ui_tests {
     fn run_session_preserves_column_filters() {
         use crate::model::LevelMask;
         let mut h = harness();
-        h.run();
+        h.step();
 
         // User narrows the view by level/PID/TID/tag before restarting capture.
         h.state_mut().ui.allowed_levels = Some(LevelMask::E);
@@ -4839,7 +4846,7 @@ mod ui_tests {
     #[test]
     fn open_file_loads_entries_into_model() {
         let mut h = harness();
-        h.run();
+        h.step();
 
         // Write a small threadtime logcat file
         let tmp = std::env::temp_dir().join(format!("lf_open_{}.log", std::process::id()));
@@ -4862,7 +4869,7 @@ mod ui_tests {
 
         // Give the ingest thread time to process
         std::thread::sleep(std::time::Duration::from_millis(100));
-        h.run();
+        h.step();
 
         let m = h.state().model.read().unwrap();
         assert_eq!(
@@ -4883,12 +4890,12 @@ mod ui_tests {
     #[test]
     fn open_file_populates_detected_encoding() {
         let mut h = harness();
-        h.run();
+        h.step();
         let tmp = std::env::temp_dir().join(format!("lf_enc_disp_{}.log", std::process::id()));
         std::fs::write(&tmp, "01-01 10:00:00.000  1  2 I T: 中文 abc\n").unwrap();
         h.state_mut().open_file(&tmp).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(120));
-        h.run();
+        h.step();
         let enc = h.state().detected_encoding.lock_recover().clone();
         assert_eq!(
             enc.as_deref(),
@@ -4919,7 +4926,7 @@ mod ui_tests {
     #[test]
     fn open_file_tails_appended_lines_without_moving_scroll() {
         let mut h = harness();
-        h.run();
+        h.step();
 
         let tmp = std::env::temp_dir().join(format!("lf_tail_e2e_{}.log", std::process::id()));
         std::fs::write(
@@ -4936,7 +4943,7 @@ mod ui_tests {
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
-            h.run();
+            h.step();
         }
         assert_eq!(h.state().model.read().unwrap().entries.len(), 2);
         // Tailing must not hijack the viewport.
@@ -4962,7 +4969,7 @@ mod ui_tests {
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
-            h.run();
+            h.step();
         }
 
         let m = h.state().model.read().unwrap();
@@ -4985,7 +4992,7 @@ mod ui_tests {
     #[test]
     fn open_file_reloads_on_truncation() {
         let mut h = harness();
-        h.run();
+        h.step();
 
         let tmp = std::env::temp_dir().join(format!("lf_tail_rot_{}.log", std::process::id()));
         std::fs::write(
@@ -5005,7 +5012,7 @@ mod ui_tests {
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
-            h.run();
+            h.step();
         }
         assert_eq!(
             h.state().model.read().unwrap().entries.len(),
@@ -5032,7 +5039,7 @@ mod ui_tests {
                 h.state().model.read().unwrap().entries.len()
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
-            h.run();
+            h.step();
         }
 
         let m = h.state().model.read().unwrap();
@@ -5049,7 +5056,7 @@ mod ui_tests {
     #[test]
     fn open_file_nonexistent_returns_error() {
         let mut h = harness();
-        h.run();
+        h.step();
 
         let result = h.state_mut().open_file(std::path::Path::new(
             "/tmp/nonexistent_logfilter_test_xyz.log",
@@ -5060,11 +5067,11 @@ mod ui_tests {
     #[test]
     fn open_file_clears_previous_data() {
         let mut h = harness();
-        h.run();
+        h.step();
         inject(h.state_mut(), 50);
         h.state_mut().toggle_bookmark(10);
         h.state_mut().select_filtered_row_with_len(20, 50);
-        h.run();
+        h.step();
 
         // Write a new file and open it
         let tmp = std::env::temp_dir().join(format!("lf_open2_{}.log", std::process::id()));
@@ -5087,7 +5094,7 @@ mod ui_tests {
     fn open_different_file_resets_column_filters() {
         use crate::model::LevelMask;
         let mut h = harness();
-        h.run();
+        h.step();
 
         let a = std::env::temp_dir().join(format!("lf_srcA_{}.log", std::process::id()));
         std::fs::write(&a, "01-01 10:00:00.000  1  1 I T: msg\n").unwrap();
@@ -5113,7 +5120,7 @@ mod ui_tests {
     fn reopen_same_file_keeps_column_filters() {
         use crate::model::LevelMask;
         let mut h = harness();
-        h.run();
+        h.step();
 
         let p = std::env::temp_dir().join(format!("lf_same_{}.log", std::process::id()));
         std::fs::write(&p, "01-01 10:00:00.000  1  1 I T: msg\n").unwrap();
