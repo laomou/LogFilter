@@ -122,6 +122,7 @@ status_copied_row = 已复制 1 行
 status_copied_rows = 已复制 {n} 行
 status_nothing_to_save = 无内容可保存
 status_saved = 已保存 {n} 行 → {path}
+status_saved_incomplete = 导出不完整: 已写入 {n} 行 → {path}（日志在导出期间被清空或重载）
 status_save_failed = 保存失败: {e}
 
 # goto status

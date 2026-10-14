@@ -22,6 +22,23 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+/// Result of a background `save_filtered()` export.
+enum SaveOutcome {
+    /// Every requested row was written.
+    Saved {
+        rows: usize,
+        path: PathBuf,
+    },
+    /// The log was cleared or reloaded mid-export. The file holds the rows written
+    /// before that; the rest were deliberately left out rather than taken from the
+    /// new dataset.
+    Interrupted {
+        rows: usize,
+        path: PathBuf,
+    },
+    Failed(String),
+}
+
 pub struct App {
     pub cfg: Config,
     pub model: Arc<RwLock<Model>>,
@@ -106,8 +123,7 @@ pub struct App {
     /// Column widths mirrored from the table each frame; persisted to config on exit.
     cached_col_widths: [f32; 10],
     /// Pending result from a background save_filtered() operation.
-    save_result_rx:
-        Option<crossbeam_channel::Receiver<Result<(usize, std::path::PathBuf), String>>>,
+    save_result_rx: Option<crossbeam_channel::Receiver<SaveOutcome>>,
     /// Set by the background file-load thread when a mid-stream read error
     /// truncates a load, so the UI can tell the user the file loaded only
     /// partially instead of silently presenting it as complete.
@@ -778,6 +794,105 @@ fn permanent_read_error(e: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.is::<PermanentTailReadError>())
 }
 
+/// Rows copied out of the model per read-lock acquisition while exporting.
+const SAVE_CHUNK_ROWS: usize = 4096;
+
+/// Soft per-chunk byte target, so a chunk normally stays a few MiB.
+///
+/// *Soft* because an individual row longer than this is still copied whole — it
+/// has to be in memory to be written — so this bounds every chunk except one
+/// holding such a row.
+const SAVE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// How an export finished.
+enum ExportEnd {
+    /// Every row in the snapshot was written.
+    Complete,
+    /// The dataset was replaced (cleared / reloaded) mid-export. The rows written
+    /// so far belong to the old log; the rest are left out rather than silently
+    /// appended from the new one.
+    SourceChanged,
+}
+
+/// Copy at most `max_rows` rows (and normally at most `max_bytes`) of the
+/// snapshot starting at `start`, under one short read lock.
+///
+/// `indices` is a snapshot of the rows to export, so a filter change mid-export
+/// cannot swap in a different selection. A `None` return means the dataset was
+/// replaced — the caller must stop, because those indices now address a
+/// different log.
+fn read_export_chunk(
+    model: &RwLock<Model>,
+    source_generation: u64,
+    indices: &[u32],
+    start: usize,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Option<Vec<String>> {
+    let m = model.read_recover();
+    if m.source_generation != source_generation {
+        return None;
+    }
+    let mut chunk: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    let mut i = start;
+    while i < indices.len() && chunk.len() < max_rows {
+        let line = m.entries.get(indices[i] as usize)?.raw();
+        // Stop before exceeding the target, unless the chunk is still empty: an
+        // oversized row has to be taken whole for the export to make progress.
+        if !chunk.is_empty() && bytes + line.len() > max_bytes {
+            break;
+        }
+        bytes += line.len();
+        chunk.push(line.to_string());
+        i += 1;
+    }
+    Some(chunk)
+}
+
+/// Write the snapshot `indices` to `dest`, streaming it in chunks.
+///
+/// Each chunk holds the model read lock only long enough to copy its own lines,
+/// so the ingest thread keeps appending between chunks. Holding the lock for the
+/// whole write would stall it and, with a device session running, drop incoming
+/// lines. Extra memory is one chunk plus the index snapshot (4 bytes per row)
+/// instead of a copy of the whole export.
+fn write_filtered_rows(
+    model: &RwLock<Model>,
+    source_generation: u64,
+    indices: &[u32],
+    dest: &Path,
+) -> std::io::Result<(usize, ExportEnd)> {
+    use std::io::{BufWriter, Write};
+
+    let file = std::fs::File::create(dest)?;
+    let mut writer = BufWriter::new(file);
+    let mut written = 0usize;
+    let mut end = ExportEnd::Complete;
+    while written < indices.len() {
+        let Some(chunk) = read_export_chunk(
+            model,
+            source_generation,
+            indices,
+            written,
+            SAVE_CHUNK_ROWS,
+            SAVE_CHUNK_BYTES,
+        ) else {
+            end = ExportEnd::SourceChanged;
+            break;
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        for line in &chunk {
+            writeln!(writer, "{line}")?;
+        }
+        written += chunk.len();
+    }
+    writer.flush()?;
+    Ok((written, end))
+}
+
 /// The log format a command produces. Built-in commands carry it explicitly;
 /// for anything else, fall back to the `-v <fmt>` flag (`/kmsg` → kernel).
 fn detect_format_from_cmd(cmd: &str) -> LogFormat {
@@ -1014,11 +1129,22 @@ impl App {
     }
 
     fn save_filtered(&mut self) {
-        let m = self.model.read_recover();
-        if m.filtered.is_empty() && m.entries.is_empty() {
-            self.status = tr!("status_nothing_to_save");
-            return;
-        }
+        // Snapshot, under one short lock, *which* rows to export and which
+        // dataset they belong to. Re-reading `filtered` per chunk instead would
+        // let a filter change mid-export swap in a different selection, mixing two
+        // results into one file. The file dialog below is modal and can stay open
+        // indefinitely, so no guard may be held across it either — that would
+        // stall the ingest thread's write lock and, with a device session running,
+        // drop incoming lines.
+        let (source_generation, indices) = {
+            let m = self.model.read_recover();
+            if m.filtered.is_empty() && m.entries.is_empty() {
+                self.status = tr!("status_nothing_to_save");
+                return;
+            }
+            (m.source_generation, m.filtered.clone())
+        };
+
         let default_name = format!(
             "logfilter_{}.txt",
             chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
@@ -1028,39 +1154,26 @@ impl App {
             .save_file();
         let Some(dest) = path else { return };
 
-        // Snapshot the filtered entries so the background thread doesn't need
-        // to hold the model lock while writing (which could block the UI). We
-        // save each entry's original line verbatim so the output preserves the
-        // source format (adb stream / original file) rather than a re-joined
-        // table.
-        let rows: Vec<String> = m
-            .filtered
-            .iter()
-            .map(|&ei| m.entries[ei as usize].raw().to_string())
-            .collect();
-        drop(m);
-
-        let n = rows.len();
+        // The background thread streams the rows out in chunks. The snapshot
+        // costs 4 bytes per row; the rows themselves are never all copied at once
+        // (5 GB of matches used to mean 5 GB of extra allocations on the UI
+        // thread). Each row is saved verbatim so the output preserves the source
+        // format (adb stream / original file) rather than a re-joined table.
+        let model = self.model.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.save_result_rx = Some(rx);
         thread::Builder::new()
             .name("save-filtered".into())
             .spawn(move || {
-                let res = (|| -> Result<(), std::io::Error> {
-                    use std::io::{BufWriter, Write};
-                    let f = std::fs::File::create(&dest)?;
-                    let mut w = BufWriter::new(f);
-                    for line in &rows {
-                        writeln!(w, "{}", line)?;
+                let outcome = match write_filtered_rows(&model, source_generation, &indices, &dest)
+                {
+                    Ok((rows, ExportEnd::Complete)) => SaveOutcome::Saved { rows, path: dest },
+                    Ok((rows, ExportEnd::SourceChanged)) => {
+                        SaveOutcome::Interrupted { rows, path: dest }
                     }
-                    w.flush()?;
-                    Ok(())
-                })();
-                let result = match res {
-                    Ok(()) => Ok((n, dest)),
-                    Err(e) => Err(format!("{e}")),
+                    Err(e) => SaveOutcome::Failed(format!("{e}")),
                 };
-                let _ = tx.send(result);
+                let _ = tx.send(outcome);
             })
             .expect("spawn save thread");
     }
@@ -2181,12 +2294,18 @@ impl eframe::App for App {
         // Poll background save result.
         if let Some(rx) = &self.save_result_rx {
             match rx.try_recv() {
-                Ok(Ok((n, path))) => {
-                    self.status = tr!("status_saved", { n: &n.to_string(), path: &path.display().to_string() });
-                    self.save_result_rx = None;
-                }
-                Ok(Err(e)) => {
-                    self.status = tr!("status_save_failed", { e: &e });
+                Ok(outcome) => {
+                    self.status = match outcome {
+                        SaveOutcome::Saved { rows, path } => tr!(
+                            "status_saved",
+                            { n: &rows.to_string(), path: &path.display().to_string() }
+                        ),
+                        SaveOutcome::Interrupted { rows, path } => tr!(
+                            "status_saved_incomplete",
+                            { n: &rows.to_string(), path: &path.display().to_string() }
+                        ),
+                        SaveOutcome::Failed(e) => tr!("status_save_failed", { e: &e }),
+                    };
                     self.save_result_rx = None;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {} // still in progress
@@ -3419,6 +3538,166 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Append `n` rows tagged `tag`, so each row's text is exactly `<tag>-NNNNN`.
+    fn append_rows(model: &mut Model, n: u32, tag: &str) {
+        for i in 0..n {
+            // Everything in one field, so `raw()` is exactly the row text.
+            model.append(crate::model::LogEntry::from_fields(
+                "",
+                "",
+                LevelMask::I,
+                "",
+                "",
+                "",
+                &format!("{tag}-{i:05}"),
+            ));
+        }
+    }
+
+    /// Build a model whose filtered list is every entry, with `n` predictable rows.
+    fn model_with_rows(n: u32) -> RwLock<Model> {
+        let mut model = Model::default();
+        append_rows(&mut model, n, "row");
+        model.filtered = (0..n).collect();
+        RwLock::new(model)
+    }
+
+    /// The row indices and source generation an export would snapshot.
+    fn snapshot(model: &RwLock<Model>) -> (u64, Vec<u32>) {
+        let m = model.read_recover();
+        (m.source_generation, m.filtered.clone())
+    }
+
+    fn tmp_txt(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lf_{tag}_{}.txt", std::process::id()))
+    }
+
+    #[test]
+    fn write_filtered_rows_streams_every_row_in_order_across_chunks() {
+        let model = model_with_rows(10_000);
+        let (generation, indices) = snapshot(&model);
+        let tmp = tmp_txt("save_rows");
+
+        let (written, end) = write_filtered_rows(&model, generation, &indices, &tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(matches!(end, ExportEnd::Complete));
+        assert_eq!(written, 10_000);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            10_000,
+            "every row must be written exactly once"
+        );
+        assert_eq!(lines[0], "row-00000");
+        assert_eq!(lines[SAVE_CHUNK_ROWS - 1], "row-04095");
+        assert_eq!(
+            lines[SAVE_CHUNK_ROWS], "row-04096",
+            "the chunk boundary must not drop, duplicate or reorder a row"
+        );
+        assert_eq!(lines[9_999], "row-09999");
+    }
+
+    #[test]
+    fn write_filtered_rows_uses_the_snapshot_indices_when_the_filter_changes() {
+        // A filter change replaces `m.filtered` while the export runs. The export
+        // must keep writing the rows it snapshotted, not whatever `filtered`
+        // happens to say at the next chunk boundary.
+        let model = model_with_rows(10);
+        let (generation, indices) = snapshot(&model);
+        model.write_recover().filtered = (0..10).rev().collect();
+
+        let tmp = tmp_txt("save_filter_changed");
+        let (written, end) = write_filtered_rows(&model, generation, &indices, &tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(matches!(end, ExportEnd::Complete));
+        assert_eq!(written, 10);
+        assert_eq!(
+            text.lines().next(),
+            Some("row-00000"),
+            "the snapshot order must win over the new filter"
+        );
+        assert_eq!(text.lines().last(), Some("row-00009"));
+    }
+
+    #[test]
+    fn read_export_chunk_stops_after_the_dataset_is_replaced() {
+        // A clear/reload between two chunks. A length check alone would happily
+        // continue, because the replacement can have just as many rows — silently
+        // mixing the new log into the old export.
+        let model = model_with_rows(10);
+        let (generation, indices) = snapshot(&model);
+        assert!(read_export_chunk(&model, generation, &indices, 0, 2, SAVE_CHUNK_BYTES).is_some());
+
+        {
+            let mut m = model.write_recover();
+            m.clear();
+            append_rows(&mut m, 10, "other");
+            m.filtered = (0..10).collect();
+        }
+
+        assert!(
+            read_export_chunk(&model, generation, &indices, 2, 2, SAVE_CHUNK_BYTES).is_none(),
+            "a replaced dataset must stop the export, not be appended to it"
+        );
+    }
+
+    #[test]
+    fn write_filtered_rows_reports_an_interrupted_export_and_writes_nothing_new() {
+        let model = model_with_rows(10);
+        let (generation, indices) = snapshot(&model);
+        {
+            let mut m = model.write_recover();
+            m.clear();
+            append_rows(&mut m, 10, "other");
+            m.filtered = (0..10).collect();
+        }
+
+        let tmp = tmp_txt("save_interrupted");
+        let (written, end) = write_filtered_rows(&model, generation, &indices, &tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(matches!(end, ExportEnd::SourceChanged));
+        assert_eq!(written, 0);
+        assert!(
+            text.is_empty(),
+            "nothing from the new dataset may leak into the export: {text:?}"
+        );
+    }
+
+    #[test]
+    fn read_export_chunk_treats_the_byte_target_as_soft() {
+        let mut model = Model::default();
+        append_rows(&mut model, 1, "small");
+        model.append(crate::model::LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "",
+            "",
+            "",
+            &"x".repeat(8000),
+        ));
+        append_rows(&mut model, 1, "tail");
+        model.filtered = (0..3).collect();
+        let model = RwLock::new(model);
+        let (generation, indices) = snapshot(&model);
+
+        // A following row that would exceed the target is left for the next chunk.
+        let first = read_export_chunk(&model, generation, &indices, 0, 10, 100).unwrap();
+        assert_eq!(first, vec!["small-00000".to_string()]);
+
+        // A row larger than the whole target is still taken, or the export could
+        // never advance past it.
+        let second = read_export_chunk(&model, generation, &indices, 1, 10, 100).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].len(), 8000);
+    }
 
     #[test]
     fn an_allocation_failure_stops_the_follower_instead_of_looping() {
