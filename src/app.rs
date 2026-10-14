@@ -333,10 +333,12 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let ui = UiState::from_config(&cfg);
         let shared_filter = Arc::new(RwLock::new(ui.to_filter_spec()));
-        // Bounded so a fast file reader can't buffer the whole file as queued
-        // Strings ahead of the (slower) parse/append step — it blocks instead,
-        // capping peak memory. 8192 ≈ a few ingest batches of headroom.
-        let (line_tx, line_rx) = bounded::<(u64, String)>(8192);
+        // Unbounded so the device reader never waits for room — a blocked reader
+        // stops draining adb's pipe and the device's logd then rotates our logs
+        // away. The file readers apply their own backpressure instead (see
+        // `io::MAX_QUEUED_LINES`), so a fast disk read still cannot queue the whole
+        // file ahead of the slower parse/append step.
+        let (line_tx, line_rx) = transport::log_channel();
         // Restore the last-used command/device; fall back to the first command
         // of the saved backend / "(any)" device when not previously saved.
         let transport = cfg.device.transport;

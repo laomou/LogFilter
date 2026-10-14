@@ -345,7 +345,7 @@ pub fn send_utf8_lines(
             }
             line
         };
-        if tx.send((epoch, line)).is_err() {
+        if !send_throttled(&tx, epoch, line) {
             return Ok(Tail::Append {
                 offset: read_bytes,
                 enc: encoding_rs::UTF_8,
@@ -473,7 +473,7 @@ fn send_decoded_lines_with_enc(
         // Match the UTF-8 reader's `read_until` behavior: a final logical line
         // is preserved even if CR/LF normalization leaves it empty (for example
         // a file ending in a lone `\r`).
-        if tx.send((epoch, line)).is_err() {
+        if !send_throttled(&tx, epoch, line) {
             return Ok(tail_for(read_bytes));
         }
     }
@@ -616,7 +616,7 @@ fn read_appended_with_budget(
         let consumed = &text[..consumed_chars];
         for chunk in consumed.split_inclusive('\n') {
             let line = chunk.trim_end_matches(['\r', '\n']).to_string();
-            if tx.send((epoch, line)).is_err() {
+            if !send_throttled(tx, epoch, line) {
                 return Ok(Appended {
                     offset,
                     truncated: false,
@@ -674,7 +674,7 @@ fn read_appended_with_budget(
     for chunk in complete.split_inclusive(|&b| b == b'\n') {
         let (cow, _, _) = enc.decode(chunk);
         let line = cow.trim_end_matches(['\r', '\n']).to_string();
-        if tx.send((epoch, line)).is_err() {
+        if !send_throttled(tx, epoch, line) {
             return Ok(Appended {
                 offset,
                 truncated: false,
@@ -748,7 +748,7 @@ fn flush_lines(buf: &str, tx: &Sender<(u64, String)>, epoch: u64) -> usize {
     while scan < bytes.len() {
         if bytes[scan] == b'\n' {
             let line = buf[consumed..scan].trim_end_matches(['\r', '\n']);
-            if tx.send((epoch, line.to_string())).is_err() {
+            if !send_throttled(tx, epoch, line.to_string()) {
                 return consumed;
             }
             consumed = scan + 1;
@@ -756,6 +756,26 @@ fn flush_lines(buf: &str, tx: &Sender<(u64, String)>, epoch: u64) -> usize {
         scan += 1;
     }
     consumed
+}
+
+/// Lines allowed to sit queued ahead of the ingest side before a *file* reader
+/// waits.
+///
+/// The log channel is unbounded so the device reader never blocks on it (see
+/// `transport::log_channel`) — there, waiting would let adb's pipe fill and cost
+/// us logs on the device. The file paths have no pipe to protect, so they apply
+/// their own backpressure instead: a fast disk read must not queue the whole file
+/// as Strings ahead of the slower parse/append step.
+pub(crate) const MAX_QUEUED_LINES: usize = 8192;
+
+/// Hand a line to the ingest side, waiting while it is already too far behind.
+///
+/// Returns false when the receiver is gone.
+fn send_throttled(tx: &Sender<(u64, String)>, epoch: u64, line: String) -> bool {
+    while tx.len() >= MAX_QUEUED_LINES {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    tx.send((epoch, line)).is_ok()
 }
 
 pub fn pick_local_encoding(locale: &str) -> &'static Encoding {
@@ -1773,5 +1793,43 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "a closed channel must not block or spin"
         );
+    }
+
+    #[test]
+    fn file_sends_apply_backpressure_instead_of_queueing_the_whole_file() {
+        // The channel is unbounded so the device reader never blocks, which means a
+        // file reader has to limit itself: without this it would queue the entire
+        // file as Strings ahead of the slower parse/append step.
+        let (tx, rx) = crossbeam_channel::unbounded::<(u64, String)>();
+        let sender = std::thread::spawn(move || {
+            let mut sent = 0usize;
+            while sent < 100_000 && send_throttled(&tx, 1, String::from("line")) {
+                sent += 1;
+            }
+            sent
+        });
+
+        // Nobody consumes: it must park near the limit rather than queue all 100k.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            rx.len() <= MAX_QUEUED_LINES + 1,
+            "queued {} lines with nobody consuming",
+            rx.len()
+        );
+
+        // Consuming must let it continue.
+        let mut drained = 0usize;
+        while drained < MAX_QUEUED_LINES * 2 {
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(_) => drained += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            drained >= MAX_QUEUED_LINES,
+            "draining must unblock the file reader, only {drained} came through"
+        );
+        drop(rx);
+        let _ = sender.join();
     }
 }
