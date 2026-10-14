@@ -2236,10 +2236,17 @@ impl eframe::App for App {
             let mut s = self.session.take().expect("checked is_some above");
             s.reap();
             let err = s.stderr_text();
-            self.status = if err.is_empty() {
-                tr!("status_dev_ended", { tool: self.transport.binary() })
-            } else {
-                tr!("status_dev_ended_err", { tool: self.transport.binary(), e: &err })
+            // A failed read and a finished stream both just stop producing bytes,
+            // so report the recorded I/O error distinctly when there is one
+            // instead of calling every stop an ordinary "session ended".
+            self.status = match s.read_error_text() {
+                Some(read_err) => {
+                    tr!("status_dev_read_failed", { tool: self.transport.binary(), e: &read_err })
+                }
+                None if err.is_empty() => {
+                    tr!("status_dev_ended", { tool: self.transport.binary() })
+                }
+                None => tr!("status_dev_ended_err", { tool: self.transport.binary(), e: &err }),
             };
         }
 
