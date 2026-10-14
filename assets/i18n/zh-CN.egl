@@ -60,6 +60,7 @@ no_file = (无文件)
 total = 总计
 filtered = 已过滤
 bookmarks = 书签
+queued = 排队
 line = 行
 close = 关闭
 select_all = 全选

@@ -60,6 +60,7 @@ no_file = (no file)
 total = total
 filtered = filtered
 bookmarks = bookmarks
+queued = Queued
 line = line
 close = Close
 select_all = Select all
