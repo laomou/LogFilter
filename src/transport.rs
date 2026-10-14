@@ -11,7 +11,7 @@ use std::thread;
 
 /// Device-connector backend. adb (Android) and hdc (HarmonyOS) differ only in
 /// the binary name, the command that lists devices, and the flag that selects
-/// one — everything else (streaming, pause buffering, stderr) is shared, so they
+/// one — everything else (streaming, pause handling, stderr) is shared, so they
 /// live in one module behind this enum rather than separate adb.rs/hdc.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Transport {
@@ -298,28 +298,15 @@ impl Session {
         let handle = thread::Builder::new()
             .name("device-reader".into())
             .spawn(move || {
-                // Cap on lines held while paused: keeps memory bounded on a long
-                // pause under a heavy log rate (~a few MB at this size).
-                const PAUSE_BUFFER_CAP: usize = 100_000;
                 let reader = BufReader::new(stdout);
-                let mut buffer = std::collections::VecDeque::new();
                 stream_lossy_lines(reader, |line| {
-                    // While paused, keep reading (drain the kernel pipe so adb
-                    // doesn't back up and logd doesn't rotate our logs away) but
-                    // hold lines in a bounded buffer; flush them on resume.
-                    let paused = paused_thr.load(std::sync::atomic::Ordering::Relaxed);
-                    route_line(paused, line, &mut buffer, PAUSE_BUFFER_CAP, |l| {
-                        tx.send((epoch, l)).is_ok()
-                    })
+                    // "Pause Capture" stops *recording*, not *reading*: keep
+                    // draining the kernel pipe so adb doesn't back up and the
+                    // device's logd doesn't rotate our logs away. Lines arriving
+                    // while paused are dropped rather than buffered.
+                    let paused = paused_thr.load(Ordering::Relaxed);
+                    route_line(paused, line, |l| tx.send((epoch, l)).is_ok())
                 });
-                // Stream ended (EOF / killed) — flush anything still buffered from
-                // a pause that was never resumed, so those lines aren't lost when
-                // the device disconnects or a finite `logcat -d` dump ends mid-pause.
-                for line in buffer.drain(..) {
-                    if tx.send((epoch, line)).is_err() {
-                        break;
-                    }
-                }
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
                 ended_thr.store(true, Ordering::Release);
@@ -437,9 +424,8 @@ impl Drop for Session {
 }
 
 /// Read `reader` line by line, decoding each line lossily (invalid UTF-8 bytes
-/// become U+FFFD) and sending it — sans trailing CR/LF — through `tx` tagged
-/// with `epoch`. `before_read` runs at the top of each iteration (used to park
-/// while paused). Returns when the stream ends, a read errors, or `tx` closes.
+/// become U+FFFD) and handing it — sans trailing CR/LF — to `emit`, which returns
+/// false to stop. Returns when the stream ends or a read errors.
 ///
 /// This deliberately avoids `BufRead::lines()`: that decoder yields `Err` on the
 /// first line with a non-UTF-8 byte, and the previous `map_while(Result::ok)`
@@ -463,30 +449,18 @@ fn stream_lossy_lines<R: BufRead>(mut reader: R, mut emit: impl FnMut(String) ->
     }
 }
 
-/// Route one streamed line while honoring pause. While `paused`, buffer the line
-/// (bounded by `cap`, dropping the oldest past the cap) instead of emitting it —
-/// this keeps draining adb's stdout so the kernel pipe never backs up (a full
-/// pipe makes the device's logd rotate our logs away). On resume, the buffered
-/// backlog is flushed oldest-first, then the current line, via `send`. Returns
-/// false when `send` fails (the receiver is gone), so the caller stops.
-fn route_line(
-    paused: bool,
-    line: String,
-    buffer: &mut std::collections::VecDeque<String>,
-    cap: usize,
-    mut send: impl FnMut(String) -> bool,
-) -> bool {
+/// Route one streamed line while honoring "Pause Capture".
+///
+/// While paused the line is **not recorded**: it is dropped. The caller must keep
+/// reading regardless — draining adb's stdout is what stops the kernel pipe
+/// backing up, which would otherwise make the device's logd rotate our logs away.
+/// Pausing therefore trades a gap in this viewer for not also losing logs on the
+/// device.
+///
+/// Returns false when `send` fails (the receiver is gone), so the caller stops.
+fn route_line(paused: bool, line: String, mut send: impl FnMut(String) -> bool) -> bool {
     if paused {
-        if buffer.len() >= cap {
-            buffer.pop_front();
-        }
-        buffer.push_back(line);
         return true;
-    }
-    while let Some(buffered) = buffer.pop_front() {
-        if !send(buffered) {
-            return false;
-        }
     }
     send(line)
 }
@@ -745,46 +719,35 @@ mod tests {
     }
 
     #[test]
-    fn route_line_buffers_while_paused_then_flushes_on_resume() {
-        use std::collections::VecDeque;
-        let mut buffer: VecDeque<String> = VecDeque::new();
+    fn route_line_drops_while_paused_and_passes_through_on_resume() {
         let mut out: Vec<String> = Vec::new();
 
-        // Paused: lines are buffered, nothing emitted.
-        route_line(true, "a".into(), &mut buffer, 3, |l| {
+        // Paused: the line is dropped, never recorded. Returning true is what
+        // keeps the reader draining the pipe.
+        assert!(route_line(true, "a".into(), |l| {
             out.push(l);
             true
-        });
-        route_line(true, "b".into(), &mut buffer, 3, |l| {
+        }));
+        assert!(route_line(true, "b".into(), |l| {
             out.push(l);
             true
-        });
-        assert!(out.is_empty(), "paused lines must not be emitted yet");
-        assert_eq!(buffer.len(), 2);
+        }));
+        assert!(out.is_empty(), "paused lines must not be recorded");
 
-        // Resume: the next line flushes the backlog (oldest first) then itself.
-        route_line(false, "c".into(), &mut buffer, 3, |l| {
+        // Resume: the next line goes straight through. The pause window is *not*
+        // replayed — that is the whole point of "Pause Capture".
+        route_line(false, "c".into(), |l| {
             out.push(l);
             true
         });
-        assert_eq!(out, vec!["a", "b", "c"]);
-        assert!(buffer.is_empty());
-
-        // Overflow past the cap drops the oldest buffered line.
-        for l in ["x", "y", "z", "w"] {
-            route_line(true, l.into(), &mut buffer, 3, |_| true);
-        }
-        assert_eq!(
-            buffer.iter().cloned().collect::<Vec<_>>(),
-            vec!["y", "z", "w"],
-            "cap=3 drops the oldest ('x')"
-        );
+        assert_eq!(out, vec!["c"], "the pause window must not be backfilled");
     }
 
     #[test]
-    fn buffered_lines_flush_when_stream_ends_while_paused() {
-        // Pause before the child emits, so every line is buffered; then the child
-        // exits. The buffer must be flushed on EOF, not dropped with the thread.
+    fn paused_capture_drops_lines_but_still_drains_the_stream() {
+        // Pause before the child emits: every line is dropped, and the reader must
+        // still run to EOF. Stopping the read instead would back adb's pipe up and
+        // make the device's logd rotate our logs away.
         let (tx, rx) = crossbeam_channel::bounded(16);
         let mut session = Session::start(
             Transport::Adb,
@@ -801,14 +764,16 @@ mod tests {
         while !session.has_ended() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(session.has_ended(), "child should exit");
+        assert!(
+            session.has_ended(),
+            "a paused reader must still drain to EOF, not stall the pipe"
+        );
         session.reap();
 
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
-        assert_eq!(
-            lines,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            "lines buffered while paused must survive stream-end"
+        assert!(
+            lines.is_empty(),
+            "paused capture must not record the pause window, got {lines:?}"
         );
     }
 }
