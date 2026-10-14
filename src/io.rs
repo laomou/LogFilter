@@ -108,6 +108,25 @@ impl Tail {
     }
 }
 
+/// Upper bound on how much appended data one tail poll will buffer.
+///
+/// A followed file can grow by an arbitrary amount between two polls (the app or
+/// the OS was suspended, the poll thread was starved, a burst writer, a slow
+/// network filesystem). Reading that whole growth into memory at once made the
+/// peak unbounded — large enough to abort the process on allocation failure.
+/// Reads are chunked at this size instead, and [`Appended::more`] tells the
+/// caller to continue immediately rather than wait for the next tick.
+const MAX_TAIL_READ: u64 = 64 * 1024 * 1024;
+
+// Compile-time guard: a larger budget re-opens the unbounded-peak issue the
+// chunked read fixes, so raising it has to be a deliberate, reviewed change
+// rather than a stray edit. `tail_default_budget_bounds_one_poll_end_to_end`
+// covers the behavioural side of the same invariant.
+const _: () = assert!(
+    MAX_TAIL_READ <= 64 * 1024 * 1024,
+    "raising MAX_TAIL_READ re-opens the tail read memory peak"
+);
+
 /// Result of reading data appended since a previous tail offset.
 pub struct Appended {
     /// New byte offset (just past the last complete line consumed).
@@ -115,6 +134,127 @@ pub struct Appended {
     /// True if the path now points to a different file, or the same file is
     /// shorter than `offset` — the caller should reload instead of appending.
     pub truncated: bool,
+    /// True while the file still holds data this call deliberately did not
+    /// consume (the [`MAX_TAIL_READ`] budget was reached, or a partial line is
+    /// still being held back).
+    ///
+    /// The caller should poll again immediately instead of sleeping, so a large
+    /// backlog drains quickly while the memory per read stays bounded. `more` is
+    /// never set when the call consumed nothing, so it cannot spin.
+    pub more: bool,
+}
+
+/// A tail-read failure that retrying is not expected to fix.
+///
+/// Carried as an [`std::io::Error`] payload so the follower can recognise *our*
+/// deliberately-permanent failures instead of guessing from
+/// [`std::io::ErrorKind`]. `ErrorKind` is a coarse vocabulary shared with the OS:
+/// a `read`/`seek` failure that happens to report `InvalidData` — or any other
+/// kind — must keep the follower polling, because reloading the file can
+/// genuinely recover it.
+#[derive(Debug)]
+pub(crate) struct PermanentTailReadError(&'static str);
+
+impl std::fmt::Display for PermanentTailReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PermanentTailReadError {}
+
+/// An [`std::io::Error`] explicitly marked as unfixable by retrying.
+pub(crate) fn permanent_io_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        PermanentTailReadError(message),
+    )
+}
+
+/// Reserve a buffer for `want` bytes without ever aborting the process.
+///
+/// `Vec::with_capacity` routes an allocation failure to `handle_alloc_error`,
+/// which aborts: no unwinding, no error message, unsaved work lost.
+/// `try_reserve_exact` turns the same refusal into an `Err`. On `Err` no buffer
+/// is handed back, so a failed reservation can never be read from or written to.
+pub(crate) fn reserve_buffer(want: usize) -> std::io::Result<Vec<u8>> {
+    let mut raw: Vec<u8> = Vec::new();
+    raw.try_reserve_exact(want)
+        .map_err(|_| permanent_io_error("not enough memory to buffer appended log data"))?;
+    Ok(raw)
+}
+
+/// Buffer at most `want` bytes of the appended range starting at `offset`.
+///
+/// Reserves exactly `want` bytes up front and never reads past it, so a writer
+/// that appends faster than we read cannot make the buffer grow without bound.
+fn read_appended_bytes(file: &mut File, offset: u64, want: usize) -> std::io::Result<Vec<u8>> {
+    let mut raw = reserve_buffer(want)?;
+    // `reserve_buffer` already reserved the capacity, so this resize cannot
+    // reallocate — and returning early on `Err` above means the buffer is never
+    // touched when the reservation failed.
+    raw.resize(want, 0);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut filled = 0usize;
+    while filled < want {
+        match file.read(&mut raw[filled..]) {
+            Ok(0) => break, // EOF (or the file was truncated under us)
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    raw.truncate(filled);
+    Ok(raw)
+}
+
+/// Largest prefix of `raw` that ends on a complete character boundary for `enc`.
+///
+/// Used when an over-long line has to be split at the read budget: cutting a
+/// character in half decodes its head to U+FFFD *and* leaves the orphaned tail
+/// bytes to decay to a second U+FFFD on the next read, corrupting two rows
+/// instead of one. The unconsumed tail is simply left for the next read.
+///
+/// Never returns 0 for non-empty `raw` unless the chunk genuinely holds no
+/// complete character, so a caller that falls back to consuming the chunk can
+/// always make progress.
+fn floor_char_boundary(enc: &'static Encoding, raw: &[u8]) -> usize {
+    if enc == encoding_rs::UTF_8 {
+        return match std::str::from_utf8(raw) {
+            Ok(_) => raw.len(),
+            // `valid_up_to` is by definition the end of the last complete
+            // character. A genuinely malformed byte lands here too; its position
+            // is still the right place to stop and leave the rest for next time.
+            Err(e) => e.valid_up_to(),
+        };
+    }
+    if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+        // Whole code units only; a trailing half code unit is held back.
+        let units = raw.len() & !1;
+        // A trailing high surrogate is probably paired with the first code unit
+        // of the next chunk. Only hold it back when a unit precedes it: an empty
+        // prefix would leave the offset unable to advance.
+        if units >= 4 && is_high_surrogate(enc, &raw[units - 2..units]) {
+            return units - 2;
+        }
+        return units;
+    }
+    // Legacy East-Asian codepages (GBK/Shift_JIS/EUC-KR/Big5, plus windows-1252)
+    // keep the raw chunk: locating their boundaries needs decoder state that
+    // `encoding_rs` does not expose, and splitting one costs a single U+FFFD in a
+    // line already larger than the read budget.
+    raw.len()
+}
+
+/// Whether the two bytes of one UTF-16 code unit are a high surrogate.
+fn is_high_surrogate(enc: &'static Encoding, unit: &[u8]) -> bool {
+    debug_assert_eq!(unit.len(), 2);
+    let value = if enc == encoding_rs::UTF_16LE {
+        u16::from_le_bytes([unit[0], unit[1]])
+    } else {
+        u16::from_be_bytes([unit[0], unit[1]])
+    };
+    (0xD800..=0xDBFF).contains(&value)
 }
 
 /// Stream a UTF-8 (or BOM-detected UTF-16) file's lines into `tx`.
@@ -377,11 +517,36 @@ pub(crate) fn read_appended_checked(
     epoch: u64,
     expected_identity: Option<FileIdentity>,
 ) -> std::io::Result<Appended> {
+    read_appended_with_budget(
+        path,
+        offset,
+        enc,
+        tx,
+        epoch,
+        expected_identity,
+        MAX_TAIL_READ,
+    )
+}
+
+/// [`read_appended_checked`] with an explicit per-call read budget.
+///
+/// Split out so tests can drive chunking, the `more` backlog, and over-long
+/// lines with small inputs instead of multi-megabyte files.
+fn read_appended_with_budget(
+    path: &Path,
+    offset: u64,
+    enc: &'static Encoding,
+    tx: &Sender<(u64, String)>,
+    epoch: u64,
+    expected_identity: Option<FileIdentity>,
+    max_read: u64,
+) -> std::io::Result<Appended> {
     let mut file = File::open(path)?;
     if expected_identity.is_some_and(|expected| file_identity(&file).ok() != Some(expected)) {
         return Ok(Appended {
             offset,
             truncated: true,
+            more: false,
         });
     }
     let len = file.seek(SeekFrom::End(0))?;
@@ -389,19 +554,28 @@ pub(crate) fn read_appended_checked(
         return Ok(Appended {
             offset,
             truncated: true,
+            more: false,
         });
     }
     if len == offset {
         return Ok(Appended {
             offset,
             truncated: false,
+            more: false,
         });
     }
-    file.seek(SeekFrom::Start(offset))?;
-    // Read everything appended so far into memory (bounded by how much the log
-    // grew between 500 ms polls — small in practice).
-    let mut raw = Vec::with_capacity((len - offset) as usize);
-    file.read_to_end(&mut raw)?;
+    // Bounded, chunked read: buffer at most `max_read` of the growth, so the
+    // peak no longer scales with how much the file grew between two polls. The
+    // budget is capped at `MAX_TAIL_READ`, which fits in `usize` on every
+    // supported target, so the range conversion below cannot actually overflow;
+    // keeping it total avoids inventing an `InvalidData` error that a caller
+    // could mistake for something a reload would recover.
+    let budget = max_read.min(MAX_TAIL_READ);
+    let want = usize::try_from((len - offset).min(budget)).unwrap_or(usize::MAX);
+    let raw = read_appended_bytes(&mut file, offset, want)?;
+    // The file held more bytes than this call was willing to read. Together with
+    // an unterminated line below, that means a single line longer than the budget.
+    let unconsumed_beyond = (offset + raw.len() as u64) < len;
 
     // UTF-16: `0x0A` also occurs as a byte inside unrelated code units, so we
     // can't split on raw newline bytes. Decode whole 2-byte code units, split on
@@ -409,51 +583,110 @@ pub(crate) fn read_appended_checked(
     // what we consumed. (This lets UTF-16 files tail incrementally instead of
     // reloading the whole file on every size change.)
     if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
-        let usable = raw.len() & !1; // whole code units only; hold back a stray byte
-                                     // decode_without_bom_handling: a plain decode() would BOM-sniff the chunk
-                                     // and, if it happens to start with BOM-like bytes (a real U+FEFF char, or
-                                     // 0xFFFE), drop a char or switch encoding — drifting the byte offset.
+        // Whole code units only, and a trailing high surrogate is left for the
+        // next read (see `floor_char_boundary`).
+        let usable = floor_char_boundary(enc, &raw);
+        // decode_without_bom_handling: a plain decode() would BOM-sniff the chunk
+        // and, if it happens to start with BOM-like bytes (a real U+FEFF char, or
+        // 0xFFFE), drop a char or switch encoding — drifting the byte offset.
         let (text, _) = enc.decode_without_bom_handling(&raw[..usable]);
-        let Some(nl) = text.rfind('\n') else {
+        let consumed_chars = match text.rfind('\n') {
+            Some(nl) => nl + 1,
+            // No complete line in this chunk, and the file holds more than we
+            // read: the line exceeds the budget. Emit what we buffered so the
+            // tail keeps moving instead of retrying the same read forever.
+            None if unconsumed_beyond => text.len(),
+            None => {
+                return Ok(Appended {
+                    offset,
+                    truncated: false,
+                    more: false,
+                })
+            }
+        };
+        if consumed_chars == 0 {
+            // Nothing consumable (e.g. only a stray half code unit): report no
+            // progress so the caller does not spin.
             return Ok(Appended {
                 offset,
                 truncated: false,
+                more: false,
             });
-        };
-        let consumed = &text[..=nl];
+        }
+        let consumed = &text[..consumed_chars];
         for chunk in consumed.split_inclusive('\n') {
             let line = chunk.trim_end_matches(['\r', '\n']).to_string();
             if tx.send((epoch, line)).is_err() {
-                break;
+                return Ok(Appended {
+                    offset,
+                    truncated: false,
+                    more: false,
+                });
             }
         }
         let consumed_bytes = consumed.encode_utf16().count() as u64 * 2;
+        let new_offset = offset + consumed_bytes;
         return Ok(Appended {
-            offset: offset + consumed_bytes,
+            offset: new_offset,
             truncated: false,
+            more: new_offset < len,
         });
     }
 
     // Only consume up to the last newline; bytes after it are a partial line.
-    let last_nl = raw.iter().rposition(|&b| b == b'\n');
-    let Some(end) = last_nl else {
-        // No complete line yet — leave the offset untouched.
+    let end = match raw.iter().rposition(|&b| b == b'\n') {
+        Some(nl) => nl + 1,
+        // No complete line in this chunk, and the file holds more than we read:
+        // the line exceeds the budget. Emit a prefix so the tail keeps moving,
+        // backing off to a character boundary so the split cannot halve a
+        // character; the unconsumed tail is picked up by the next read.
+        None if unconsumed_beyond => {
+            let safe = floor_char_boundary(enc, &raw);
+            if safe == 0 {
+                // The chunk is nothing but an incomplete character (only
+                // reachable when the budget is smaller than one character).
+                // Waiting cannot complete it because the file already holds more
+                // bytes, so consume it lossily: one bad row beats an offset that
+                // never advances.
+                raw.len()
+            } else {
+                safe
+            }
+        }
+        None => {
+            // No complete line yet — leave the offset untouched.
+            return Ok(Appended {
+                offset,
+                truncated: false,
+                more: false,
+            });
+        }
+    };
+    if end == 0 {
+        // The read raced a truncation and returned nothing: no progress.
         return Ok(Appended {
             offset,
             truncated: false,
+            more: false,
         });
-    };
-    let complete = &raw[..=end];
+    }
+    let complete = &raw[..end];
     for chunk in complete.split_inclusive(|&b| b == b'\n') {
         let (cow, _, _) = enc.decode(chunk);
         let line = cow.trim_end_matches(['\r', '\n']).to_string();
         if tx.send((epoch, line)).is_err() {
-            break;
+            return Ok(Appended {
+                offset,
+                truncated: false,
+                more: false,
+            });
         }
     }
+    let new_offset = offset + complete.len() as u64;
     Ok(Appended {
-        offset: offset + complete.len() as u64,
+        offset: new_offset,
         truncated: false,
+        more: new_offset < len,
     })
 }
 
@@ -981,5 +1214,564 @@ mod tests {
         let tail = send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local).unwrap();
         assert_eq!(tail.encoding_name(), "UTF-8");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ---- tail-read memory bound and backlog continuity ----------------------
+    //
+    // These guard the invariants that keep a large log append from turning into an
+    // unbounded (or aborting) allocation: one call never buffers more than its
+    // budget, the backlog still drains completely and in order, and an over-long
+    // line neither spins nor loses bytes.
+
+    /// Drain `rx` on a helper thread so a bounded channel cannot deadlock the
+    /// reader under test; returns the received lines in order.
+    fn collect_lines(
+        rx: crossbeam_channel::Receiver<(u64, String)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Ok((_, line)) = rx.recv() {
+                got.push(line);
+            }
+            got
+        })
+    }
+
+    #[test]
+    fn tail_chunked_reads_cover_the_backlog_in_order_without_loss() {
+        let tmp = unique_tmp("tail_chunked");
+        let expected: Vec<String> = (0..200).map(|i| format!("line-{i:04}")).collect();
+        {
+            let mut f = File::create(&tmp).unwrap();
+            for line in &expected {
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let len = std::fs::metadata(&tmp).unwrap().len();
+
+        // A 64-byte budget over ~2 KiB forces many chunks; the small bounded
+        // channel also makes the reader hit backpressure mid-chunk.
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+
+        let mut offset = 0u64;
+        let mut calls = 0;
+        loop {
+            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 64)
+                .unwrap();
+            calls += 1;
+            assert!(a.offset > offset, "every call must make progress");
+            assert!(
+                a.offset - offset <= 64,
+                "buffered {} bytes with a 64-byte budget",
+                a.offset - offset
+            );
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(calls < 1000, "backlog never drained");
+        }
+        assert_eq!(offset, len, "all complete lines consumed");
+        assert!(calls > 1, "expected several chunks, got {calls}");
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            got, expected,
+            "no line may be lost, duplicated or reordered"
+        );
+    }
+
+    #[test]
+    fn tail_overlong_line_advances_without_spinning_or_truncating() {
+        let tmp = unique_tmp("tail_overlong");
+        let original = vec![b'z'; 250];
+        std::fs::write(&tmp, &original).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let collector = collect_lines(rx);
+
+        // 100-byte budget, 250 bytes with no newline anywhere.
+        let mut offset = 0u64;
+        let mut calls = 0;
+        loop {
+            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 100)
+                .unwrap();
+            calls += 1;
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(calls < 100, "an over-long line must not spin");
+        }
+        // Two budget-sized chunks are emitted; the trailing partial chunk is
+        // withheld (the reader still cannot see a complete line).
+        assert_eq!(offset, 200, "must advance by the budget, not stall at 0");
+        assert_eq!(
+            calls, 3,
+            "the third call must report no progress and no more"
+        );
+
+        // Completing the line releases the withheld remainder intact.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let a =
+            read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 100).unwrap();
+        assert_eq!(
+            a.offset,
+            original.len() as u64 + 1,
+            "rest of the line consumed"
+        );
+        assert!(!a.more);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let joined: String = got.concat();
+        assert_eq!(
+            joined.as_bytes(),
+            original.as_slice(),
+            "no byte of the over-long line may be lost"
+        );
+    }
+
+    #[test]
+    fn tail_force_split_lands_on_utf8_char_boundaries() {
+        let tmp = unique_tmp("tail_utf8_boundary");
+        let text = "中".repeat(12);
+        std::fs::write(&tmp, format!("{text}\n").as_bytes()).unwrap();
+        let len = std::fs::metadata(&tmp).unwrap().len();
+
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let collector = collect_lines(rx);
+
+        // A 10-byte budget over 3-byte characters: every force-split would land
+        // inside a character if the reader did not back off to a boundary.
+        let mut offset = 0u64;
+        let mut guard = 0;
+        loop {
+            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 10)
+                .unwrap();
+            guard += 1;
+            assert!(a.offset > offset, "a force-split must still advance");
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(guard < 100, "must not spin");
+        }
+        assert_eq!(offset, len, "the whole line must be consumed");
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let joined: String = got.concat();
+        assert!(
+            !joined.contains('\u{fffd}'),
+            "splitting on a character boundary must not produce replacement characters"
+        );
+        assert_eq!(
+            joined, text,
+            "the unconsumed tail must survive to the next read"
+        );
+    }
+
+    #[test]
+    fn tail_budget_smaller_than_one_character_still_advances() {
+        let tmp = unique_tmp("tail_tiny_budget");
+        let content = "中中中\n"; // 10 bytes; every character is 3 bytes
+        std::fs::write(&tmp, content.as_bytes()).unwrap();
+        let len = std::fs::metadata(&tmp).unwrap().len();
+
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let collector = collect_lines(rx);
+
+        // A 1-byte budget can never hold a complete character, so backing off to
+        // a boundary would consume nothing. Each call must still make progress
+        // (lossily) instead of stalling or spinning.
+        let mut offset = 0u64;
+        let mut calls = 0usize;
+        loop {
+            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 1)
+                .unwrap();
+            calls += 1;
+            assert!(
+                a.offset > offset || !a.more,
+                "reporting `more` while consuming nothing is what spins the follower"
+            );
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(calls <= len as usize + 1, "must not spin: {calls} calls");
+        }
+        assert_eq!(offset, len, "every byte must eventually be consumed");
+
+        drop(tx);
+        let _ = collector.join();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tail_force_split_keeps_utf16_surrogate_pairs_whole() {
+        let tmp = unique_tmp("tail_utf16_surrogate");
+        let text = "😀".repeat(3);
+        let mut bytes: Vec<u8> = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x0Au16.to_le_bytes());
+        std::fs::write(&tmp, &bytes).unwrap();
+        let len = bytes.len() as u64;
+
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let collector = collect_lines(rx);
+
+        // 6 bytes = 3 code units, which always lands between the halves of a
+        // surrogate pair; the high half must be held back for the next read
+        // rather than decoded as U+FFFD on this one.
+        let mut offset = 0u64;
+        let mut guard = 0;
+        loop {
+            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_16LE, &tx, 1, None, 6)
+                .unwrap();
+            guard += 1;
+            assert!(a.offset > offset, "a force-split must still advance");
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(guard < 100, "must not spin");
+        }
+        assert_eq!(offset, len, "the whole line must be consumed");
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let joined: String = got.concat();
+        assert!(
+            !joined.contains('\u{fffd}'),
+            "splitting between surrogate halves must not produce replacement characters"
+        );
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn tail_reserve_failure_returns_an_error_instead_of_aborting() {
+        // `usize::MAX` cannot be a capacity, so this fails before touching the
+        // allocator. What matters is that it comes back as `Err` rather than
+        // reaching `handle_alloc_error` (which aborts) and that no buffer is
+        // handed out for the caller to read or write unprepared memory.
+        let err = reserve_buffer(usize::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+        // The failure must also carry our marker, because that — not the kind —
+        // is what tells the follower to stop instead of retrying.
+        assert!(
+            err.get_ref()
+                .is_some_and(|inner| inner.is::<PermanentTailReadError>()),
+            "reservation failures must be recognisable as deliberately permanent"
+        );
+    }
+
+    #[test]
+    fn tail_truncation_and_replacement_after_a_partial_backlog_are_detected() {
+        let tmp = unique_tmp("tail_backlog_rotate");
+        let backup = unique_tmp("tail_backlog_backup");
+        let content: String = (0..100).map(|i| format!("row-{i:04}\n")).collect();
+        std::fs::write(&tmp, &content).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+        let identity = file_identity(&File::open(&tmp).unwrap()).unwrap();
+
+        // Consume one budget-sized chunk: the offset is now mid-file and a
+        // backlog is still pending.
+        let first =
+            read_appended_with_budget(&tmp, 0, encoding_rs::UTF_8, &tx, 1, Some(identity), 64)
+                .unwrap();
+        assert!(first.more, "a backlog must still be pending");
+        assert!(first.offset > 0 && first.offset < content.len() as u64);
+
+        // Truncation below the consumed offset must ask for a reload instead of
+        // appending at a now-invalid offset.
+        std::fs::write(&tmp, b"tiny\n").unwrap();
+        let after_trunc = read_appended_with_budget(
+            &tmp,
+            first.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            Some(identity),
+            64,
+        )
+        .unwrap();
+        assert!(after_trunc.truncated, "truncation must trigger a reload");
+        assert_eq!(after_trunc.offset, first.offset, "offset must not move");
+
+        // A replacement file (new inode) must also be detected, even when it is
+        // longer than the offset so the length check alone would pass.
+        std::fs::rename(&tmp, &backup).unwrap();
+        let replacement = format!("new header\n{}\n", "y".repeat(first.offset as usize + 8));
+        std::fs::write(&tmp, replacement).unwrap();
+        let after_replace = read_appended_with_budget(
+            &tmp,
+            first.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            Some(identity),
+            64,
+        )
+        .unwrap();
+        assert!(after_replace.truncated, "replacement must trigger a reload");
+
+        drop(tx);
+        let _ = collector.join();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    /// Write `count` deterministic lines of `line_len` bytes each (including the
+    /// newline) and return the file length. The index is baked into every line so
+    /// a duplicated, dropped or reordered row is detectable.
+    fn write_indexed_lines(path: &std::path::Path, count: u64, line_len: usize) -> u64 {
+        let payload = "p".repeat(line_len - 17); // 16-byte index + payload + '\n'
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, File::create(path).unwrap());
+        for i in 0..count {
+            writeln!(f, "{i:016}{payload}").unwrap();
+        }
+        f.flush().unwrap();
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn tail_160mib_backlog_is_consumed_completely_without_loss_or_duplication() {
+        // The production entry point with the real MAX_TAIL_READ: a backlog far
+        // larger than one poll must arrive complete, in order, exactly once.
+        const TARGET: u64 = 160 * 1024 * 1024;
+        const LINE_LEN: usize = 4096;
+        let tmp = unique_tmp("tail_backlog_160mib");
+        let count = TARGET / LINE_LEN as u64;
+        let len = write_indexed_lines(&tmp, count, LINE_LEN);
+
+        let (tx, rx) = crossbeam_channel::bounded(8192);
+        let collector = collect_lines(rx);
+
+        let mut offset = 0u64;
+        let mut calls = 0;
+        loop {
+            let a = read_appended(&tmp, offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+            calls += 1;
+            assert!(a.offset > offset, "must progress");
+            assert!(
+                a.offset - offset <= MAX_TAIL_READ,
+                "one poll buffered {} bytes, over MAX_TAIL_READ",
+                a.offset - offset
+            );
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(calls < 100, "backlog never drained");
+        }
+        assert_eq!(offset, len, "the backlog must be consumed to EOF");
+        assert!(
+            calls >= 3,
+            "160 MiB needs >= 3 polls of 64 MiB, took {calls}"
+        );
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(got.len() as u64, count, "line count must match exactly");
+        for (i, line) in got.iter().enumerate() {
+            assert_eq!(line.len(), LINE_LEN - 1, "line {i} has the wrong length");
+            assert_eq!(
+                &line[..16],
+                format!("{i:016}").as_str(),
+                "line {i} is out of order or duplicated"
+            );
+        }
+        let bytes: u64 = got.iter().map(|l| l.len() as u64 + 1).sum();
+        assert_eq!(bytes, len, "no byte may be lost or duplicated");
+    }
+
+    #[test]
+    fn tail_100mib_line_without_newline_keeps_advancing() {
+        const TOTAL: usize = 100 * 1024 * 1024;
+        let tmp = unique_tmp("tail_100mib_nonewline");
+        {
+            let mut f = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp).unwrap());
+            let block = vec![b'x'; 1 << 20];
+            for _ in 0..(TOTAL >> 20) {
+                f.write_all(&block).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let len = std::fs::metadata(&tmp).unwrap().len();
+        assert_eq!(len as usize, TOTAL);
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+
+        // Poll 1: exactly one budget-sized chunk of the un-terminated line.
+        let first = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert_eq!(
+            first.offset, MAX_TAIL_READ,
+            "must advance by the budget, not stall at 0"
+        );
+        assert!(first.more, "the rest of the line is still pending");
+
+        // Poll 2: the remainder is still un-terminated with nothing beyond it, so
+        // it is held back — but it must report no `more`, or the caller would spin.
+        let second = read_appended(&tmp, first.offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert_eq!(
+            second.offset, first.offset,
+            "an unterminated tail is left for the next read"
+        );
+        assert!(!second.more, "no progress must never be reported as `more`");
+
+        // Completing the line releases the remainder intact.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let third = read_appended(&tmp, second.offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert_eq!(third.offset, len + 1, "the whole line must be consumed");
+        assert!(!third.more);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let joined: String = got.concat();
+        assert_eq!(joined.len(), TOTAL, "every byte must survive");
+        assert!(
+            joined.bytes().all(|b| b == b'x'),
+            "content must be preserved exactly"
+        );
+    }
+
+    #[test]
+    fn tail_utf8_multibyte_char_straddling_the_budget_boundary_stays_intact() {
+        let tmp = unique_tmp("tail_straddle");
+        let budget = MAX_TAIL_READ as usize;
+        // Start the emoji two bytes before the boundary, so the first poll reads
+        // into it and would split it without the character-boundary back-off.
+        let prefix = budget - 2;
+        let expected = format!("{}😀中", "a".repeat(prefix));
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+        {
+            let mut f = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp).unwrap());
+            f.write_all(expected.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+            f.flush().unwrap();
+        }
+        let len = std::fs::metadata(&tmp).unwrap().len();
+
+        let mut offset = 0u64;
+        let mut calls = 0;
+        loop {
+            let a = read_appended(&tmp, offset, encoding_rs::UTF_8, &tx, 1).unwrap();
+            calls += 1;
+            assert!(a.offset > offset, "must progress");
+            offset = a.offset;
+            if !a.more {
+                break;
+            }
+            assert!(calls < 10, "must not spin");
+        }
+        assert_eq!(offset, len);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let joined: String = got.concat();
+        assert!(
+            calls >= 2,
+            "the straddle must force a second poll, got {calls}"
+        );
+        assert!(
+            !joined.contains('\u{fffd}'),
+            "a character straddling the 64 MiB boundary must not be split"
+        );
+        assert_eq!(joined, expected, "content must survive the boundary intact");
+    }
+
+    #[test]
+    fn tail_utf16_offsets_are_correct_at_chunk_boundaries_and_newlines() {
+        let tmp = unique_tmp("tail_utf16_offsets");
+        let budget = MAX_TAIL_READ as usize; // even, so a whole number of code units
+                                             // A first line whose terminating newline sits exactly on the budget
+                                             // boundary, followed by a surrogate pair that the next chunk must decode.
+        let first_line = "a".repeat(budget / 2 - 1);
+        let mut bytes: Vec<u8> = Vec::with_capacity(budget + 8);
+        for unit in first_line.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x0Au16.to_le_bytes());
+        for unit in "😀b\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&tmp, &bytes).unwrap();
+        let len = bytes.len() as u64;
+        drop(bytes);
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+
+        // Poll 1 consumes the newline that sits exactly on the boundary, and not
+        // a byte more.
+        let a = read_appended(&tmp, 0, encoding_rs::UTF_16LE, &tx, 1).unwrap();
+        assert_eq!(
+            a.offset, MAX_TAIL_READ,
+            "the newline on the boundary must be consumed exactly"
+        );
+        assert!(a.more, "the following line is still pending");
+
+        // Poll 2 starts on a whole code unit and consumes the rest to EOF.
+        let b = read_appended(&tmp, a.offset, encoding_rs::UTF_16LE, &tx, 1).unwrap();
+        assert_eq!(b.offset, len, "the tail must be consumed exactly to EOF");
+        assert!(!b.more);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            got,
+            vec![first_line, "😀b".to_string()],
+            "offsets and content must survive the boundary"
+        );
+    }
+
+    #[test]
+    fn tail_send_failure_reports_no_progress_instead_of_looping() {
+        let tmp = unique_tmp("tail_send_closed");
+        std::fs::write(&tmp, b"a\nb\nc\n").unwrap();
+
+        // Receiver gone: every `send` fails immediately.
+        let (tx, rx) = crossbeam_channel::bounded::<(u64, String)>(1);
+        drop(rx);
+
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let a = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+            assert_eq!(a.offset, 0, "nothing was delivered, so nothing is consumed");
+            assert!(
+                !a.more,
+                "a closed channel must not look like a pending backlog"
+            );
+        }
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a closed channel must not block or spin"
+        );
     }
 }
