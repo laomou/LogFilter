@@ -2,7 +2,8 @@ use crate::config::{self, parse_color, Config};
 use crate::filter::FilterSpec;
 use crate::fonts::{bump_global_text_sizes, install_ui_font, list_user_font_stems};
 use crate::io::{
-    file_changed_since, read_appended_checked, send_decoded_lines, send_utf8_lines, Tail,
+    file_changed_since, read_appended_checked, send_decoded_lines, send_utf8_lines,
+    PermanentTailReadError, Tail,
 };
 use crate::lock::{MutexExt, RwLockExt};
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
@@ -514,6 +515,7 @@ impl App {
                     epoch,
                     &source_epoch,
                     &reload_request,
+                    &load_error,
                     &ctx,
                 );
             })?;
@@ -677,7 +679,9 @@ impl App {
 /// read. Exits when the epoch changes (a new file/adb load superseded this one)
 /// or the receiver is gone. On rotation/truncation (or growth under a
 /// reload-only encoding like UTF-16) it records a reload request and exits;
-/// the UI thread performs the actual `open_file` reload.
+/// the UI thread performs the actual `open_file` reload. On a permanent read
+/// failure it records the error and stops, so the UI can report it instead of
+/// silently retrying a read that can never succeed.
 #[allow(clippy::too_many_arguments)]
 fn follow_file(
     path: &Path,
@@ -686,6 +690,7 @@ fn follow_file(
     epoch: u64,
     source_epoch: &Arc<AtomicU64>,
     reload_request: &Arc<Mutex<Option<PathBuf>>>,
+    load_error: &Arc<Mutex<Option<String>>>,
     ctx: &egui::Context,
 ) {
     const POLL: Duration = Duration::from_millis(500);
@@ -698,27 +703,50 @@ fn follow_file(
             mut offset,
             enc,
             identity,
-        } => loop {
-            thread::sleep(POLL);
-            if source_epoch.load(Ordering::Acquire) != epoch {
-                return; // superseded by a newer load
-            }
-            match read_appended_checked(path, offset, enc, tx, epoch, Some(identity)) {
-                Ok(a) if a.truncated => {
-                    request_reload();
-                    return;
+        } => {
+            // `Appended::more` means the file still holds data this poll
+            // deliberately did not read (reads are chunked). Drain that backlog
+            // without waiting for the next tick: the memory per read stays
+            // bounded while the tail still catches up at disk speed.
+            let mut wait = POLL;
+            loop {
+                if !wait.is_zero() {
+                    thread::sleep(wait);
                 }
-                Ok(a) => {
-                    if a.offset != offset {
-                        offset = a.offset;
-                        ctx.request_repaint();
+                wait = POLL;
+                if source_epoch.load(Ordering::Acquire) != epoch {
+                    return; // superseded by a newer load
+                }
+                match read_appended_checked(path, offset, enc, tx, epoch, Some(identity)) {
+                    Ok(a) if a.truncated => {
+                        request_reload();
+                        return;
                     }
+                    Ok(a) => {
+                        if a.offset != offset {
+                            offset = a.offset;
+                            ctx.request_repaint();
+                        }
+                        if a.more {
+                            wait = Duration::ZERO;
+                        }
+                    }
+                    // A permanent failure — the buffer for the next chunk could
+                    // not be allocated, or the range is unaddressable — cannot
+                    // resolve by waiting: the file only grows, so retrying every
+                    // 500 ms would spin forever without showing anything. Report
+                    // it and stop following.
+                    Err(e) if permanent_read_error(&e) => {
+                        *load_error.lock_recover() = Some(format!("{}: {e}", path.display()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                    // Transient read error (e.g. file briefly missing during
+                    // rotation): keep polling rather than giving up.
+                    Err(_) => {}
                 }
-                // Transient read error (e.g. file briefly missing during
-                // rotation): keep polling rather than giving up.
-                Err(_) => {}
             }
-        },
+        }
         Tail::ReloadOnChange {
             loaded_len,
             modified,
@@ -735,6 +763,19 @@ fn follow_file(
             }
         },
     }
+}
+
+/// Whether a tail read failure is one we deliberately marked as permanent.
+///
+/// Classification is by *origin*, not by `std::io::ErrorKind`. The kind is a
+/// coarse vocabulary shared with the OS, so a `read`/`seek` failure that happens
+/// to report `InvalidData` (or even `OutOfMemory`) would otherwise stop the
+/// follower even though reloading the file can recover it. Only errors built
+/// with `io::permanent_io_error` stop the follower; every other failure keeps
+/// polling, exactly as a transient rotation gap does.
+fn permanent_read_error(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<PermanentTailReadError>())
 }
 
 /// The log format a command produces. Built-in commands carry it explicitly;
@@ -3371,6 +3412,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn an_allocation_failure_stops_the_follower_instead_of_looping() {
+        // Chain both halves of the guarantee: the tail read really does report a
+        // refused buffer reservation, and that error is classified permanent — so
+        // `follow_file` returns instead of retrying a range that only grows.
+        let err = crate::io::reserve_buffer(usize::MAX).unwrap_err();
+        assert!(
+            permanent_read_error(&err),
+            "a failed reservation must stop the follower, not loop on it"
+        );
+    }
+
+    #[test]
+    fn permanent_read_errors_stop_the_follower_instead_of_retrying_forever() {
+        use crate::io::permanent_io_error;
+        use std::io::{Error, ErrorKind};
+
+        // Our own marker: the tail buffer could not be allocated. Reported and
+        // stopped rather than retried in silence.
+        assert!(permanent_read_error(&permanent_io_error("no memory")));
+
+        // Anything the OS reports must keep the follower polling, even when the
+        // kind *looks* permanent. Classification is by origin, not by
+        // `ErrorKind`: a failure we did not construct may well be recoverable by
+        // reloading the file, so stopping would be wrong.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(
+                !permanent_read_error(&Error::from(kind)),
+                "{kind:?} did not come from our permanent-error marker"
+            );
+        }
+    }
 
     #[test]
     fn send_utf8_lines_replaces_invalid_bytes_and_continues() {
