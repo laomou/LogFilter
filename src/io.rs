@@ -770,6 +770,11 @@ pub(crate) const MAX_QUEUED_LINES: usize = 8192;
 
 /// Hand a line to the ingest side, waiting while it is already too far behind.
 ///
+/// The wait ends as soon as the ingest side drains below the threshold, which
+/// happens at the ingest rate — so a load that has been superseded still stops,
+/// just at its next per-line epoch check rather than mid-wait. Threading a
+/// cancellation signal through every caller would cost more than that delay.
+///
 /// Returns false when the receiver is gone.
 fn send_throttled(tx: &Sender<(u64, String)>, epoch: u64, line: String) -> bool {
     while tx.len() >= MAX_QUEUED_LINES {

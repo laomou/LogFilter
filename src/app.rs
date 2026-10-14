@@ -73,6 +73,10 @@ pub struct App {
 
     // device session (adb / hdc)
     pub line_tx: Sender<(u64, String)>,
+    /// Bumped by `clear()`. The ingest thread drops any batch that was assembled
+    /// before the latest clear, so lines produced earlier cannot refill a view the
+    /// user just emptied.
+    clear_gen: Arc<AtomicU64>,
     pub session: Option<transport::Session>,
     pub devices: Vec<String>,
     pub selected_device: String,
@@ -390,6 +394,7 @@ impl App {
             last_window_size: None,
             user_font_stems: font_stems,
             line_tx,
+            clear_gen: Arc::new(AtomicU64::new(0)),
             session: None,
             devices: Vec::new(),
             selected_device,
@@ -624,6 +629,7 @@ impl App {
         let wake = self.wake.clone();
         let source_epoch = self.source_epoch.clone();
         let source_format_hint = self.source_format_hint.clone();
+        let clear_gen = self.clear_gen.clone();
         thread::Builder::new()
             .name("ingest".into())
             .spawn(move || {
@@ -633,11 +639,16 @@ impl App {
                 // we skip the full 4-regex scan for homogeneous streams.
                 let mut hint = LogFormat::Unknown;
                 let mut hint_epoch: u64 = u64::MAX;
+                let mut seen_clear_generation = clear_gen.load(Ordering::Acquire);
                 loop {
                     // block for first line
                     let Ok(first) = rx.recv() else {
                         return;
                     };
+                    // Note the clear generation this batch started under: if a
+                    // `clear()` lands while the batch is still being assembled,
+                    // `append_batch` drops it (its lines all predate the clear).
+                    let generation_at_read = clear_gen.load(Ordering::Acquire);
                     batch.clear();
                     batch.push(first);
                     // drain more if available (up to 512 lines / 25ms)
@@ -652,6 +663,19 @@ impl App {
                             Err(_) => break,
                         }
                     }
+                    // A `clear()` that landed since the last batch means this batch —
+                    // and everything still queued behind it — was produced before
+                    // the user emptied the view. Discard both instead of refilling
+                    // the table. (The ingest thread owns the only receiver, so it is
+                    // the one that drains; a second handle held by the UI would keep
+                    // the channel connected forever and stop producers from noticing
+                    // that the consumer is gone.)
+                    if generation_at_read != seen_clear_generation {
+                        seen_clear_generation = generation_at_read;
+                        batch.clear();
+                        while rx.try_recv().is_ok() {}
+                        continue;
+                    }
                     // Drop lines from a superseded source (an older file load / adb
                     // session) so they never interleave into the current one.
                     let cur = source_epoch.load(Ordering::Acquire);
@@ -660,23 +684,14 @@ impl App {
                         hint = *source_format_hint.lock_recover();
                         hint_epoch = cur;
                     }
-                    let mut appended = false;
-                    {
-                        let mut m = model.write_recover();
-                        for (ep, line) in batch.drain(..) {
-                            if ep != cur {
-                                continue;
-                            }
-                            let (entry, fmt) = parse_line_hinted(line, hint);
-                            // Lock in the format on the first matched line so subsequent
-                            // lines skip the full scan entirely.
-                            if hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
-                                hint = fmt;
-                            }
-                            m.append(entry);
-                            appended = true;
-                        }
-                    }
+                    let appended = append_batch(
+                        &model,
+                        &mut batch,
+                        cur,
+                        generation_at_read,
+                        &clear_gen,
+                        &mut hint,
+                    );
                     if appended {
                         // Wake the filter thread for an append-only pass. Deliberately
                         // do NOT bump `gen` — that's reserved for filter-spec changes,
@@ -690,6 +705,46 @@ impl App {
             })
             .expect("spawn ingest thread");
     }
+}
+
+/// Append a received batch to the model, returning whether anything was added.
+///
+/// Two kinds of line are dropped: those from a superseded source (`source_epoch`
+/// has moved on), and — as a whole batch — those assembled before the latest
+/// `clear()`. Every line in such a batch predates the clear, so appending it would
+/// refill the table the user just emptied.
+///
+/// The generation is compared while holding the model write lock, which `clear()`
+/// takes *after* bumping it: a batch either appends before the clear (and is then
+/// wiped by it) or is dropped here, never appended into the emptied view.
+fn append_batch(
+    model: &RwLock<Model>,
+    batch: &mut Vec<(u64, String)>,
+    source_epoch: u64,
+    generation_at_read: u64,
+    clear_gen: &AtomicU64,
+    hint: &mut LogFormat,
+) -> bool {
+    let mut appended = false;
+    let mut m = model.write_recover();
+    // Re-read under the model lock: `clear()` bumps the generation *before* taking
+    // that lock, so this batch either appends ahead of the clear (and is wiped by
+    // it) or is dropped here — never appended into an already-emptied view.
+    let batch_is_current = generation_at_read == clear_gen.load(Ordering::Acquire);
+    for (ep, line) in batch.drain(..) {
+        if !batch_is_current || ep != source_epoch {
+            continue;
+        }
+        let (entry, fmt) = parse_line_hinted(line, *hint);
+        // Lock in the format on the first matched line so subsequent lines skip
+        // the full scan entirely.
+        if *hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
+            *hint = fmt;
+        }
+        m.append(entry);
+        appended = true;
+    }
+    appended
 }
 
 /// Poll a followed file every 500 ms and stream appended lines through `tx`,
@@ -995,6 +1050,10 @@ impl App {
     }
 
     fn clear(&mut self) {
+        // Bumping this makes the ingest thread drop the batch it holds *and* drain
+        // whatever is queued behind it: all of it predates this clear, so replaying
+        // it would immediately refill the table the user just emptied.
+        self.clear_gen.fetch_add(1, Ordering::AcqRel);
         // Bump the epoch so a running file-tail (or any queued lines) stops
         // feeding this cleared view — otherwise the tail poller would keep
         // appending new lines into a table the user just emptied.
@@ -2942,6 +3001,25 @@ impl App {
                 }
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
+                // A device capture is the only path that does not throttle itself:
+                // its reader never waits on the log channel, so a backlog here means
+                // the ingest side is behind and memory is growing. File readers stop
+                // at `io::MAX_QUEUED_LINES`, where a full queue is the intended
+                // state, so showing the count for them would be noise.
+                if self.session.is_some() {
+                    let queued = self.line_tx.len();
+                    if queued > 0 {
+                        ui.separator();
+                        let text = format!("{} {}", tr!("queued"), queued);
+                        ui.label(if queued >= crate::io::MAX_QUEUED_LINES {
+                            egui::RichText::new(text)
+                                .color(Color32::from_rgb(230, 126, 34))
+                                .strong()
+                        } else {
+                            egui::RichText::new(text)
+                        });
+                    }
+                }
                 // Encoding only applies to a loaded file (resolves "Local" to the
                 // sniffed codepage). An adb stream is always UTF-8-lossy and an
                 // empty view has no source, so showing an encoding there is stale
@@ -3699,6 +3777,102 @@ mod tests {
         let second = read_export_chunk(&model, generation, &indices, 1, 10, 100).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].len(), 8000);
+    }
+
+    #[test]
+    fn append_batch_drops_a_batch_that_a_clear_overtook() {
+        let model = RwLock::new(Model::default());
+        let mut hint = LogFormat::ThreadTime;
+        let clear_gen = AtomicU64::new(4);
+
+        // Batch assembled under generation 4, view still at generation 4.
+        let mut batch = vec![(1u64, "a".to_string()), (1u64, "b".to_string())];
+        assert!(append_batch(
+            &model, &mut batch, 1, 4, &clear_gen, &mut hint
+        ));
+        assert_eq!(model.read_recover().entries.len(), 2);
+
+        // A clear lands (generation 5) while this batch was being assembled: every
+        // line in it predates the clear, so it must be dropped rather than refill
+        // the view the user just emptied.
+        clear_gen.store(5, Ordering::Release);
+        let mut batch = vec![(1u64, "c".to_string())];
+        assert!(!append_batch(
+            &model, &mut batch, 1, 4, &clear_gen, &mut hint
+        ));
+        assert_eq!(
+            model.read_recover().entries.len(),
+            2,
+            "a batch the clear overtook must not be appended"
+        );
+
+        // Only that one batch is lost: the next one (assembled after the clear)
+        // lands normally.
+        let mut batch = vec![(1u64, "d".to_string())];
+        assert!(append_batch(
+            &model, &mut batch, 1, 5, &clear_gen, &mut hint
+        ));
+        assert_eq!(model.read_recover().entries.len(), 3);
+
+        // A superseded source is still filtered per line, as before.
+        let mut batch = vec![(9u64, "stale".to_string())];
+        assert!(!append_batch(
+            &model, &mut batch, 1, 5, &clear_gen, &mut hint
+        ));
+        assert_eq!(model.read_recover().entries.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_discards_a_backlog_queued_during_capture() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        let epoch = app.source_epoch.load(Ordering::Acquire);
+
+        // A live session is what makes this subtle: `clear()` must NOT bump the
+        // source epoch while capturing (that would drop the session's *future*
+        // lines too), so the queued lines below still carry the current epoch and
+        // the ingest thread would happily append them after the clear.
+        let session = transport::Session::start(
+            Transport::Adb,
+            Some("/bin/sh"),
+            None,
+            // Exits immediately: the test only needs `session.is_some()` (so
+            // `clear()` skips the epoch bump), and a long-lived child would keep
+            // the stdout pipe open, making teardown wait for it.
+            "-c 'true'",
+            app.line_tx.clone(),
+            epoch,
+        )
+        .expect("shell-backed session should start");
+        app.session = Some(session);
+
+        // A burst far larger than one ingest batch, sent immediately before the
+        // clear, so most of it is still queued (or in the batch the ingest thread
+        // is assembling) when the clear lands.
+        for i in 0..50_000 {
+            app.line_tx.send((epoch, format!("line {i}"))).unwrap();
+        }
+        app.clear();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let n = app.model.read_recover().entries.len();
+            assert_eq!(n, 0, "cleared view refilled with {n} queued line(s)");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn clear_bumps_the_generation_so_a_batch_in_flight_is_dropped() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        let before = app.clear_gen.load(Ordering::Acquire);
+        app.clear();
+        assert!(
+            app.clear_gen.load(Ordering::Acquire) > before,
+            "clear() must bump the generation `append_batch` compares against"
+        );
     }
 
     #[test]
