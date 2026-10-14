@@ -208,6 +208,12 @@ pub struct Model {
     pub bookmarks: HashSet<u32>,
     pub error_lines: Vec<u32>,
     pub file_path: Option<PathBuf>,
+    /// Bumped whenever the dataset is replaced wholesale (`clear()`).
+    ///
+    /// Entries are addressed by index, so a reader that snapshots indices needs a
+    /// way to tell that a later index now refers to a *different* log — otherwise
+    /// it would silently mix two datasets into one result.
+    pub source_generation: u64,
 
     // Cached distinct-value counts for column picker panels.
     pub pid_counts: HashMap<String, usize>,
@@ -223,6 +229,7 @@ impl Model {
         self.bookmarks.clear();
         self.error_lines.clear();
         self.file_path = None;
+        self.source_generation = self.source_generation.wrapping_add(1);
         self.pid_counts.clear();
         self.tid_counts.clear();
         self.tag_counts.clear();
