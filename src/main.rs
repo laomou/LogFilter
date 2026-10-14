@@ -9,6 +9,7 @@ mod filter;
 mod fonts;
 mod io;
 mod lock;
+mod memory;
 mod model;
 mod parser;
 mod transport;

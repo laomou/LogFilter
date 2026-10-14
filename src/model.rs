@@ -85,6 +85,11 @@ pub struct LogEntry {
     message: Span,
 }
 
+/// Estimated per-entry overhead beyond the line text: the fixed struct (the
+/// `Box<str>` fat pointer, line number, level and seven spans) plus the
+/// allocator's per-allocation header and size-class rounding.
+pub const ENTRY_OVERHEAD: u64 = 128;
+
 impl LogEntry {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -123,6 +128,12 @@ impl LogEntry {
     #[inline]
     pub fn raw(&self) -> &str {
         &self.raw
+    }
+
+    /// Estimated resident cost of this entry, for the memory budget.
+    #[inline]
+    pub fn estimated_bytes(&self) -> u64 {
+        self.raw.len() as u64 + ENTRY_OVERHEAD
     }
 
     #[inline]
@@ -208,6 +219,10 @@ pub struct Model {
     pub bookmarks: HashSet<u32>,
     pub error_lines: Vec<u32>,
     pub file_path: Option<PathBuf>,
+    /// Estimated resident bytes of `entries` (see [`LogEntry::estimated_bytes`]).
+    /// Bumped by [`Model::append`], reset by [`Model::clear`]; the ingest thread
+    /// stops recording once it reaches the budget from [`crate::memory`].
+    pub estimated_bytes: u64,
     /// Bumped whenever the dataset is replaced wholesale (`clear()`).
     ///
     /// Entries are addressed by index, so a reader that snapshots indices needs a
@@ -229,6 +244,7 @@ impl Model {
         self.bookmarks.clear();
         self.error_lines.clear();
         self.file_path = None;
+        self.estimated_bytes = 0;
         self.source_generation = self.source_generation.wrapping_add(1);
         self.pid_counts.clear();
         self.tid_counts.clear();
@@ -249,6 +265,9 @@ impl Model {
         if let Some(idx) = level_index(entry.level) {
             self.level_counts[idx] += 1;
         }
+        // Saturating: the budget stops appends long before this could saturate, and
+        // saturating_add keeps a debug build from panicking on the theoretical wrap.
+        self.estimated_bytes = self.estimated_bytes.saturating_add(entry.estimated_bytes());
         self.entries.push(entry);
     }
 }
@@ -395,6 +414,37 @@ mod tests {
         assert_eq!(m.tag_counts["TagB"], 1);
         assert_eq!(m.level_counts[2], 2); // I
         assert_eq!(m.level_counts[4], 1); // E
+    }
+
+    #[test]
+    fn estimated_bytes_tracks_appends_and_resets_on_clear() {
+        let mut m = Model::default();
+        assert_eq!(m.estimated_bytes, 0);
+
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "",
+            "",
+            "",
+            "abcd",
+        ));
+        assert_eq!(m.estimated_bytes, 4 + ENTRY_OVERHEAD);
+
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::I,
+            "",
+            "",
+            "",
+            "abcdefgh",
+        ));
+        assert_eq!(m.estimated_bytes, 4 + 8 + 2 * ENTRY_OVERHEAD);
+
+        m.clear();
+        assert_eq!(m.estimated_bytes, 0, "clearing must free the budget");
     }
 
     #[test]
