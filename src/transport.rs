@@ -255,6 +255,11 @@ pub struct Session {
     /// the UI when the session ends to surface the reason (device offline,
     /// unknown command, etc.) instead of a silent empty stream.
     stderr: Arc<Mutex<String>>,
+    /// Why the reader stopped, when it was not a normal end of stream. `None`
+    /// means EOF: the device or the command simply finished. A failed stream and
+    /// a finished one look identical from outside (stdout just stops being
+    /// readable), so without this the UI can only say "ended".
+    read_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -293,13 +298,15 @@ impl Session {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused_thr = paused.clone();
+        let read_error = Arc::new(Mutex::new(None));
+        let read_error_thr = read_error.clone();
         let ended = Arc::new(AtomicBool::new(false));
         let ended_thr = ended.clone();
         let handle = thread::Builder::new()
             .name("device-reader".into())
             .spawn(move || {
                 let reader = BufReader::new(stdout);
-                stream_lossy_lines(reader, |line| {
+                let outcome = stream_lossy_lines(reader, |line| {
                     // "Pause Capture" stops *recording*, not *reading*: keep
                     // draining the kernel pipe so adb doesn't back up and the
                     // device's logd doesn't rotate our logs away. Lines arriving
@@ -307,6 +314,13 @@ impl Session {
                     let paused = paused_thr.load(Ordering::Relaxed);
                     route_line(paused, line, |l| tx.send((epoch, l)).is_ok())
                 });
+                if let Err(e) = outcome {
+                    // Record why, so the UI can say "capture failed" rather than
+                    // reporting an I/O failure as an ordinary end of session.
+                    if let Ok(mut slot) = read_error_thr.lock() {
+                        *slot = Some(e.to_string());
+                    }
+                }
                 // stdout closed → the adb process ended (or was killed). Signal the
                 // UI so it doesn't keep showing a live session that emits nothing.
                 ended_thr.store(true, Ordering::Release);
@@ -342,6 +356,7 @@ impl Session {
             stopped: false,
             ended,
             stderr: stderr_buf,
+            read_error,
         })
     }
 
@@ -349,6 +364,13 @@ impl Session {
     /// user-initiated `stop()`).
     pub fn has_ended(&self) -> bool {
         self.ended.load(Ordering::Acquire)
+    }
+
+    /// The I/O error that stopped the reader, if it stopped for that reason.
+    ///
+    /// `None` means the stream ended normally (EOF); see [`Self::has_ended`].
+    pub fn read_error_text(&self) -> Option<String> {
+        self.read_error.lock().ok().and_then(|g| g.clone())
     }
 
     /// Snapshot of any stderr captured from the adb child so far.
@@ -425,26 +447,36 @@ impl Drop for Session {
 
 /// Read `reader` line by line, decoding each line lossily (invalid UTF-8 bytes
 /// become U+FFFD) and handing it — sans trailing CR/LF — to `emit`, which returns
-/// false to stop. Returns when the stream ends or a read errors.
+/// false to stop.
+///
+/// Returns `Ok(())` when the stream ended normally (EOF) or `emit` asked to stop,
+/// and the I/O error otherwise — so the caller can tell a finished stream apart
+/// from a failed one instead of reporting both as "ended".
 ///
 /// This deliberately avoids `BufRead::lines()`: that decoder yields `Err` on the
 /// first line with a non-UTF-8 byte, and the previous `map_while(Result::ok)`
 /// turned that single bad line into a premature end-of-stream — silently losing
 /// it and everything after. Lossy decoding keeps the line and the stream alive.
-fn stream_lossy_lines<R: BufRead>(mut reader: R, mut emit: impl FnMut(String) -> bool) {
+fn stream_lossy_lines<R: BufRead>(
+    mut reader: R,
+    mut emit: impl FnMut(String) -> bool,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
+        // No `Interrupted` handling is needed here: `read_until` already loops on
+        // `fill_buf` internally, so a signal never surfaces as an error from it.
+        // Anything that reaches this match is a real read failure.
         match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break, // EOF: stdout closed.
+            Ok(0) => return Ok(()), // EOF: stdout closed.
             Ok(_) => {}
-            Err(_) => break, // genuine I/O error: stop reading.
+            Err(e) => return Err(e),
         }
         let line = String::from_utf8_lossy(&buf)
             .trim_end_matches(['\n', '\r'])
             .to_string();
         if !emit(line) {
-            break; // receiver gone
+            return Ok(()); // receiver gone
         }
     }
 }
@@ -662,6 +694,78 @@ mod tests {
         assert!(session.reader_handle.is_none(), "stdout worker joined");
     }
 
+    /// A `Read` that replays scripted steps, so a mid-stream I/O error or a
+    /// signal-induced `Interrupted` can be injected without a real device.
+    enum Step {
+        Data(&'static [u8]),
+        Err(std::io::ErrorKind),
+    }
+
+    struct ScriptedRead {
+        steps: Vec<Step>,
+        next: usize,
+        /// Bytes of the current step not yet handed over.
+        pending: &'static [u8],
+    }
+
+    impl ScriptedRead {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps,
+                next: 0,
+                pending: &[],
+            }
+        }
+    }
+
+    impl std::io::Read for ScriptedRead {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() {
+                let Some(step) = self.steps.get(self.next) else {
+                    return Ok(0);
+                };
+                self.next += 1;
+                match step {
+                    Step::Data(d) => self.pending = d,
+                    Step::Err(kind) => return Err(std::io::Error::from(*kind)),
+                }
+            }
+            let n = self.pending.len().min(out.len());
+            out[..n].copy_from_slice(&self.pending[..n]);
+            self.pending = &self.pending[n..];
+            Ok(n)
+        }
+    }
+
+    fn collect(reader: ScriptedRead) -> (std::io::Result<()>, Vec<String>) {
+        let mut got = Vec::new();
+        let outcome = stream_lossy_lines(std::io::BufReader::new(reader), |line| {
+            got.push(line);
+            true
+        });
+        (outcome, got)
+    }
+
+    #[test]
+    fn stream_lossy_lines_surfaces_read_errors_instead_of_ending_quietly() {
+        // A genuine I/O failure must not look like a normal end of stream: the
+        // caller has to be able to report "capture failed" rather than "ended".
+        let (outcome, got) = collect(ScriptedRead::new(vec![
+            Step::Data(b"first\n"),
+            Step::Err(std::io::ErrorKind::BrokenPipe),
+        ]));
+        let err = outcome.expect_err("an I/O error must be returned, not swallowed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(got, vec!["first"], "lines before the failure are kept");
+    }
+
+    #[test]
+    fn stream_lossy_lines_ends_cleanly_at_eof() {
+        let (outcome, got) = collect(ScriptedRead::new(vec![Step::Data(b"only\n")]));
+        outcome.expect("EOF is a normal end of stream");
+        assert_eq!(got, vec!["only"]);
+    }
+
     #[test]
     fn stream_lossy_lines_keeps_all_lines_across_invalid_utf8() {
         // A stray non-UTF-8 byte (0xFF) sits in the middle line. The old
@@ -675,7 +779,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(16);
         stream_lossy_lines(std::io::Cursor::new(data), |line| {
             tx.send((7, line)).is_ok()
-        });
+        })
+        .expect("reading from a Cursor cannot fail");
         drop(tx);
 
         let lines: Vec<(u64, String)> = rx.try_iter().collect();
@@ -697,7 +802,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(16);
         stream_lossy_lines(std::io::Cursor::new(data), |line| {
             tx.send((1, line)).is_ok()
-        });
+        })
+        .expect("reading from a Cursor cannot fail");
         drop(tx);
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert_eq!(
@@ -714,7 +820,8 @@ mod tests {
         drop(rx);
         stream_lossy_lines(std::io::Cursor::new(data), |line| {
             tx.send((1, line)).is_ok()
-        });
+        })
+        .expect("reading from a Cursor cannot fail");
         // Returning at all (no hang/panic) is the assertion.
     }
 

@@ -107,6 +107,7 @@ status_dev_devices_zero = no devices
 status_dev_devices_failed = {tool} devices failed: {e}
 status_dev_ended = {tool} session ended
 status_dev_ended_err = {tool} session ended: {e}
+status_dev_read_failed = {tool} capture failed: {e}
 status_load_truncated = File load truncated by a read error: {e}
 status_failed_open = Failed to open: {e}
 status_failed_open_dropped = Failed to open dropped file: {e}

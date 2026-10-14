@@ -107,6 +107,7 @@ status_dev_devices_zero = 无设备
 status_dev_devices_failed = {tool} 设备列表失败: {e}
 status_dev_ended = {tool} 会话已结束
 status_dev_ended_err = {tool} 会话已结束: {e}
+status_dev_read_failed = {tool} 采集异常终止: {e}
 status_load_truncated = 文件加载因读取错误中断: {e}
 status_failed_open = 打开失败: {e}
 status_failed_open_dropped = 打开拖入文件失败: {e}
