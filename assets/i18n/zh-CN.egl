@@ -125,6 +125,7 @@ status_nothing_to_save = 无内容可保存
 status_saved = 已保存 {n} 行 → {path}
 status_saved_incomplete = 导出不完整: 已写入 {n} 行 → {path}（日志在导出期间被清空或重载）
 status_save_failed = 保存失败: {e}
+status_log_full = 内存已达上限，停止记录（清空后继续）
 
 # goto status
 status_goto_out_of_range = 行号 {n} 超出范围（共 {total} 行）

@@ -6,6 +6,7 @@ use crate::io::{
     PermanentTailReadError, Tail,
 };
 use crate::lock::{MutexExt, RwLockExt};
+use crate::memory;
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
 use crate::transport::{self, Transport};
@@ -17,7 +18,7 @@ use egui_extras::{Column, TableBuilder};
 use egui_i18n::tr;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -84,6 +85,22 @@ pub struct App {
     /// Device-connector backend (adb / hdc). Chosen in the toolbar, persisted.
     pub transport: Transport,
     pub auto_scroll: bool,
+    /// Resident budget for the in-memory log, sampled once at startup
+    /// (see [`crate::memory`]).
+    log_budget: u64,
+    /// Set by the ingest thread once the log reached `log_budget` and recording
+    /// stopped. Cleared whenever the model is cleared, which resumes recording.
+    recording_full: Arc<AtomicBool>,
+    /// Whether the "recording stopped" notice has already been shown.
+    record_full_reported: bool,
+    /// Config text as last written by the autosave, so unchanged settings do not
+    /// rewrite the file every few seconds.
+    last_saved_config: String,
+    /// When the next autosave check is due.
+    next_config_save: std::time::Instant,
+    /// Whether the periodic config autosave may write. Tests turn this off so they
+    /// never touch the developer's real config file.
+    autosave_config: bool,
     /// Result channel for an in-flight device-list probe (`adb devices` /
     /// `hdc list targets`). Keeping the probe off the UI thread prevents startup
     /// and the refresh button from freezing the window when the connector is
@@ -343,6 +360,9 @@ impl App {
         // `io::MAX_QUEUED_LINES`), so a fast disk read still cannot queue the whole
         // file ahead of the slower parse/append step.
         let (line_tx, line_rx) = transport::log_channel();
+        // Snapshot of the settings as loaded, so the autosave below only writes
+        // when something actually changed.
+        let last_saved_config = toml::to_string(&cfg).unwrap_or_default();
         // Restore the last-used command/device; fall back to the first command
         // of the saved backend / "(any)" device when not previously saved.
         let transport = cfg.device.transport;
@@ -401,6 +421,12 @@ impl App {
             selected_cmd,
             transport,
             auto_scroll: true,
+            log_budget: memory::log_budget(),
+            recording_full: Arc::new(AtomicBool::new(false)),
+            record_full_reported: false,
+            last_saved_config,
+            next_config_save: std::time::Instant::now(),
+            autosave_config: true,
             device_refresh_rx: None,
             ctx: ctx.clone(),
             reload_request: Arc::new(Mutex::new(None)),
@@ -445,7 +471,10 @@ impl App {
     /// UI tests run hermetically.
     #[cfg(test)]
     pub fn new_for_test(ctx: &egui::Context) -> Self {
-        Self::from_ctx(ctx, Config::default(), None)
+        let mut app = Self::from_ctx(ctx, Config::default(), None);
+        // Never let a test write the real config file.
+        app.autosave_config = false;
+        app
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
@@ -478,6 +507,7 @@ impl App {
             model.clear();
             model.file_path = Some(path.to_path_buf());
         }
+        self.resume_recording();
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -627,6 +657,8 @@ impl App {
     fn spawn_ingest_thread(&self, ctx: egui::Context, rx: Receiver<(u64, String)>) {
         let model = self.model.clone();
         let wake = self.wake.clone();
+        let budget = self.log_budget;
+        let full = self.recording_full.clone();
         let source_epoch = self.source_epoch.clone();
         let source_format_hint = self.source_format_hint.clone();
         let clear_gen = self.clear_gen.clone();
@@ -684,14 +716,24 @@ impl App {
                         hint = *source_format_hint.lock_recover();
                         hint_epoch = cur;
                     }
+                    let was_full = full.load(Ordering::Relaxed);
                     let appended = append_batch(
                         &model,
                         &mut batch,
-                        cur,
-                        generation_at_read,
-                        &clear_gen,
+                        &BatchContext {
+                            source_epoch: cur,
+                            generation_at_read,
+                            clear_gen: &clear_gen,
+                            budget,
+                            full: &full,
+                        },
                         &mut hint,
                     );
+                    if full.load(Ordering::Relaxed) && !was_full {
+                        // Nothing was added, but the notice must reach the screen:
+                        // a frozen table looks exactly like a device gone quiet.
+                        ctx.request_repaint();
+                    }
                     if appended {
                         // Wake the filter thread for an append-only pass. Deliberately
                         // do NOT bump `gen` — that's reserved for filter-spec changes,
@@ -717,12 +759,24 @@ impl App {
 /// The generation is compared while holding the model write lock, which `clear()`
 /// takes *after* bumping it: a batch either appends before the clear (and is then
 /// wiped by it) or is dropped here, never appended into the emptied view.
+/// Everything `append_batch` needs beyond the model and the batch itself, so the
+/// "is this batch still wanted" and "is the log full" decisions stay together.
+struct BatchContext<'a> {
+    /// Source the batch was read under; lines from a superseded one are dropped.
+    source_epoch: u64,
+    /// `clear_gen` as read when the batch was assembled.
+    generation_at_read: u64,
+    clear_gen: &'a AtomicU64,
+    /// Resident budget for the in-memory log.
+    budget: u64,
+    /// Set when the budget stopped this batch, so the UI can say so.
+    full: &'a AtomicBool,
+}
+
 fn append_batch(
     model: &RwLock<Model>,
     batch: &mut Vec<(u64, String)>,
-    source_epoch: u64,
-    generation_at_read: u64,
-    clear_gen: &AtomicU64,
+    ctx: &BatchContext<'_>,
     hint: &mut LogFormat,
 ) -> bool {
     let mut appended = false;
@@ -730,9 +784,16 @@ fn append_batch(
     // Re-read under the model lock: `clear()` bumps the generation *before* taking
     // that lock, so this batch either appends ahead of the clear (and is wiped by
     // it) or is dropped here — never appended into an already-emptied view.
-    let batch_is_current = generation_at_read == clear_gen.load(Ordering::Acquire);
+    let batch_is_current = ctx.generation_at_read == ctx.clear_gen.load(Ordering::Acquire);
+    if batch_is_current && m.estimated_bytes >= ctx.budget {
+        // The log reached its memory budget. The caller keeps draining the channel
+        // (the device's pipe must never back up) but nothing is appended until a
+        // `clear()` resets the accounting.
+        ctx.full.store(true, Ordering::Relaxed);
+        return false;
+    }
     for (ep, line) in batch.drain(..) {
-        if !batch_is_current || ep != source_epoch {
+        if !batch_is_current || ep != ctx.source_epoch {
             continue;
         }
         let (entry, fmt) = parse_line_hinted(line, *hint);
@@ -998,6 +1059,7 @@ impl App {
             let mut model = self.model.write_recover();
             model.clear();
         }
+        self.resume_recording();
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -1049,6 +1111,12 @@ impl App {
         }
     }
 
+    /// Clearing the table frees the memory budget, so recording resumes.
+    fn resume_recording(&mut self) {
+        self.recording_full.store(false, Ordering::Relaxed);
+        self.record_full_reported = false;
+    }
+
     fn clear(&mut self) {
         // Bumping this makes the ingest thread drop the batch it holds *and* drain
         // whatever is queued behind it: all of it predates this clear, so replaying
@@ -1070,6 +1138,7 @@ impl App {
             let mut m = self.model.write_recover();
             m.clear();
         }
+        self.resume_recording();
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -2398,6 +2467,29 @@ impl eframe::App for App {
                 if let Err(e) = self.open_file(&path) {
                     self.status = tr!("status_failed_open", { e: &format!("{}", e) });
                 }
+            }
+        }
+
+        // Report a log that reached its memory budget: recording has stopped until
+        // the user clears the table. Without this the frozen table would be
+        // indistinguishable from a device that simply went quiet.
+        if self.recording_full.load(Ordering::Relaxed) {
+            if !self.record_full_reported {
+                self.record_full_reported = true;
+                self.status = tr!("status_log_full");
+            }
+        } else {
+            self.record_full_reported = false;
+        }
+
+        // Autosave the settings. They used to be written only on a clean exit, so a
+        // crash silently dropped every change made during the session. Serializing
+        // is cheap and only a real change is written.
+        if self.autosave_config && std::time::Instant::now() >= self.next_config_save {
+            self.next_config_save = std::time::Instant::now() + Duration::from_secs(5);
+            let current = toml::to_string(&self.cfg).unwrap_or_default();
+            if current != self.last_saved_config && config::save(&self.cfg).is_ok() {
+                self.last_saved_config = current;
             }
         }
 
@@ -3784,11 +3876,22 @@ mod tests {
         let model = RwLock::new(Model::default());
         let mut hint = LogFormat::ThreadTime;
         let clear_gen = AtomicU64::new(4);
+        // No budget here: this test is about the clear, not the memory cap.
+        let full = AtomicBool::new(false);
 
         // Batch assembled under generation 4, view still at generation 4.
         let mut batch = vec![(1u64, "a".to_string()), (1u64, "b".to_string())];
         assert!(append_batch(
-            &model, &mut batch, 1, 4, &clear_gen, &mut hint
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 4,
+                clear_gen: &clear_gen,
+                budget: u64::MAX,
+                full: &full,
+            },
+            &mut hint
         ));
         assert_eq!(model.read_recover().entries.len(), 2);
 
@@ -3798,7 +3901,16 @@ mod tests {
         clear_gen.store(5, Ordering::Release);
         let mut batch = vec![(1u64, "c".to_string())];
         assert!(!append_batch(
-            &model, &mut batch, 1, 4, &clear_gen, &mut hint
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 4,
+                clear_gen: &clear_gen,
+                budget: u64::MAX,
+                full: &full,
+            },
+            &mut hint
         ));
         assert_eq!(
             model.read_recover().entries.len(),
@@ -3810,16 +3922,85 @@ mod tests {
         // lands normally.
         let mut batch = vec![(1u64, "d".to_string())];
         assert!(append_batch(
-            &model, &mut batch, 1, 5, &clear_gen, &mut hint
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 5,
+                clear_gen: &clear_gen,
+                budget: u64::MAX,
+                full: &full,
+            },
+            &mut hint
         ));
         assert_eq!(model.read_recover().entries.len(), 3);
 
         // A superseded source is still filtered per line, as before.
         let mut batch = vec![(9u64, "stale".to_string())];
         assert!(!append_batch(
-            &model, &mut batch, 1, 5, &clear_gen, &mut hint
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 5,
+                clear_gen: &clear_gen,
+                budget: u64::MAX,
+                full: &full,
+            },
+            &mut hint
         ));
         assert_eq!(model.read_recover().entries.len(), 3);
+    }
+
+    #[test]
+    fn append_batch_stops_at_the_memory_budget_and_reports_it() {
+        let model = RwLock::new(Model::default());
+        let mut hint = LogFormat::ThreadTime;
+        let clear_gen = AtomicU64::new(4);
+        let full = AtomicBool::new(false);
+
+        // The check compares the log's current usage against the budget, so start
+        // already over it.
+        model.write_recover().estimated_bytes = 100;
+        let budget = 1;
+        let mut batch = vec![(1u64, "a".to_string())];
+        assert!(!append_batch(
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 4,
+                clear_gen: &clear_gen,
+                budget,
+                full: &full,
+            },
+            &mut hint
+        ));
+        assert!(
+            model.read_recover().entries.is_empty(),
+            "nothing may be appended past the budget"
+        );
+        assert!(
+            full.load(Ordering::Relaxed),
+            "the caller must learn it stopped"
+        );
+
+        // Clearing frees the budget, so the next batch lands.
+        model.write_recover().clear();
+        let mut batch = vec![(1u64, "b".to_string())];
+        assert!(append_batch(
+            &model,
+            &mut batch,
+            &BatchContext {
+                source_epoch: 1,
+                generation_at_read: 4,
+                clear_gen: &clear_gen,
+                budget: u64::MAX,
+                full: &full,
+            },
+            &mut hint
+        ));
+        assert_eq!(model.read_recover().entries.len(), 1);
     }
 
     #[cfg(unix)]
@@ -4903,6 +5084,96 @@ mod ui_tests {
             "status bar should reflect the actually-used encoding"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn a_full_log_stops_recording_but_keeps_draining_the_channel() {
+        let mut h = harness();
+        h.run();
+
+        // Pretend the log has already reached its budget.
+        h.state().model.write().unwrap().estimated_bytes = u64::MAX;
+        let epoch = h.state().source_epoch.load(Ordering::Acquire);
+        for i in 0..3 {
+            h.state()
+                .line_tx
+                .send((epoch, format!("line {i}")))
+                .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.state().recording_full.load(Ordering::Relaxed)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.state().recording_full.load(Ordering::Relaxed),
+            "reaching the budget must stop recording"
+        );
+        assert!(
+            h.state().line_tx.is_empty(),
+            "a full log must still drain the channel, or the device's pipe backs up"
+        );
+        assert_eq!(
+            h.state().model.read().unwrap().entries.len(),
+            0,
+            "a full log must not add rows"
+        );
+
+        // Clearing frees the budget, so recording resumes with the new epoch.
+        // Clearing frees the budget and resumes recording. The first batch after a
+        // clear is deliberately discarded together with the pre-clear backlog (see
+        // `clear_gen`), so keep feeding until one lands.
+        h.state_mut().clear();
+        assert!(!h.state().recording_full.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.state().model.read().unwrap().entries.is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            let epoch = h.state().source_epoch.load(Ordering::Acquire);
+            h.state()
+                .line_tx
+                .send((epoch, "after clear".into()))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !h.state().model.read().unwrap().entries.is_empty(),
+            "clearing must resume recording"
+        );
+    }
+
+    #[test]
+    fn a_full_log_is_reported_once_and_clearing_resumes_recording() {
+        let mut h = harness();
+        h.run();
+
+        // The ingest thread sets this once the log reaches its memory budget.
+        h.state().recording_full.store(true, Ordering::Relaxed);
+        h.run();
+        assert_eq!(
+            h.state().status,
+            tr!("status_log_full"),
+            "stopped recording must say so, not just freeze the table"
+        );
+
+        // Reported once: it must not keep overwriting later statuses every frame.
+        h.state_mut().status = "other".into();
+        h.run();
+        assert_eq!(h.state().status, "other");
+
+        // Clearing frees the budget, so recording resumes and the notice can fire again.
+        h.state_mut().clear();
+        h.run();
+        assert!(
+            !h.state().recording_full.load(Ordering::Relaxed),
+            "clearing must lift the cap"
+        );
+
+        h.state().recording_full.store(true, Ordering::Relaxed);
+        h.run();
+        assert_eq!(h.state().status, tr!("status_log_full"));
     }
 
     #[test]
