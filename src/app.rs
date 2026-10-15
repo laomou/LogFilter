@@ -2459,15 +2459,24 @@ impl eframe::App for App {
             self.status = tr!("status_load_truncated", { e: &msg });
         }
 
-        // Detect a device session that ended on its own (device unplugged, adb
-        // exited, bad command) so the UI stops showing it as live and surfaces
-        // any captured stderr instead of a silently frozen stream.
-        if self.session.as_ref().is_some_and(|s| s.has_ended()) {
-            // The session ended on its own (stdout closed). Reap it first — that
-            // joins the stderr worker so the captured failure reason is complete,
-            // instead of racing the stdout/stderr close and losing it.
-            let mut s = self.session.take().expect("checked is_some above");
-            s.reap();
+        // EOF is not process exit. Poll without blocking, including while idle,
+        // so a quiet or stderr-only command remains stoppable and its eventual
+        // exit is noticed without mouse/keyboard activity.
+        let session_done = if let Some(session) = self.session.as_mut() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            match session.try_reap() {
+                Ok(done) => done,
+                Err(e) => {
+                    self.stop_session();
+                    self.status = tr!("status_dev_read_failed", { tool: self.transport.binary(), e: &e.to_string() });
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if session_done {
+            let s = self.session.take().expect("completed session exists");
             let err = s.stderr_text();
             // A failed read and a finished stream both just stop producing bytes,
             // so report the recorded I/O error distinctly when there is one
@@ -5073,6 +5082,57 @@ mod ui_tests {
         assert!(h.state().session.is_none());
         h.state_mut().stop_session();
         // No panic, status unchanged
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_eof_keeps_the_ui_responsive_and_stop_enabled() {
+        let gate =
+            std::env::temp_dir().join(format!("lf_ui_stdout_eof_{}.gate", std::process::id()));
+        let worker_gate = gate.clone();
+        let (done_tx, done_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let mut h = harness();
+            h.step();
+            let script = format!(
+                "exec 1>&-; while [ ! -e {} ]; do sleep 0.01; done",
+                shlex::try_quote(worker_gate.to_str().unwrap()).unwrap()
+            );
+            let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+            let app = h.state_mut();
+            app.session = Some(
+                transport::Session::start(
+                    Transport::Adb,
+                    Some("/bin/sh"),
+                    None,
+                    &cmd,
+                    app.line_tx.clone(),
+                    app.source_epoch.load(Ordering::Acquire),
+                )
+                .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !h.state().session.as_ref().unwrap().stdout_ended() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // This frame used to block in child.wait(), before handling input.
+            h.step();
+            assert!(
+                h.state().session.is_some(),
+                "live child must remain stoppable"
+            );
+            h.get_by_label(tr!("stop").as_str()).click();
+            h.step();
+            assert!(h.state().session.is_none());
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        // Release the mock process even if a regression blocks the UI worker.
+        std::fs::write(&gate, b"").unwrap();
+        result.expect("UI blocked after stdout EOF");
+        worker.join().unwrap();
+        std::fs::remove_file(gate).unwrap();
     }
 
     #[test]
