@@ -1,8 +1,12 @@
+use crate::lock::MutexExt;
 use crate::model::LogFormat;
+use crate::recording;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -262,17 +266,59 @@ pub struct Session {
     read_error: Arc<Mutex<Option<String>>>,
 }
 
+enum Output {
+    Recording(recording::Writer),
+    #[cfg(test)]
+    Lines(Sender<(u64, String)>),
+}
+
 impl Session {
     /// Spawn `<binary> [device-flag serial] <cmd_args...>` and stream stdout
     /// lines into `tx`, each tagged with `epoch` so the ingest side can drop
     /// lines from a superseded source. Blank lines are preserved; the reader
     /// thread exits when stdout closes.
+    #[cfg(test)]
     pub fn start(
         transport: Transport,
         override_path: Option<&str>,
         device: Option<&str>,
         cmd: &str,
         tx: Sender<(u64, String)>,
+        epoch: u64,
+    ) -> Result<Self> {
+        Self::start_output(
+            transport,
+            override_path,
+            device,
+            cmd,
+            Output::Lines(tx),
+            epoch,
+        )
+    }
+
+    pub fn start_recording(
+        transport: Transport,
+        override_path: Option<&str>,
+        device: Option<&str>,
+        cmd: &str,
+        writer: recording::Writer,
+    ) -> Result<Self> {
+        Self::start_output(
+            transport,
+            override_path,
+            device,
+            cmd,
+            Output::Recording(writer),
+            0,
+        )
+    }
+
+    fn start_output(
+        transport: Transport,
+        override_path: Option<&str>,
+        device: Option<&str>,
+        cmd: &str,
+        output: Output,
         epoch: u64,
     ) -> Result<Self> {
         let mut command = transport_command(transport, override_path);
@@ -296,42 +342,64 @@ impl Session {
             )
         })?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = match &output {
+            Output::Recording(writer) => writer.state.paused.clone(),
+            #[cfg(test)]
+            Output::Lines(_) => Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(test)]
         let paused_thr = paused.clone();
         let read_error = Arc::new(Mutex::new(None));
         let read_error_thr = read_error.clone();
-        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_requested = match &output {
+            Output::Recording(writer) => writer.state.stop.clone(),
+            #[cfg(test)]
+            Output::Lines(_) => Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(test)]
         let reader_stop_requested = stop_requested.clone();
         let epoch = Arc::new(AtomicU64::new(epoch));
+        #[cfg(test)]
         let reader_epoch = epoch.clone();
         let handle = thread::Builder::new()
             .name("device-reader".into())
             .spawn(move || {
-                let reader = BufReader::new(stdout);
-                let outcome = stream_lossy_lines(reader, |line| {
-                    if reader_stop_requested.load(Ordering::Acquire) {
-                        return false;
+                match output {
+                    Output::Recording(writer) => {
+                        // Disk I/O is the only backpressure on the device pipe.
+                        // Preview pause, filters and rendering never gate this path.
+                        let state = writer.state.clone();
+                        writer.record(stdout);
+                        let error = state.error.lock_recover().clone();
+                        if let Some(error) = error {
+                            *read_error_thr.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                        }
                     }
-                    // "Pause Capture" stops *recording*, not *reading*: keep
-                    // draining the kernel pipe so adb doesn't back up and the
-                    // device's logd doesn't rotate our logs away.
-                    if paused_thr.load(Ordering::Relaxed) {
-                        return true;
-                    }
-                    // Never wait here. The reader is the only consumer of adb's
-                    // stdout, so blocking on the log channel lets the pipe fill and
-                    // the device's logd rotate our logs away — losing an unknown
-                    // amount *on the device*. The channel is unbounded (see
-                    // `log_channel`), so this can neither block nor drop: a backlog
-                    // just lives in memory until the ingest side catches up.
-                    tx.send((reader_epoch.load(Ordering::Acquire), line))
-                        .is_ok()
-                });
-                if let Err(e) = outcome {
-                    // Record why, so the UI can say "capture failed" rather than
-                    // reporting an I/O failure as an ordinary end of session.
-                    if let Ok(mut slot) = read_error_thr.lock() {
-                        *slot = Some(e.to_string());
+                    #[cfg(test)]
+                    Output::Lines(tx) => {
+                        let reader = BufReader::new(stdout);
+                        let outcome = stream_lossy_lines(reader, |line| {
+                            if reader_stop_requested.load(Ordering::Acquire) {
+                                return false;
+                            }
+                            // "Pause Capture" stops *recording*, not *reading*: keep
+                            // draining the kernel pipe so adb doesn't back up and the
+                            // device's logd doesn't rotate our logs away.
+                            if paused_thr.load(Ordering::Relaxed) {
+                                return true;
+                            }
+                            // Test-only legacy line sink for the epoch/cancellation tests.
+                            // Production device capture always uses Output::Recording.
+                            tx.send((reader_epoch.load(Ordering::Acquire), line))
+                                .is_ok()
+                        });
+                        if let Err(e) = outcome {
+                            // Record why, so the UI can say "capture failed" rather than
+                            // reporting an I/O failure as an ordinary end of session.
+                            if let Ok(mut slot) = read_error_thr.lock() {
+                                *slot = Some(e.to_string());
+                            }
+                        }
                     }
                 }
             })?;
@@ -347,12 +415,24 @@ impl Session {
                 thread::Builder::new()
                     .name("device-stderr".into())
                     .spawn(move || {
-                        let mut s = String::new();
-                        if es.read_to_string(&mut s).is_ok() && !s.is_empty() {
-                            if let Ok(mut guard) = buf.lock() {
-                                guard.push_str(&s);
+                        // Diagnostics are bounded too; keep draining after the
+                        // retained prefix fills so stderr never blocks capture.
+                        let mut retained = Vec::new();
+                        let mut block = [0u8; 8192];
+                        loop {
+                            match es.read(&mut block) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    let keep =
+                                        n.min((256 * 1024usize).saturating_sub(retained.len()));
+                                    retained.extend_from_slice(&block[..keep]);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(_) => break,
                             }
                         }
+                        *buf.lock().unwrap_or_else(|e| e.into_inner()) =
+                            String::from_utf8_lossy(&retained).into_owned();
                     })?,
             )
         } else {
@@ -444,6 +524,10 @@ impl Session {
     /// the session stoppable until both the process and its pipe workers end.
     /// Completed workers are joined before the UI reads their final diagnostics.
     pub fn try_reap(&mut self) -> std::io::Result<bool> {
+        if self.stop_requested.load(Ordering::Acquire) {
+            self.stop();
+            return Ok(true);
+        }
         let Some(child) = &mut self.child else {
             return Ok(true);
         };
@@ -485,17 +569,9 @@ impl Drop for Session {
 /// produced it, so the ingest thread can drop lines from a superseded one.
 pub type LogLine = (u64, String);
 
-/// The channel carrying streamed device lines from the reader thread to the
-/// ingest thread.
-///
-/// Deliberately **unbounded**. The reader is the only consumer of adb's stdout, so
-/// if it ever waits for room the pipe fills and the device's `logd` rotates our
-/// logs away, losing an unknown amount *on the device*. An unbounded channel makes
-/// `send` non-blocking and infallible, so the reader always keeps draining and
-/// nothing is dropped; the trade is that a backlog lives in memory until the
-/// ingest side catches up. That side parses and appends at ~687k lines/s
-/// (measured), far above any realistic device rate, so the backlog does not
-/// actually grow — which is why no overflow mechanism is needed.
+/// Local-file loader channel, throttled by io::send_throttled. Production device
+/// capture does not use this channel: raw bytes go directly to the recording
+/// file, and preview batches use recording::preview's bounded single-slot queue.
 pub fn log_channel() -> (Sender<LogLine>, Receiver<LogLine>) {
     crossbeam_channel::unbounded()
 }
@@ -512,6 +588,7 @@ pub fn log_channel() -> (Sender<LogLine>, Receiver<LogLine>) {
 /// first line with a non-UTF-8 byte, and the previous `map_while(Result::ok)`
 /// turned that single bad line into a premature end-of-stream — silently losing
 /// it and everything after. Lossy decoding keeps the line and the stream alive.
+#[cfg(test)]
 fn stream_lossy_lines<R: BufRead>(
     mut reader: R,
     mut emit: impl FnMut(String) -> bool,

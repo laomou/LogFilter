@@ -1848,6 +1848,7 @@ dependencies = [
  "egui_kittest",
  "encoding_rs",
  "image",
+ "libc",
  "regex",
  "rfd",
  "serde",

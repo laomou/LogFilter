@@ -229,6 +229,9 @@ pub struct Model {
     /// way to tell that a later index now refers to a *different* log — otherwise
     /// it would silently mix two datasets into one result.
     pub source_generation: u64,
+    /// Entries evicted from the front of a live preview. Displayed line numbers
+    /// keep advancing while all in-memory indices remain relative to the cache.
+    pub first_line: usize,
 
     // Cached distinct-value counts for column picker panels.
     pub pid_counts: HashMap<String, usize>,
@@ -250,12 +253,13 @@ impl Model {
         self.tid_counts.clear();
         self.tag_counts.clear();
         self.level_counts = [0; 6];
+        self.first_line = 0;
     }
 
     pub fn append(&mut self, mut entry: LogEntry) {
-        entry.line_no = (self.entries.len() as u64) + 1;
+        entry.line_no = (self.first_line + self.entries.len()) as u64 + 1;
         if entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F) {
-            self.error_lines.push(entry.line_no as u32 - 1);
+            self.error_lines.push(self.entries.len() as u32);
         }
         // Bump per-value counts. Clone the key only when it's a new distinct
         // value (cardinality is tiny), not once per line.
@@ -269,6 +273,57 @@ impl Model {
         // saturating_add keeps a debug build from panicking on the theoretical wrap.
         self.estimated_bytes = self.estimated_bytes.saturating_add(entry.estimated_bytes());
         self.entries.push(entry);
+    }
+
+    /// Evict in chunks to amortize Vec compaction. Every dependent index/count
+    /// moves with the cache, and generation changes invalidate export snapshots.
+    pub fn evict_to(&mut self, target_bytes: u64) -> usize {
+        let mut count = 0;
+        let mut remaining = self.estimated_bytes;
+        while remaining > target_bytes && count < self.entries.len() {
+            remaining = remaining.saturating_sub(self.entries[count].estimated_bytes());
+            count += 1;
+        }
+        if count == 0 {
+            return 0;
+        }
+        for entry in self.entries.drain(..count) {
+            for (map, key) in [
+                (&mut self.pid_counts, entry.pid()),
+                (&mut self.tid_counts, entry.tid()),
+                (&mut self.tag_counts, entry.tag()),
+            ] {
+                if let Some(value) = map.get_mut(key) {
+                    *value -= 1;
+                    if *value == 0 {
+                        map.remove(key);
+                    }
+                }
+            }
+            if let Some(i) = level_index(entry.level) {
+                self.level_counts[i] -= 1;
+            }
+        }
+        self.estimated_bytes = remaining;
+        self.first_line += count;
+        let shift = count as u32;
+        self.filtered = self
+            .filtered
+            .iter()
+            .filter_map(|n| n.checked_sub(shift))
+            .collect();
+        self.bookmarks = self
+            .bookmarks
+            .iter()
+            .filter_map(|n| n.checked_sub(shift))
+            .collect();
+        self.error_lines = self
+            .error_lines
+            .iter()
+            .filter_map(|n| n.checked_sub(shift))
+            .collect();
+        self.source_generation = self.source_generation.wrapping_add(1);
+        count
     }
 }
 
@@ -314,6 +369,51 @@ pub const LEVEL_MASKS: [LevelMask; 6] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_rebases_indices_counts_and_preserves_line_numbers() {
+        let mut m = Model::default();
+        for tag in ["old", "old", "new", "new"] {
+            m.append(LogEntry::from_fields(
+                "",
+                "",
+                LevelMask::E,
+                "1",
+                "2",
+                tag,
+                "message",
+            ));
+        }
+        m.filtered = vec![0, 1, 2, 3];
+        m.bookmarks = [0, 2, 3].into();
+        let generation = m.source_generation;
+        let target = m.entries[2..].iter().map(LogEntry::estimated_bytes).sum();
+        assert_eq!(m.evict_to(target), 2);
+        assert_eq!(m.filtered, [0, 1]);
+        assert_eq!(m.bookmarks, [0, 1].into());
+        assert_eq!(m.error_lines, [0, 1]);
+        assert_eq!(m.first_line, 2);
+        assert_eq!(m.entries[0].line_no, 3);
+        assert_eq!(m.tag_counts.get("old"), None);
+        assert_eq!(m.tag_counts.get("new"), Some(&2));
+        assert_eq!(m.level_counts[4], 2);
+        assert_ne!(m.source_generation, generation);
+        m.append(LogEntry::from_fields(
+            "",
+            "",
+            LevelMask::E,
+            "1",
+            "2",
+            "new",
+            "last",
+        ));
+        assert_eq!(m.entries[2].line_no, 5);
+        assert_eq!(m.error_lines, [0, 1, 2]);
+        assert_eq!(
+            m.estimated_bytes,
+            m.entries.iter().map(LogEntry::estimated_bytes).sum()
+        );
+    }
 
     #[test]
     fn append_sets_line_no_sequentially() {
