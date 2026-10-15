@@ -3713,42 +3713,33 @@ impl App {
     fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
-            let current_recording = self.recording.as_ref();
-            if let Some(recorded) = current_recording {
-                let recorded_bytes = recorded.written.load(Ordering::Acquire);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(tr!("recording_progress", {
-                        written: &format!("{:.1}", recorded_bytes as f64 / 1048576.0),
-                        backlog: &format!("{:.1}", recorded_bytes.saturating_sub(self.preview_offset) as f64 / 1048576.0)
-                    }));
-                    if recorded.finished.load(Ordering::Acquire) {
-                        ui.label(if recorded.error.lock_recover().is_some() { tr!("recording_incomplete") } else { tr!("recording_complete") });
-                    } else if self.session.is_none() { ui.label(tr!("recording_finishing")); }
-                    if self.preview_omitted > 0 { ui.label(tr!("preview_omitted", { n: &self.preview_omitted.to_string() })); }
-                });
-            }
             let model = self.model.read_recover();
+            // File viewing identifies that file; capture identifies its actual
+            // output, including after Stop/Clear. Before capture, show logs/.
+            let source_path = model
+                .file_path
+                .clone()
+                .or_else(|| {
+                    self.recording
+                        .as_ref()
+                        .map(|recorded| recorded.path.clone())
+                })
+                .or_else(|| {
+                    self.recording_directory
+                        .as_ref()
+                        .map(|directory| directory.path().to_path_buf())
+                })
+                .or_else(|| self.recording_directory_override.clone())
+                .or_else(config::recordings_dir);
             ui.horizontal(|ui| {
-                match &model.file_path {
-                    Some(p) => {
-                        // Only the file name, middle-ellipsized to fit the bar;
-                        // full path on hover. Budget is in logical points, so it
-                        // scales with window size and DPI.
-                        let name = p
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| p.display().to_string());
-                        let budget = (ui.available_width() * 0.5).max(80.0);
-                        let full = p.display().to_string();
-                        ui.label(fit_middle(ui, &name, budget)).on_hover_ui(|ui| {
-                            // Single-line tooltip: don't wrap the full path.
-                            ui.add(egui::Label::new(full).wrap_mode(egui::TextWrapMode::Extend));
-                        });
-                    }
-                    None => {
-                        ui.label(tr!("no_file"));
-                    }
+                if let Some(path) = source_path {
+                    let full = path.display().to_string();
+                    let budget = (ui.available_width() * 0.5).max(80.0);
+                    ui.label(fit_middle(ui, &full, budget)).on_hover_ui(|ui| {
+                        ui.add(egui::Label::new(full).wrap_mode(egui::TextWrapMode::Extend));
+                    });
+                } else {
+                    ui.label(tr!("no_file"));
                 }
                 ui.separator();
                 let global_rows = self
@@ -3762,7 +3753,9 @@ impl App {
                     } else {
                         tr!("total")
                     },
-                    self.paged.as_ref().map(|paged| paged.source.base.total_rows.load(Ordering::Acquire))
+                    self.paged
+                        .as_ref()
+                        .map(|paged| paged.source.base.total_rows.load(Ordering::Acquire))
                         .unwrap_or(model.entries.len() as u64)
                 ));
                 if model.first_line > 0 {
@@ -3807,6 +3800,23 @@ impl App {
                 if n > 0 {
                     ui.separator();
                     ui.label(tr!("selected_n", { n: &n.to_string() }));
+                }
+                if let Some(recorded) = &self.recording {
+                    if recorded.finished.load(Ordering::Acquire) {
+                        ui.separator();
+                        ui.label(if recorded.error.lock_recover().is_some() {
+                            tr!("recording_incomplete")
+                        } else {
+                            tr!("recording_complete")
+                        });
+                    } else if self.session.is_none() {
+                        ui.separator();
+                        ui.label(tr!("recording_finishing"));
+                    }
+                    if self.preview_omitted > 0 {
+                        ui.separator();
+                        ui.label(tr!("preview_omitted", { n: &self.preview_omitted.to_string() }));
+                    }
                 }
                 // Shown alongside the selection count, not instead of it, so a
                 // message never hides the count (and needs no expiry to reveal it).

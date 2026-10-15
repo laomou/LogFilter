@@ -69,7 +69,6 @@ page_label = 页码
 page_rows = 每页最多 {n} 行
 recording_force_exit = 立即退出
 recording_cancel_exit = 取消退出
-recording_progress = 已写入 {written} MiB · 预览积压 {backlog} MiB
 recording_complete = 已写入文件
 recording_incomplete = 采集异常，已接收的数据保留在文件中
 recording_finishing = 正在完成录制…
