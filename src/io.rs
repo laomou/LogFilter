@@ -118,6 +118,11 @@ impl Tail {
 /// caller to continue immediately rather than wait for the next tick.
 const MAX_TAIL_READ: u64 = 64 * 1024 * 1024;
 
+/// Maximum decoded UTF-8 bytes in one line during initial loading (excluding
+/// its newline). A missing newline or binary input must not grow a buffer until
+/// allocation aborts. Stop with an error and retain previously emitted lines.
+const MAX_INITIAL_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 // Compile-time guard: a larger budget re-opens the unbounded-peak issue the
 // chunked read fixes, so raising it has to be a deliberate, reviewed change
 // rather than a stray edit. `tail_default_budget_bounds_one_poll_end_to_end`
@@ -260,99 +265,17 @@ fn is_high_surrogate(enc: &'static Encoding, unit: &[u8]) -> bool {
 /// Stream a UTF-8 (or BOM-detected UTF-16) file's lines into `tx`.
 ///
 /// Returns `Ok(Tail)` describing how to follow subsequent appends on clean EOF
-/// (or when a newer source epoch supersedes this load); returns `Err` only on a
-/// genuine mid-stream read failure, so the caller can distinguish "finished"
-/// from "truncated by an I/O error" and surface the latter instead of
-/// presenting a partial file as whole.
+/// (or when a newer source epoch supersedes this load). Read errors, oversized
+/// lines and allocation failures return `Err` so the UI reports a partial load.
 pub fn send_utf8_lines(
     file: File,
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
 ) -> std::io::Result<Tail> {
-    let identity = file_identity(&file)?;
-    let mut reader = BufReader::new(file);
-    let bom = reader.fill_buf()?;
-    if bom.starts_with(&[0xFF, 0xFE]) || bom.starts_with(&[0xFE, 0xFF]) {
-        // UTF-16 BOM detected: pick LE/BE and delegate to the decoded path.
-        let is_le = bom.starts_with(&[0xFF, 0xFE]);
-        let mut file2 = reader.into_inner();
-        // fill_buf() advanced the file position (up to the BufReader capacity)
-        // and into_inner() discards that buffer, so rewind — otherwise the
-        // delegate reads from ~8 KiB in and the file's first chunk is skipped.
-        file2.seek(SeekFrom::Start(0))?;
-        let enc = if is_le {
-            encoding_rs::UTF_16LE
-        } else {
-            encoding_rs::UTF_16BE
-        };
-        return send_decoded_lines_with_enc(file2, tx, epoch, source_epoch, enc);
-    }
-
-    let mut buf = Vec::new();
-    let mut first = true;
-    let mut read_bytes: u64 = 0;
-    let mut has_partial_line = false;
-    loop {
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            let metadata = reader.get_ref().metadata()?;
-            return Ok(if has_partial_line {
-                Tail::ReloadOnChange {
-                    loaded_len: read_bytes,
-                    modified: metadata.modified().ok(),
-                    enc: encoding_rs::UTF_8,
-                    identity,
-                }
-            } else {
-                Tail::Append {
-                    offset: read_bytes,
-                    enc: encoding_rs::UTF_8,
-                    identity,
-                }
-            });
-        }
-        read_bytes += n as u64;
-        if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(Tail::Append {
-                offset: read_bytes,
-                enc: encoding_rs::UTF_8,
-                identity,
-            });
-        }
-        if buf.last() != Some(&b'\n') {
-            has_partial_line = true;
-        }
-        // Fast path: valid UTF-8 -> borrow & trim on the slice, no lossy scan.
-        let line: String = if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-            let mut s = s;
-            if first {
-                first = false;
-                s = s.strip_prefix('\u{feff}').unwrap_or(s);
-            }
-            s.trim_end_matches(['\n', '\r']).to_string()
-        } else {
-            let mut line = String::from_utf8_lossy(&buf).into_owned();
-            if first {
-                first = false;
-                if line.starts_with('\u{feff}') {
-                    line.remove(0);
-                }
-            }
-            while line.ends_with(['\n', '\r']) {
-                line.pop();
-            }
-            line
-        };
-        if !send_throttled(&tx, epoch, line) {
-            return Ok(Tail::Append {
-                offset: read_bytes,
-                enc: encoding_rs::UTF_8,
-                identity,
-            });
-        }
-    }
+    // Use the same fixed-size decoder and bounded line buffer for every file
+    // encoding, including BOM-detected UTF-16 and lossy UTF-8.
+    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, encoding_rs::UTF_8)
 }
 
 pub fn send_decoded_lines(
@@ -388,7 +311,7 @@ pub fn send_decoded_lines(
 /// an incomplete tail, the prefix is still treated as UTF-8.
 fn looks_like_utf8(file: &mut File) -> std::io::Result<bool> {
     const SNIFF: usize = 64 * 1024;
-    let mut buf = vec![0u8; SNIFF];
+    let mut buf = [0u8; SNIFF];
     let mut read = 0;
     // A single read() may return a short count; loop until the buffer is full or
     // EOF so a large file is actually sniffed on its first 64 KiB, not ~8 KiB.
@@ -424,10 +347,8 @@ fn send_decoded_lines_with_enc(
     // alignment as the initial load. fill_buf leaves the BOM for the decoder.
     let enc = Encoding::for_bom(reader.fill_buf()?).map_or(enc, |(detected, _)| detected);
     let mut decoder = enc.new_decoder();
-    // Accumulate decoded text across chunks so we can split into lines only when
-    // a full line is available — avoids splitting a multibyte character mid-sequence.
-    let mut text_buf = String::with_capacity(8192);
-    let mut raw_buf = vec![0u8; 8192];
+    let mut lines = InitialLines::new(MAX_INITIAL_LINE_BYTES);
+    let mut raw_buf = [0u8; 8192];
     let mut read_bytes: u64 = 0;
     // All encodings here tail incrementally: UTF-8 and the byte-safe legacy
     // codepages split on raw `\n`, and UTF-16 is handled specially in
@@ -444,40 +365,31 @@ fn send_decoded_lines_with_enc(
             identity,
         }
     };
+    let mut emit =
+        |line| source_epoch.load(Ordering::Acquire) == epoch && send_throttled(&tx, epoch, line);
     loop {
-        let n = reader.read(&mut raw_buf)?;
+        if source_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(tail_for(read_bytes));
+        }
+        let n = match reader.read(&mut raw_buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        read_bytes += n as u64;
+        if !decode_chunk(&mut decoder, &raw_buf[..n], n == 0, &mut lines, &mut emit)? {
+            return Ok(tail_for(read_bytes));
+        }
         if n == 0 {
             break;
         }
-        read_bytes += n as u64;
-        if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(tail_for(read_bytes));
-        }
-        decode_chunk(
-            &mut decoder,
-            &raw_buf[..n],
-            false,
-            &mut text_buf,
-            &tx,
-            epoch,
-        );
-        if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(tail_for(read_bytes));
-        }
     }
-    // Final flush: drain any remaining buffered bytes from the decoder.
-    decode_chunk(&mut decoder, b"", true, &mut text_buf, &tx, epoch);
     // Emit any remaining text without a trailing newline as a final line.
-    let has_partial_line = !text_buf.is_empty();
+    let has_partial_line = !lines.pending.is_empty();
     if has_partial_line {
-        if source_epoch.load(Ordering::Acquire) != epoch {
-            return Ok(tail_for(read_bytes));
-        }
-        let line = text_buf.trim_end_matches(['\r', '\n']).to_string();
         // Match the UTF-8 reader's `read_until` behavior: a final logical line
         // is preserved even if CR/LF normalization leaves it empty (for example
         // a file ending in a lone `\r`).
-        if !send_throttled(&tx, epoch, line) {
+        if !emit(lines.take_line()) {
             return Ok(tail_for(read_bytes));
         }
     }
@@ -707,59 +619,86 @@ pub(crate) fn file_changed_since(
         || metadata.modified().ok() != modified)
 }
 
-/// Decode all of `input`, growing `text_buf` or flushing complete lines when
-/// the decoder reports a full output buffer. `decode_to_string` deliberately
-/// does not reallocate its destination; ignoring `OutputFull` would otherwise
-/// discard the unconsumed suffix of a long log line.
+/// Buffer only the unfinished line, using fallible, capped growth. Completed
+/// strings transfer directly to the channel without allocating a second copy.
+struct InitialLines {
+    pending: String,
+    max_bytes: usize,
+}
+
+impl InitialLines {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            pending: String::new(),
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, text: &str, emit: &mut impl FnMut(String) -> bool) -> std::io::Result<bool> {
+        for part in text.split_inclusive('\n') {
+            let content = part.strip_suffix('\n').unwrap_or(part);
+            reserve_initial_line(&mut self.pending, content.len(), self.max_bytes)?;
+            self.pending.push_str(content);
+            if part.ends_with('\n') && !emit(self.take_line()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn take_line(&mut self) -> String {
+        self.pending
+            .truncate(self.pending.trim_end_matches('\r').len());
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn reserve_initial_line(line: &mut String, additional: usize, limit: usize) -> std::io::Result<()> {
+    let needed = line
+        .len()
+        .checked_add(additional)
+        .filter(|&n| n <= limit)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("log line exceeds the {limit}-byte decoded limit; loading stopped"),
+            )
+        })?;
+    if needed > line.capacity() {
+        // Geometric growth avoids copying an ever longer prefix every 8 KiB;
+        // capping the requested capacity prevents rounding above the limit.
+        let capacity = needed.max(line.capacity().saturating_mul(2)).min(limit);
+        line.try_reserve_exact(capacity - line.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "not enough memory to buffer a log line; loading stopped",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Decode into a fixed-size scratch buffer. Decoder state retains incomplete
+/// characters between chunks; only complete UTF-8 text reaches the line buffer.
 fn decode_chunk(
     decoder: &mut Decoder,
     mut input: &[u8],
     last: bool,
-    text_buf: &mut String,
-    tx: &Sender<(u64, String)>,
-    epoch: u64,
-) {
+    lines: &mut InitialLines,
+    emit: &mut impl FnMut(String) -> bool,
+) -> std::io::Result<bool> {
+    let mut decoded = [0u8; 8192];
     loop {
-        if text_buf.len() == text_buf.capacity() {
-            text_buf.reserve(8192);
-        }
-        let (result, read, _) = decoder.decode_to_string(input, text_buf, last);
+        let (result, read, written, _) = decoder.decode_to_utf8(input, &mut decoded, last);
         input = &input[read..];
-
-        // Drain complete lines to free space before allocating more. A single
-        // very long line has no newline to drain, in which case reserve grows
-        // the backing buffer and the next iteration resumes the same input.
-        let consumed = flush_lines(text_buf, tx, epoch);
-        if consumed > 0 {
-            text_buf.drain(..consumed);
+        let text = std::str::from_utf8(&decoded[..written]).expect("decoder produces valid UTF-8");
+        if !lines.push(text, emit)? {
+            return Ok(false);
         }
-
-        match result {
-            CoderResult::InputEmpty => return,
-            CoderResult::OutputFull if consumed == 0 => text_buf.reserve(8192),
-            CoderResult::OutputFull => {}
+        if result == CoderResult::InputEmpty {
+            return Ok(true);
         }
     }
-}
-
-/// Scan `buf` for complete lines (terminated by `\n`), send each via `tx`,
-/// and return the number of bytes consumed (the processed prefix length).
-/// The caller drains that prefix once — O(n) per chunk instead of O(n²).
-fn flush_lines(buf: &str, tx: &Sender<(u64, String)>, epoch: u64) -> usize {
-    let bytes = buf.as_bytes();
-    let mut consumed = 0usize;
-    let mut scan = 0usize;
-    while scan < bytes.len() {
-        if bytes[scan] == b'\n' {
-            let line = buf[consumed..scan].trim_end_matches(['\r', '\n']);
-            if !send_throttled(tx, epoch, line.to_string()) {
-                return consumed;
-            }
-            consumed = scan + 1;
-        }
-        scan += 1;
-    }
-    consumed
 }
 
 /// Lines allowed to sit queued ahead of the ingest side before a *file* reader
@@ -808,6 +747,182 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn initial_line_limit_allows_exact_fit_and_resets_after_newlines() {
+        let mut lines = InitialLines::new(8);
+        let mut got = Vec::new();
+        let mut emit = |line| {
+            got.push(line);
+            true
+        };
+        lines.push("12345678", &mut emit).unwrap();
+        lines.push("\n\nabc\r", &mut emit).unwrap();
+        lines.push("\n", &mut emit).unwrap();
+        for _ in 0..100 {
+            lines.push("日志\n", &mut emit).unwrap();
+        }
+        assert!(lines.pending.is_empty());
+        assert_eq!(&got[..3], ["12345678", "", "abc"]);
+        assert_eq!(got.len(), 103);
+        assert!(got[3..].iter().all(|line| line == "日志"));
+    }
+
+    #[test]
+    fn initial_line_growth_is_capped_and_allocation_failure_is_recoverable() {
+        let mut line = String::new();
+        reserve_initial_line(&mut line, 7, 8).unwrap();
+        line.push_str("1234567");
+        let err = reserve_initial_line(&mut line, 2, 8).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(line, "1234567");
+        assert!(line.capacity() <= 8);
+
+        // An impossible reservation fails before allocation, instead of routing
+        // through Rust's aborting allocation handler.
+        let mut empty = String::new();
+        let err = reserve_initial_line(&mut empty, usize::MAX, usize::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn initial_decoding_limits_decoded_bytes_in_every_encoding() {
+        for enc in [
+            encoding_rs::UTF_8,
+            encoding_rs::GBK,
+            encoding_rs::UTF_16LE,
+            encoding_rs::UTF_16BE,
+        ] {
+            let text = format!("first\n{}\nunread\n", "日志".repeat(32));
+            let raw = if enc == encoding_rs::UTF_16LE {
+                text.encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            } else if enc == encoding_rs::UTF_16BE {
+                text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+            } else {
+                enc.encode(&text).0.into_owned()
+            };
+            let mut decoder = enc.new_decoder();
+            let mut lines = InitialLines::new(32);
+            let mut got = Vec::new();
+            let mut emit = |line| {
+                got.push(line);
+                true
+            };
+            let result = raw.chunks(3).try_for_each(|chunk| {
+                decode_chunk(&mut decoder, chunk, false, &mut lines, &mut emit).map(|_| ())
+            });
+            let err = result.expect_err(enc.name());
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(lines.pending.len() <= 32);
+            assert!(lines.pending.capacity() <= 32);
+            assert_eq!(
+                got,
+                ["first"],
+                "{} must retain only complete preceding rows",
+                enc.name()
+            );
+        }
+    }
+
+    #[test]
+    fn initial_lossy_decoding_limits_replacement_character_expansion() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut lines = InitialLines::new(64);
+        let mut emit = |_| panic!("an oversized unfinished line must not be emitted");
+        // 32 invalid input bytes expand to 96 UTF-8 bytes of U+FFFD.
+        let err = decode_chunk(&mut decoder, &[0xff; 32], true, &mut lines, &mut emit).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(lines.pending.len() <= 64);
+    }
+
+    #[test]
+    fn initial_decoder_handles_fragmented_unicode_and_final_flush() {
+        let text = "\u{feff}日志😀\r\n\nlast";
+        for enc in [
+            encoding_rs::UTF_8,
+            encoding_rs::UTF_16LE,
+            encoding_rs::UTF_16BE,
+        ] {
+            let raw = if enc == encoding_rs::UTF_16LE {
+                text.encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            } else if enc == encoding_rs::UTF_16BE {
+                text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+            } else {
+                text.as_bytes().to_vec()
+            };
+            let mut decoder = enc.new_decoder();
+            let mut lines = InitialLines::new(64);
+            let mut got = Vec::new();
+            let mut emit = |line| {
+                got.push(line);
+                true
+            };
+            for chunk in raw.chunks(1) {
+                assert!(decode_chunk(&mut decoder, chunk, false, &mut lines, &mut emit).unwrap());
+            }
+            assert!(decode_chunk(&mut decoder, b"", true, &mut lines, &mut emit).unwrap());
+            assert_eq!(lines.take_line(), "last");
+            assert_eq!(got, ["日志😀", ""]);
+        }
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut lines = InitialLines::new(3);
+        let mut emit = |_| true;
+        decode_chunk(&mut decoder, &[0xe4, 0xbd], false, &mut lines, &mut emit).unwrap();
+        decode_chunk(&mut decoder, b"", true, &mut lines, &mut emit).unwrap();
+        assert_eq!(lines.take_line(), "\u{fffd}");
+    }
+
+    #[test]
+    fn initial_decoder_stops_immediately_when_receiver_is_gone() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut lines = InitialLines::new(8);
+        let mut emit = |_| false;
+        // A disconnected consumer stops before the oversized second row.
+        assert!(!decode_chunk(
+            &mut decoder,
+            b"first\nthis line would exceed the limit",
+            true,
+            &mut lines,
+            &mut emit
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn initial_load_default_limit_rejects_a_sparse_100mib_line() {
+        let path = unique_tmp("initial_oversized");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(b"first\n").unwrap();
+            // Sparse zeros simulate selecting a huge binary/no-newline file
+            // without allocating a matching test fixture in memory.
+            file.set_len(100 * 1024 * 1024).unwrap();
+        }
+        for local in [false, true] {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let file = File::open(&path).unwrap();
+            let epoch = Arc::new(AtomicU64::new(1));
+            let result = if local {
+                send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local)
+            } else {
+                send_utf8_lines(file, tx, 1, epoch)
+            };
+            let err = result
+                .err()
+                .expect("oversized input must fail at the production limit");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err
+                .to_string()
+                .contains(&MAX_INITIAL_LINE_BYTES.to_string()));
+            assert_eq!(rx.try_iter().map(|(_, s)| s).collect::<Vec<_>>(), ["first"]);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn pick_local_encoding_maps_locales() {
         assert_eq!(pick_local_encoding("zh-CN").name(), "GBK");
         assert_eq!(pick_local_encoding("zh_TW.UTF-8").name(), "GBK");
@@ -833,9 +948,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        // send_utf8_lines detects the UTF-16 BOM and delegates to the decoded
-        // path, which must read from the *start* of the file (the BOM detection
-        // uses fill_buf, which advances the position — the delegate has to rewind).
+        // BOM sniffing must retain the buffered prefix so UTF-16 content is
+        // decoded from the start, including when opened through the UTF-8 entry point.
         let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert_eq!(
