@@ -93,9 +93,7 @@ pub struct App {
     exit_recording_error: Option<String>,
     recording_directory: Option<recording::RecordingDirectory>,
     recording_directory_override: Option<PathBuf>,
-    last_recording_path: Option<PathBuf>,
     disk_budget: Arc<recording::DiskBudget>,
-    show_cache_settings: bool,
     pub devices: Vec<String>,
     pub selected_device: String,
     pub selected_cmd: String,
@@ -445,9 +443,7 @@ impl App {
             exit_recording_error: None,
             recording_directory: None,
             recording_directory_override: None,
-            last_recording_path: None,
             disk_budget,
-            show_cache_settings: false,
             devices: Vec::new(),
             selected_device,
             selected_cmd,
@@ -1106,7 +1102,6 @@ impl App {
             }
         };
         let recorded = writer.state.clone();
-        self.last_recording_path = Some(recorded.path.clone());
         self.last_recording = Some(recorded.clone());
         // Install the source and empty dataset atomically with respect to ingest.
         let epoch = {
@@ -2868,37 +2863,6 @@ impl eframe::App for App {
         self.ui_status_bar(ui);
         self.ui_indicator(ui);
         self.ui_table(ui);
-        if self.show_cache_settings {
-            egui::Window::new(tr!("cache_settings"))
-                .open(&mut self.show_cache_settings)
-                .show(&ctx, |ui| {
-                    ui.label(tr!("cache_settings_hint"));
-                    ui.horizontal(|ui| {
-                        ui.label(tr!("disk_cache_limit"));
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.recording.max_disk_mib)
-                                .range(1..=1048576)
-                                .suffix(" MiB"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(tr!("disk_free_reserve"));
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.recording.min_free_mib)
-                                .range(64..=1048576)
-                                .suffix(" MiB"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(tr!("preview_cache_limit"));
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.recording.cache_mib)
-                                .range(0..=32768)
-                                .suffix(" MiB"),
-                        );
-                    });
-                });
-        }
         // Column picker popup (Excel-style) — an Area, shown on the context.
         self.render_picker(&ctx);
 
@@ -3343,9 +3307,6 @@ impl App {
                 if ui.button(tr!("clear")).clicked() {
                     self.clear();
                 }
-                if ui.button(tr!("cache_settings")).clicked() {
-                    self.show_cache_settings = true;
-                }
                 ui.separator();
                 ui.label(tr!("goto"));
                 let goto_resp =
@@ -3430,19 +3391,9 @@ impl App {
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             let current_recording = self.recording.as_ref();
-            if let Some(path) = self.last_recording_path.as_ref() {
-                ui.label(tr!("recording_directory", { path: &path.parent().unwrap_or(Path::new(".")).display().to_string() }));
-                ui.label(tr!("recording_path", { path: &path.display().to_string() }));
-            } else if let Some(directory) = self.recording_directory_override.clone().or_else(config::recordings_dir) {
-                ui.label(tr!("recording_directory", { path: &directory.display().to_string() }));
-            }
             if let Some(recorded) = current_recording {
                 let recorded_bytes = recorded.written.load(Ordering::Acquire);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(tr!("disk_cache_usage", {
-                        used: &format!("{:.1}", self.disk_budget.used.load(Ordering::Acquire) as f64 / 1073741824.0),
-                        limit: &format!("{:.1}", self.disk_budget.limit.load(Ordering::Acquire) as f64 / 1073741824.0)
-                    }));
                     ui.label(tr!("recording_progress", {
                         written: &format!("{:.1}", recorded_bytes as f64 / 1048576.0),
                         backlog: &format!("{:.1}", recorded_bytes.saturating_sub(self.preview_offset) as f64 / 1048576.0)
