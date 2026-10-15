@@ -12,6 +12,7 @@ mod lock;
 mod memory;
 mod model;
 mod parser;
+mod recording;
 mod transport;
 
 use std::path::PathBuf;

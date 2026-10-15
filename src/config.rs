@@ -13,6 +13,30 @@ pub struct Config {
     pub colors: ColorsConfig,
     pub device: DeviceConfig,
     pub recent: RecentConfig,
+    pub recording: RecordingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingConfig {
+    /// Zero selects an automatic preview-cache budget. Raw recordings are on disk.
+    pub cache_mib: u64,
+    pub max_disk_mib: u64,
+    pub min_free_mib: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            cache_mib: 0,
+            max_disk_mib: 10 * 1024,
+            min_free_mib: 1024,
+        }
+    }
+}
+
+pub fn recordings_dir() -> Option<PathBuf> {
+    Some(std::env::current_dir().ok()?.join("logs"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +511,14 @@ pub fn prune_missing_recent(cfg: &mut Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recordings_default_to_logs_under_the_current_directory() {
+        assert_eq!(
+            recordings_dir().unwrap(),
+            std::env::current_dir().unwrap().join("logs")
+        );
+    }
 
     #[test]
     fn props_basic_kv() {

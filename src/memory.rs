@@ -1,10 +1,8 @@
 //! How much of the machine's memory the in-memory log may occupy.
 //!
-//! The log model keeps every parsed line resident, so a long capture grows without
-//! bound. Instead of spilling to disk, the app stops *recording* once the log
-//! reaches a budget and resumes when the user clears the table (see the ingest
-//! thread and `App::clear`). Memory stays bounded, the device's pipe keeps being
-//! drained, and the session stays alive.
+//! Local-file loading stops adding rows at its budget. Live device recording
+//! writes directly to disk; its smaller preview cache evicts old rows without
+//! affecting the raw recording. These are estimates of model memory, not RSS.
 
 /// Divisor applied to the machine's available memory.
 ///
@@ -75,6 +73,17 @@ fn budget_from(available: Option<u64>) -> u64 {
 /// Resident budget for the in-memory log on this machine, sampled once at startup.
 pub fn log_budget() -> u64 {
     budget_from(platform_available())
+}
+
+/// Preview is a cache: roughly 10% of initially available memory, capped at
+/// 2 GiB by default. Configuration can override it, still within the log budget.
+pub fn preview_budget(configured_mib: u64, log_budget: u64) -> u64 {
+    let requested = if configured_mib == 0 {
+        (log_budget / 5).clamp(32 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
+    } else {
+        configured_mib.saturating_mul(1024 * 1024)
+    };
+    requested.clamp(4 * 1024 * 1024, log_budget.max(4 * 1024 * 1024))
 }
 
 #[cfg(test)]

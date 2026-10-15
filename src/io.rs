@@ -701,6 +701,52 @@ fn decode_chunk(
     }
 }
 
+/// Visit a UTF-8 stream with the same bounded decoder used for initial loading.
+/// Used by disk-backed exports: the caller can limit the reader to a snapshot.
+pub(crate) fn visit_utf8_lines(
+    mut reader: impl Read,
+    mut visit: impl FnMut(String) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut lines = InitialLines::new(MAX_INITIAL_LINE_BYTES);
+    let mut raw = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut raw) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        let mut failure = None;
+        let complete =
+            decode_chunk(
+                &mut decoder,
+                &raw[..n],
+                n == 0,
+                &mut lines,
+                &mut |line| match visit(line) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        failure = Some(e);
+                        false
+                    }
+                },
+            )?;
+        if !complete {
+            return Err(failure.expect("visitor stopped after error"));
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    if !lines.pending.is_empty() {
+        visit(lines.take_line())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn same_file(a: &File, b: &File) -> std::io::Result<bool> {
+    Ok(file_identity(a)? == file_identity(b)?)
+}
+
 /// Lines allowed to sit queued ahead of the ingest side before a *file* reader
 /// waits.
 ///

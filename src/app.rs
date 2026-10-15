@@ -9,6 +9,7 @@ use crate::lock::{MutexExt, RwLockExt};
 use crate::memory;
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
 use crate::parser::parse_line_hinted;
+use crate::recording::{self, PreviewBatch, Recording};
 use crate::transport::{self, Transport};
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -80,6 +81,19 @@ pub struct App {
     // device session (adb / hdc)
     pub line_tx: Sender<(u64, String)>,
     pub session: Option<transport::Session>,
+    recording: Option<Arc<Recording>>,
+    previous_recordings: Vec<Arc<Recording>>,
+    recording_error_reported: bool,
+    preview_rx: Option<Receiver<PreviewBatch>>,
+    preview_offset: u64,
+    preview_omitted: u64,
+    closing: bool,
+    close_ready: bool,
+    exit_recording_error: Option<String>,
+    recording_directory: Option<recording::RecordingDirectory>,
+    recording_directory_override: Option<PathBuf>,
+    disk_budget: Arc<recording::DiskBudget>,
+    show_cache_settings: bool,
     pub devices: Vec<String>,
     pub selected_device: String,
     pub selected_cmd: String,
@@ -89,10 +103,10 @@ pub struct App {
     /// Resident budget for the in-memory log, sampled once at startup
     /// (see [`crate::memory`]).
     log_budget: u64,
-    /// Set by the ingest thread once the log reached `log_budget` and recording
-    /// stopped. Cleared whenever the model is cleared, which resumes recording.
+    /// Local-file preview reached `log_budget`. Live device previews evict old
+    /// cache rows instead; this flag never stops disk recording.
     recording_full: Arc<AtomicBool>,
-    /// Whether the "recording stopped" notice has already been shown.
+    /// Whether the local-file preview-limit notice has already been shown.
     record_full_reported: bool,
     /// Config text as last written by the autosave, so unchanged settings do not
     /// rewrite the file every few seconds.
@@ -355,11 +369,8 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let ui = UiState::from_config(&cfg);
         let shared_filter = Arc::new(RwLock::new(ui.to_filter_spec()));
-        // Unbounded so the device reader never waits for room — a blocked reader
-        // stops draining adb's pipe and the device's logd then rotates our logs
-        // away. The file readers apply their own backpressure instead (see
-        // `io::MAX_QUEUED_LINES`), so a fast disk read still cannot queue the whole
-        // file ahead of the slower parse/append step.
+        // Local-file loaders use this throttled channel. Device output is written
+        // directly to disk and has a separate, single-slot preview channel.
         let (line_tx, line_rx) = transport::log_channel();
         // Snapshot of the settings as loaded, so the autosave below only writes
         // when something actually changed.
@@ -397,6 +408,10 @@ impl App {
         let init_palette_raw = cfg.colors.highlights.clone();
         let init_level_colors = parse_level_colors(&cfg);
         let init_col_widths = cfg.view.columns;
+        let disk_budget = recording::DiskBudget::new(
+            cfg.recording.max_disk_mib.max(1).saturating_mul(1048576),
+            cfg.recording.min_free_mib.max(64).saturating_mul(1048576),
+        );
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
@@ -416,6 +431,19 @@ impl App {
             user_font_stems: font_stems,
             line_tx,
             session: None,
+            recording: None,
+            previous_recordings: Vec::new(),
+            recording_error_reported: false,
+            preview_rx: None,
+            preview_offset: 0,
+            preview_omitted: 0,
+            closing: false,
+            close_ready: false,
+            exit_recording_error: None,
+            recording_directory: None,
+            recording_directory_override: None,
+            disk_budget,
+            show_cache_settings: false,
             devices: Vec::new(),
             selected_device,
             selected_cmd,
@@ -474,6 +502,12 @@ impl App {
         let mut app = Self::from_ctx(ctx, Config::default(), None);
         // Never let a test write the real config file.
         app.autosave_config = false;
+        static TEST_INSTANCE: AtomicU64 = AtomicU64::new(0);
+        app.recording_directory_override = Some(std::env::temp_dir().join(format!(
+            "lf_recording_test_{}_{}",
+            std::process::id(),
+            TEST_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        )));
         app
     }
 
@@ -485,6 +519,8 @@ impl App {
 
         // Stop any device session so its lines don't interleave with the file.
         self.stop_session();
+        self.retire_recording();
+        self.poll_recording();
 
         // Whether this is a switch to a *different* file, as opposed to an
         // automatic reload of the same file after a truncation/rotation. Only a
@@ -1010,7 +1046,62 @@ impl App {
     /// Start (or restart) a streaming session for the selected transport, device,
     /// and command, replacing any session or file tail currently feeding the view.
     fn run_session(&mut self) {
+        if self.closing {
+            return;
+        }
+        self.exit_recording_error = None;
         self.stop_session();
+        self.retire_recording();
+        self.poll_recording();
+        self.disk_budget.limit.store(
+            self.cfg
+                .recording
+                .max_disk_mib
+                .max(1)
+                .saturating_mul(1048576),
+            Ordering::Relaxed,
+        );
+        self.disk_budget.min_free.store(
+            self.cfg
+                .recording
+                .min_free_mib
+                .max(64)
+                .saturating_mul(1048576),
+            Ordering::Relaxed,
+        );
+        let writer = (|| {
+            if self.recording_directory.is_none() {
+                let parent = self
+                    .recording_directory_override
+                    .clone()
+                    .or_else(config::recordings_dir)
+                    .ok_or_else(|| std::io::Error::other("logs directory is unavailable"))?;
+                self.recording_directory = Some(recording::RecordingDirectory::create(&parent)?);
+            }
+            if self
+                .previous_recordings
+                .iter()
+                .all(|r| r.finished.load(Ordering::Acquire))
+            {
+                // Include files left by earlier runs and notice user cleanup.
+                self.disk_budget.used.store(
+                    self.recording_directory.as_ref().unwrap().used_bytes()?,
+                    Ordering::Release,
+                );
+            }
+            recording::Writer::create_with_budget(
+                self.recording_directory.as_ref().unwrap().path(),
+                self.disk_budget.clone(),
+            )
+        })();
+        let writer = match writer {
+            Ok(writer) => writer,
+            Err(e) => {
+                self.status = tr!("status_recording_failed", { e: &e.to_string() });
+                return;
+            }
+        };
+        let recorded = writer.state.clone();
         // Install the source and empty dataset atomically with respect to ingest.
         let epoch = {
             let mut model = self.model.write_recover();
@@ -1035,16 +1126,33 @@ impl App {
             // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
             Some(transport::device_serial(&self.selected_device))
         };
-        match transport::Session::start(
+        let preview = match recording::preview(
+            recorded.clone(),
+            0,
+            epoch,
+            self.source_epoch.clone(),
+            self.ctx.clone(),
+        ) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.status = tr!("status_recording_failed", { e: &e.to_string() });
+                return;
+            }
+        };
+        match transport::Session::start_recording(
             self.transport,
             self.transport_override().as_deref(),
             device,
             &self.selected_cmd,
-            self.line_tx.clone(),
-            epoch,
+            writer,
         ) {
             Ok(s) => {
                 self.session = Some(s);
+                self.preview_rx = Some(preview);
+                self.recording = Some(recorded);
+                self.recording_error_reported = false;
+                self.preview_offset = 0;
+                self.preview_omitted = 0;
                 self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
             }
             Err(e) => {
@@ -1061,19 +1169,29 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        if let Some(recorded) = &self.recording {
+            let paused = !recorded.paused.load(Ordering::Relaxed);
+            recorded.paused.store(paused, Ordering::Relaxed);
+            self.status = if paused {
+                tr!("status_preview_paused")
+            } else {
+                tr!("status_preview_resumed")
+            };
+            return;
+        }
         if let Some(s) = &self.session {
             let new = !s.is_paused();
             s.set_paused(new);
             self.status = if new {
-                tr!("status_dev_paused", { tool: self.transport.binary() })
+                tr!("status_preview_paused")
             } else {
-                tr!("status_dev_resumed", { tool: self.transport.binary() })
+                tr!("status_preview_resumed")
             };
         }
     }
 
     fn clear(&mut self) {
-        {
+        let epoch = {
             let mut m = self.model.write_recover();
             let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             // Queued lines keep their old epoch. A live device tags future
@@ -1083,12 +1201,118 @@ impl App {
             }
             m.clear();
             self.recording_full.store(false, Ordering::Relaxed);
+            epoch
+        };
+        if let Some(recorded) = &self.recording {
+            self.preview_offset = recorded.written.load(Ordering::Acquire);
+            self.preview_omitted = 0;
+            // Continue from the clear boundary; the recording file is untouched.
+            match recording::preview(
+                recorded.clone(),
+                self.preview_offset,
+                epoch,
+                self.source_epoch.clone(),
+                self.ctx.clone(),
+            ) {
+                Ok(rx) => self.preview_rx = Some(rx),
+                Err(e) => self.status = tr!("status_preview_failed", { e: &e.to_string() }),
+            }
         }
         self.record_full_reported = false;
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
         self.notify_filter();
+    }
+
+    fn retire_recording(&mut self) {
+        self.preview_rx = None;
+        if let Some(recorded) = self.recording.take() {
+            // Cancel even a paused preview if the next capture fails to start.
+            let _model = self.model.write_recover();
+            self.source_epoch.fetch_add(1, Ordering::AcqRel);
+            self.previous_recordings.push(recorded);
+        }
+        self.recording_error_reported = false;
+    }
+
+    fn poll_recording(&mut self) {
+        let mut evicted = false;
+        let mut appended = false;
+        let budget = memory::preview_budget(self.cfg.recording.cache_mib, self.log_budget);
+        if let Some(rx) = self.preview_rx.as_ref().filter(|_| {
+            !self
+                .recording
+                .as_ref()
+                .is_some_and(|r| r.paused.load(Ordering::Relaxed))
+        }) {
+            // Process one bounded batch per frame; the next frame is requested
+            // immediately while catching up, and no disk backlog is held in RAM.
+            if let Ok(batch) = rx.try_recv() {
+                if batch.epoch == self.source_epoch.load(Ordering::Acquire) {
+                    self.preview_offset = batch.offset;
+                    self.preview_omitted += batch.omitted;
+                    let mut m = self.model.write_recover();
+                    for entry in batch.entries {
+                        let cost = entry.estimated_bytes();
+                        if cost > budget {
+                            self.preview_omitted += 1;
+                            continue;
+                        }
+                        if m.estimated_bytes.saturating_add(cost) > budget {
+                            let target = (budget * 3 / 4).min(budget.saturating_sub(cost));
+                            evicted |= m.evict_to(target) > 0;
+                        }
+                        m.append(entry);
+                        appended = true;
+                    }
+                }
+            }
+        }
+        if evicted {
+            self.selected_rows.clear();
+            self.selection_anchor = None;
+            self.selection_cursor = None;
+            self.pending_scroll = None;
+            self.cached_picker_col = None;
+            self.refilter();
+        } else if appended {
+            let (lock, wake) = &*self.wake;
+            *lock.lock_recover() = true;
+            wake.notify_one();
+        }
+        if appended {
+            self.ctx.request_repaint();
+        }
+        if let Some(recorded) = &self.recording {
+            if !self.recording_error_reported {
+                if let Some(e) = recorded.error.lock_recover().clone() {
+                    self.recording_error_reported = true;
+                    recorded.error_reported.store(true, Ordering::Relaxed);
+                    self.exit_recording_error = Some(e.clone());
+                    self.status = tr!("status_recording_failed", { e: &e });
+                }
+            }
+            if let Some(e) = recorded.preview_error.lock_recover().take() {
+                self.status = tr!("status_preview_failed", { e: &e });
+            }
+            if !recorded.finished.load(Ordering::Acquire) {
+                self.ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        self.previous_recordings.retain(|recorded| {
+            if !recorded.finished.load(Ordering::Acquire) {
+                self.ctx.request_repaint_after(Duration::from_millis(100));
+                return true;
+            }
+            if !recorded.error_reported.swap(true, Ordering::Relaxed) {
+                if let Some(e) = recorded.error.lock_recover().clone() {
+                    self.exit_recording_error = Some(e.clone());
+                    self.status = tr!("status_recording_failed", { e: &e });
+                }
+            }
+            false
+        });
     }
 
     /// Reset the value-based column-picker filters (PID/TID/tag/level). These
@@ -1211,6 +1435,53 @@ impl App {
     }
 
     fn save_filtered(&mut self) {
+        if self.recording.is_some() && !self.ui.bookmarks_only {
+            self.export_filtered_recording();
+        } else {
+            self.save_filtered_view();
+        }
+    }
+
+    fn export_filtered_recording(&mut self) {
+        if self.save_result_rx.is_some() {
+            return;
+        }
+        let Some(recorded) = &self.recording else {
+            return;
+        };
+        let source = recorded.path.clone();
+        let length = recorded.written.load(Ordering::Acquire);
+        let filter = self.shared_filter.read_recover().clone();
+        let name = format!(
+            "logfilter_filtered_{}.log",
+            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+        );
+        let Some(destination) = rfd::FileDialog::new().set_file_name(name).save_file() else {
+            return;
+        };
+        let (tx, rx) = bounded(1);
+        self.save_result_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::Builder::new()
+            .name("recording-export".into())
+            .spawn(move || {
+                let result = match recording::export(&source, length, &destination, Some(&filter)) {
+                    Ok(rows) => SaveOutcome::Saved {
+                        rows: rows as usize,
+                        path: destination,
+                    },
+                    Err(e) => SaveOutcome::Failed(e.to_string()),
+                };
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            })
+            .expect("spawn recording export");
+    }
+
+    fn save_filtered_view(&mut self) {
+        if self.save_result_rx.is_some() {
+            return;
+        }
         // Snapshot, under one short lock, *which* rows to export and which
         // dataset they belong to. Re-reading `filtered` per chunk instead would
         // let a filter change mid-export swap in a different selection, mixing two
@@ -1235,6 +1506,21 @@ impl App {
             .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
+        if self
+            .recording
+            .iter()
+            .chain(self.previous_recordings.iter())
+            .any(|recorded| {
+                recorded.path == dest
+                    || std::fs::canonicalize(&dest)
+                        .ok()
+                        .zip(std::fs::canonicalize(&recorded.path).ok())
+                        .is_some_and(|(a, b)| a == b)
+            })
+        {
+            self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
+            return;
+        }
 
         // The background thread streams the rows out in chunks. The snapshot
         // costs 4 bytes per row; the rows themselves are never all copied at once
@@ -1387,6 +1673,7 @@ impl App {
                 // O(N²) (which is what re-scanning from 0 every batch would cost).
                 let mut last_spec_gen: u64 = u64::MAX;
                 let mut processed_len: usize = 0;
+                let mut last_source_generation = u64::MAX;
                 loop {
                     let mut pending = lock.lock_recover();
                     while !*pending {
@@ -1402,9 +1689,14 @@ impl App {
 
                     let spec_gen = gen.load(Ordering::Acquire);
                     let spec = spec_lock.read_recover().clone();
-                    let entries_len = model.read_recover().entries.len();
+                    let (entries_len, source_generation) = {
+                        let m = model.read_recover();
+                        (m.entries.len(), m.source_generation)
+                    };
 
-                    let full = spec_gen != last_spec_gen || entries_len < processed_len;
+                    let full = spec_gen != last_spec_gen
+                        || entries_len < processed_len
+                        || source_generation != last_source_generation;
                     let start = if full { 0 } else { processed_len };
 
                     let cap = if full {
@@ -1428,6 +1720,10 @@ impl App {
                         }
                         let end = (i + CHUNK).min(entries_len);
                         let m = model.read_recover();
+                        if m.source_generation != source_generation {
+                            aborted = true;
+                            break;
+                        }
                         let hi = end.min(m.entries.len());
                         for j in i..hi {
                             if spec.matches(&m.entries[j], j as u32, &m.bookmarks) {
@@ -1453,7 +1749,10 @@ impl App {
                     // could have landed since we snapshotted `entries_len` — otherwise
                     // `filtered` could hold indices past the end of a shrunk log.
                     let mut m = model.write_recover();
-                    if gen.load(Ordering::Acquire) != spec_gen || m.entries.len() < entries_len {
+                    if gen.load(Ordering::Acquire) != spec_gen
+                        || m.entries.len() < entries_len
+                        || m.source_generation != source_generation
+                    {
                         drop(m);
                         processed_len = 0;
                         last_spec_gen = u64::MAX;
@@ -1467,6 +1766,7 @@ impl App {
                     drop(m);
                     processed_len = entries_len;
                     last_spec_gen = spec_gen;
+                    last_source_generation = source_generation;
                     ctx.request_repaint();
                 }
             })
@@ -2376,9 +2676,37 @@ fn build_highlighted(
     job
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        self.source_epoch.fetch_add(1, Ordering::AcqRel);
+        self.preview_rx = None;
+        // Session::drop only requests termination; final disk cleanup runs off
+        // the UI thread. Normal window close waits for recording.finished first.
+        self.session = None;
+        self.recording = None;
+        self.previous_recordings.clear();
+        self.recording_directory = None;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_ready {
+            let unfinished = self
+                .recording
+                .as_ref()
+                .is_some_and(|r| !r.finished.load(Ordering::Acquire))
+                || self
+                    .previous_recordings
+                    .iter()
+                    .any(|r| !r.finished.load(Ordering::Acquire));
+            if unfinished || self.save_result_rx.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.closing = true;
+                self.stop_session();
+            }
+        }
         // Capture window inner size each frame so we can persist it on exit.
         self.last_window_size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
 
@@ -2492,12 +2820,79 @@ impl eframe::App for App {
             };
         }
 
+        self.poll_recording();
+        if self.closing {
+            let finished = self
+                .recording
+                .as_ref()
+                .is_none_or(|r| r.finished.load(Ordering::Acquire))
+                && self
+                    .previous_recordings
+                    .iter()
+                    .all(|r| r.finished.load(Ordering::Acquire));
+            let saving = self.save_result_rx.is_some();
+            if finished && !saving && self.exit_recording_error.is_none() {
+                self.close_ready = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                egui::Window::new(tr!("recording_finishing"))
+                    .collapsible(false)
+                    .show(&ctx, |ui| {
+                        ui.label(tr!("recording_exit_wait"));
+                        if let Some(error) = &self.exit_recording_error {
+                            ui.label(error);
+                        }
+                        if ui
+                            .add_enabled(!saving, egui::Button::new(tr!("recording_force_exit")))
+                            .clicked()
+                        {
+                            self.close_ready = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button(tr!("recording_cancel_exit")).clicked() {
+                            self.closing = false;
+                        }
+                    });
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
         self.handle_shortcuts(&ctx);
         self.ui_menu_bar(ui);
         self.ui_options_panel(ui);
         self.ui_status_bar(ui);
         self.ui_indicator(ui);
         self.ui_table(ui);
+        if self.show_cache_settings {
+            egui::Window::new(tr!("cache_settings"))
+                .open(&mut self.show_cache_settings)
+                .show(&ctx, |ui| {
+                    ui.label(tr!("cache_settings_hint"));
+                    ui.horizontal(|ui| {
+                        ui.label(tr!("disk_cache_limit"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.recording.max_disk_mib)
+                                .range(1..=1048576)
+                                .suffix(" MiB"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tr!("disk_free_reserve"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.recording.min_free_mib)
+                                .range(64..=1048576)
+                                .suffix(" MiB"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tr!("preview_cache_limit"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.recording.cache_mib)
+                                .range(0..=32768)
+                                .suffix(" MiB"),
+                        );
+                    });
+                });
+        }
         // Column picker popup (Excel-style) — an Area, shown on the context.
         self.render_picker(&ctx);
 
@@ -2565,7 +2960,11 @@ impl App {
                         }
                     });
                     ui.separator();
-                    if ui.button(tr!("save_filtered")).clicked() {
+                    if ui
+                        .button(tr!("save_filtered"))
+                        .on_hover_text(tr!("recording_export_scope"))
+                        .clicked()
+                    {
                         self.save_filtered();
                         ui.close();
                     }
@@ -2914,19 +3313,17 @@ impl App {
                 {
                     self.run_session();
                 }
-                let pause_label = self
-                    .session
+                let paused = self
+                    .recording
                     .as_ref()
-                    .map(|s| {
-                        if s.is_paused() {
-                            tr!("resume")
-                        } else {
-                            tr!("pause")
-                        }
-                    })
-                    .unwrap_or(tr!("pause"));
+                    .map(|r| r.paused.load(Ordering::Relaxed))
+                    .unwrap_or_else(|| self.session.as_ref().is_some_and(|s| s.is_paused()));
+                let pause_label = if paused { tr!("resume") } else { tr!("pause") };
                 if ui
-                    .add_enabled(running, egui::Button::new(pause_label))
+                    .add_enabled(
+                        running || self.recording.is_some(),
+                        egui::Button::new(pause_label),
+                    )
                     .clicked()
                 {
                     self.toggle_pause();
@@ -2939,6 +3336,9 @@ impl App {
                 }
                 if ui.button(tr!("clear")).clicked() {
                     self.clear();
+                }
+                if ui.button(tr!("cache_settings")).clicked() {
+                    self.show_cache_settings = true;
                 }
                 ui.separator();
                 ui.label(tr!("goto"));
@@ -2984,7 +3384,9 @@ impl App {
         let m = self.model.read_recover();
         let total = m.entries.len();
         let line_no = row + 1;
-        if row >= total {
+        let before_cache = row < m.first_line;
+        let row = row.saturating_sub(m.first_line);
+        if before_cache || row >= total {
             drop(m);
             self.status = tr!("status_goto_out_of_range", {
                 n: &line_no.to_string(),
@@ -3021,6 +3423,30 @@ impl App {
     fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
+            if self.recording.is_none() {
+                if let Some(directory) = self.recording_directory_override.clone().or_else(config::recordings_dir) {
+                    ui.label(tr!("recording_directory", { path: &directory.display().to_string() }));
+                }
+            }
+            if let Some(recorded) = &self.recording {
+                let recorded_bytes = recorded.written.load(Ordering::Acquire);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(tr!("recording_directory", { path: &recorded.path.parent().unwrap_or(Path::new(".")).display().to_string() }));
+                    ui.label(tr!("recording_path", { path: &recorded.path.display().to_string() }));
+                    ui.label(tr!("disk_cache_usage", {
+                        used: &format!("{:.1}", self.disk_budget.used.load(Ordering::Acquire) as f64 / 1073741824.0),
+                        limit: &format!("{:.1}", self.disk_budget.limit.load(Ordering::Acquire) as f64 / 1073741824.0)
+                    }));
+                    ui.label(tr!("recording_progress", {
+                        written: &format!("{:.1}", recorded_bytes as f64 / 1048576.0),
+                        backlog: &format!("{:.1}", recorded_bytes.saturating_sub(self.preview_offset) as f64 / 1048576.0)
+                    }));
+                    if recorded.finished.load(Ordering::Acquire) {
+                        ui.label(if recorded.error.lock_recover().is_some() { tr!("recording_incomplete") } else { tr!("recording_complete") });
+                    } else if self.session.is_none() { ui.label(tr!("recording_finishing")); }
+                    if self.preview_omitted > 0 { ui.label(tr!("preview_omitted", { n: &self.preview_omitted.to_string() })); }
+                });
+            }
             let model = self.model.read_recover();
             ui.horizontal(|ui| {
                 match &model.file_path {
@@ -3045,7 +3471,8 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.label(format!("{} {}", tr!("total"), model.entries.len()));
+                ui.label(format!("{} {}", if self.recording.is_some() { tr!("cached_rows") } else { tr!("total") }, model.entries.len()));
+                if model.first_line > 0 { ui.label(tr!("preview_evicted", { n: &model.first_line.to_string() })); }
                 ui.separator();
                 // When entries are loaded but the active filters hide every one of
                 // them, color the filtered count so the empty table has a visible
@@ -3063,25 +3490,6 @@ impl App {
                 }
                 ui.separator();
                 ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
-                // A device capture is the only path that does not throttle itself:
-                // its reader never waits on the log channel, so a backlog here means
-                // the ingest side is behind and memory is growing. File readers stop
-                // at `io::MAX_QUEUED_LINES`, where a full queue is the intended
-                // state, so showing the count for them would be noise.
-                if self.session.is_some() {
-                    let queued = self.line_tx.len();
-                    if queued > 0 {
-                        ui.separator();
-                        let text = format!("{} {}", tr!("queued"), queued);
-                        ui.label(if queued >= crate::io::MAX_QUEUED_LINES {
-                            egui::RichText::new(text)
-                                .color(Color32::from_rgb(230, 126, 34))
-                                .strong()
-                        } else {
-                            egui::RichText::new(text)
-                        });
-                    }
-                }
                 // Encoding only applies to a loaded file (resolves "Local" to the
                 // sniffed codepage). An adb stream is always UTF-8-lossy and an
                 // empty view has no source, so showing an encoding there is stale
@@ -4082,6 +4490,55 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("copy tried to reacquire the model lock");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn rolling_preview_keeps_memory_bounded_without_changing_the_recording() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.cfg.recording.cache_mib = 4;
+        let writer =
+            recording::Writer::create(app.recording_directory_override.as_ref().unwrap()).unwrap();
+        let state = writer.state.clone();
+        let line = "x".repeat(4095) + "\n";
+        let raw = line.repeat(2500);
+        writer.record(std::io::Cursor::new(raw.as_bytes()));
+        app.recording = Some(state.clone());
+        app.preview_rx =
+            Some(recording::preview(state.clone(), 0, 0, app.source_epoch.clone(), ctx).unwrap());
+        let budget = memory::preview_budget(4, app.log_budget);
+        app.selected_rows.insert(0);
+        app.selection_anchor = Some(0);
+        wait_until(|| {
+            app.poll_recording();
+            assert!(app.model.read_recover().estimated_bytes <= budget);
+            app.preview_offset == raw.len() as u64
+        });
+        let m = app.model.read_recover();
+        assert!(m.first_line > 0);
+        assert_eq!(m.first_line + m.entries.len(), 2500);
+        assert_eq!(m.entries.last().unwrap().line_no, 2500);
+        assert!(app.selected_rows.is_empty());
+        assert_eq!(app.selection_anchor, None);
+        drop(m);
+        wait_until(|| {
+            let m = app.model.read_recover();
+            m.filtered.len() == m.entries.len()
+        });
+        assert_eq!(std::fs::read(&state.path).unwrap(), raw.as_bytes());
+        let export = state.path.with_extension("filtered");
+        let spec = FilterSpec {
+            find: vec!["x".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            recording::export(&state.path, raw.len() as u64, &export, Some(&spec)).unwrap(),
+            2500
+        );
+        assert_eq!(std::fs::read(&export).unwrap(), raw.as_bytes());
+        std::fs::remove_file(export).unwrap();
+        app.clear();
+        assert_eq!(std::fs::read(&state.path).unwrap(), raw.as_bytes());
     }
 
     #[test]
@@ -5158,6 +5615,114 @@ mod ui_tests {
     }
 
     // ─── Open local file ─────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_recording_survives_pause_clear_and_resume_after_process_exit() {
+        let mut h = harness();
+        h.step();
+        let gate = std::env::temp_dir().join(format!("lf_disk_ui_gate_{}", std::process::id()));
+        let script = format!(
+            "printf 'first\\n'; while [ ! -e {} ]; do sleep 0.01; done; printf 'second\\n'",
+            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+        );
+        h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
+        h.state_mut().selected_cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+        h.state_mut().run_session();
+        let state = h.state().recording.as_ref().unwrap().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.state().model.read_recover().entries.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            h.step();
+        }
+        h.state_mut().toggle_pause();
+        h.state_mut().clear();
+        std::fs::write(&gate, b"").unwrap();
+        while !state.finished.load(Ordering::Acquire) || h.state().session.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            h.step();
+        }
+        assert!(h.state().model.read_recover().entries.is_empty());
+        assert_eq!(std::fs::read(&state.path).unwrap(), b"first\nsecond\n");
+        // Resume must work after the process ended, to finish previewing the file.
+        h.state_mut().toggle_pause();
+        while h.state().model.read_recover().entries.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            h.step();
+        }
+        let m = h.state().model.read_recover();
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].raw(), "second");
+        drop(m);
+        assert!(state.error.lock_recover().is_none());
+        let old_path = state.path.clone();
+        h.state_mut().run_session();
+        assert_ne!(h.state().recording.as_ref().unwrap().path, old_path);
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"first\nsecond\n");
+        h.state_mut().stop_session();
+        std::fs::remove_file(gate).unwrap();
+    }
+
+    #[test]
+    fn unavailable_recording_directory_prevents_capture_start() {
+        let mut h = harness();
+        h.step();
+        let blocked = h
+            .state()
+            .recording_directory_override
+            .as_ref()
+            .unwrap()
+            .with_extension("file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        h.state_mut().recording_directory_override = Some(blocked.clone());
+        h.state_mut().run_session();
+        assert!(h.state().session.is_none());
+        assert!(h.state().recording.is_none());
+        assert!(!h.state().status.is_empty());
+        std::fs::remove_file(blocked).unwrap();
+    }
+
+    #[test]
+    fn window_close_waits_for_recording_finalization_without_blocking_frames() {
+        let mut h = harness();
+        h.step();
+        let writer =
+            recording::Writer::create(h.state().recording_directory_override.as_ref().unwrap())
+                .unwrap();
+        let state = writer.state.clone();
+        h.state_mut().recording = Some(state.clone());
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        h.step();
+        assert!(h.state().closing);
+        assert!(!h.state().close_ready);
+        writer.record(std::io::Cursor::new(b"final bytes\n"));
+        h.step();
+        assert!(h.state().close_ready);
+        assert_eq!(std::fs::read(&state.path).unwrap(), b"final bytes\n");
+    }
+
+    #[test]
+    fn window_close_reports_failure_instead_of_silently_exiting() {
+        let mut h = harness();
+        h.step();
+        let writer =
+            recording::Writer::create(h.state().recording_directory_override.as_ref().unwrap())
+                .unwrap();
+        h.state_mut().recording = Some(writer.state.clone());
+        h.state_mut().closing = true;
+        drop(writer); // An unfinished writer is marked failed, not saved.
+        h.step();
+        assert!(!h.state().close_ready);
+        assert!(h.state().exit_recording_error.is_some());
+    }
 
     #[test]
     fn oversized_initial_line_reports_a_load_error_in_the_ui() {
