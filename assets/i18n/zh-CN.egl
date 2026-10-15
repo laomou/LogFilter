@@ -61,6 +61,12 @@ total = 总计
 filtered = 已过滤
 bookmarks = 书签
 queued = 排队
+paged_mode = 分页文件
+paged_indexing = 正在建立索引…
+page_previous = 上一页
+page_next = 下一页
+page_label = 页码
+page_rows = 每页最多 {n} 行
 recording_force_exit = 立即退出
 recording_cancel_exit = 取消退出
 recording_progress = 已写入 {written} MiB · 预览积压 {backlog} MiB
@@ -142,6 +148,13 @@ status_saved = 已保存 {n} 行 → {path}
 status_saved_incomplete = 导出不完整: 已写入 {n} 行 → {path}（日志在导出期间被清空或重载）
 status_save_failed = 保存失败: {e}
 status_log_full = 文件预览已达内存上限，当前只显示文件的部分内容
+status_paged_indexing = 已打开大文件，正在建立磁盘索引
+status_page_not_indexed = 该页尚未完成索引
+status_page_loading = 正在加载第 {page} 页…
+status_page_loaded = 已加载第 {page} 页，共索引 {rows} 行
+status_page_failed = 分页文件错误：{e}
+paged_utf8_only = 大文件分页浏览目前仅支持 UTF-8
+status_goto_paged_filtered = 跳转原始行号前请先清除全局过滤
 
 # goto status
 status_goto_out_of_range = 行号 {n} 超出范围（共 {total} 行）

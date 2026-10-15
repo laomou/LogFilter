@@ -241,6 +241,25 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn replace_page(&mut self, path: PathBuf, entries: Vec<LogEntry>) {
+        self.clear();
+        self.file_path = Some(path);
+        self.entries = entries;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.level.contains(LevelMask::E) || entry.level.contains(LevelMask::F) {
+                self.error_lines.push(index as u32);
+            }
+            bump_count(&mut self.pid_counts, entry.pid());
+            bump_count(&mut self.tid_counts, entry.tid());
+            bump_count(&mut self.tag_counts, entry.tag());
+            if let Some(i) = level_index(entry.level) {
+                self.level_counts[i] += 1;
+            }
+            self.estimated_bytes = self.estimated_bytes.saturating_add(entry.estimated_bytes());
+        }
+        self.filtered = (0..self.entries.len() as u32).collect();
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.filtered.clear();

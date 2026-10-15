@@ -24,7 +24,7 @@ pub struct FileIdentity {
     created: Option<SystemTime>,
 }
 
-fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
+pub(crate) fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
     let metadata = file.metadata()?;
     #[cfg(unix)]
     {

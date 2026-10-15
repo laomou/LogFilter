@@ -8,10 +8,11 @@ use crate::io::{
 use crate::lock::{MutexExt, RwLockExt};
 use crate::memory;
 use crate::model::{EncodingChoice, LevelMask, LogFormat, Model};
+use crate::paged_file::{self, PageLoad, PagedSource};
 use crate::parser::parse_line_hinted;
 use crate::recording::{self, PreviewBatch, Recording};
 use crate::transport::{self, Transport};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
@@ -44,6 +45,15 @@ enum SaveOutcome {
 struct DeviceRefresh {
     transport: Transport,
     rx: Receiver<Result<Vec<String>, String>>,
+}
+
+struct PagedView {
+    source: PagedSource,
+    page: u64,
+    page_rx: Option<PageLoad>,
+    filter_initialized: bool,
+    filter: Option<FilterSpec>,
+    goto_line: Option<u64>,
 }
 
 pub struct App {
@@ -103,6 +113,7 @@ pub struct App {
     /// Resident budget for the in-memory log, sampled once at startup
     /// (see [`crate::memory`]).
     log_budget: u64,
+    paged_file_budget: u64,
     /// Local-file preview reached `log_budget`. Live device previews evict old
     /// cache rows instead; this flag never stops disk recording.
     recording_full: Arc<AtomicBool>,
@@ -164,6 +175,7 @@ pub struct App {
     /// truncates a load, so the UI can tell the user the file loaded only
     /// partially instead of silently presenting it as complete.
     load_error: Arc<Mutex<Option<String>>>,
+    paged: Option<PagedView>,
 }
 
 pub struct UiState {
@@ -410,6 +422,7 @@ impl App {
         let init_col_widths = cfg.view.columns;
         let disk_budget =
             recording::DiskBudget::new(cfg.recording.min_free_mib.max(64).saturating_mul(1048576));
+        let log_budget = memory::log_budget();
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
@@ -447,7 +460,8 @@ impl App {
             selected_cmd,
             transport,
             auto_scroll: true,
-            log_budget: memory::log_budget(),
+            log_budget,
+            paged_file_budget: memory::paged_file_budget(log_budget),
             recording_full: Arc::new(AtomicBool::new(false)),
             record_full_reported: false,
             last_saved_config,
@@ -479,6 +493,7 @@ impl App {
             cached_col_widths: init_col_widths,
             save_result_rx: None,
             load_error: Arc::new(Mutex::new(None)),
+            paged: None,
         };
         app.spawn_filter_thread(ctx.clone());
         app.spawn_ingest_thread(ctx.clone(), line_rx);
@@ -514,6 +529,14 @@ impl App {
         // background load — avoids TOCTOU (open-to-use race) and eliminates the
         // duplicate open in the reader thread.
         let file = std::fs::File::open(path)?;
+        if paged_file::should_page(path, self.log_budget)? {
+            if self.encoding_choice() != EncodingChoice::Utf8 {
+                return Err(anyhow!(tr!("paged_utf8_only")));
+            }
+            drop(file);
+            return self.open_paged_file(path);
+        }
+        self.paged = None;
 
         // Stop any device session so its lines don't interleave with the file.
         self.stop_session();
@@ -609,6 +632,142 @@ impl App {
         Ok(())
     }
 
+    fn open_paged_file(&mut self, path: &Path) -> Result<()> {
+        let index = paged_file::build_index(path, self.paged_file_budget, self.ctx.clone())?;
+        self.stop_session();
+        self.retire_recording();
+        self.poll_recording();
+        let source_changed = self.model.read_recover().file_path.as_deref() != Some(path);
+        {
+            let mut model = self.model.write_recover();
+            self.source_epoch.fetch_add(1, Ordering::AcqRel);
+            *self.source_format_hint.lock_recover() = LogFormat::Unknown;
+            self.recording_full.store(false, Ordering::Relaxed);
+            model.clear();
+            model.file_path = Some(path.to_path_buf());
+        }
+        self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.pending_scroll = None;
+        self.auto_scroll = false;
+        self.cached_picker_col = None;
+        self.record_full_reported = false;
+        *self.load_error.lock_recover() = None;
+        *self.reload_request.lock_recover() = None;
+        if source_changed {
+            self.reset_column_filters();
+        }
+        config::add_recent(&mut self.cfg, path);
+        *self.detected_encoding.lock_recover() = Some("UTF-8 (paged)".into());
+        self.paged = Some(PagedView {
+            source: PagedSource {
+                base: index,
+                filtered: None,
+            },
+            page: 0,
+            page_rx: None,
+            filter_initialized: false,
+            filter: None,
+            goto_line: None,
+        });
+        self.status = tr!("status_paged_indexing");
+        self.notify_filter();
+        Ok(())
+    }
+
+    fn request_paged_page(&mut self, page: u64) -> Result<()> {
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(());
+        };
+        let active = paged.source.active().clone();
+        if !active.has_page(page) {
+            self.status = tr!("status_page_not_indexed");
+            return Ok(());
+        }
+        // Drop the old request before scheduling its replacement. Its worker
+        // observes cancellation before the shared page gate admits this one.
+        paged.page_rx = None;
+        paged.page_rx = Some(paged_file::load_page(
+            active,
+            page,
+            paged.filter.clone(),
+            self.ctx.clone(),
+        )?);
+        paged.page = page;
+        self.status = tr!("status_page_loading", { page: &(page + 1).to_string() });
+        Ok(())
+    }
+
+    fn poll_paged(&mut self) {
+        let mut loaded = None;
+        let mut disconnected = false;
+        if let Some(paged) = self.paged.as_mut() {
+            if let Some(rx) = &paged.page_rx {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        loaded = Some(result);
+                        paged.page_rx = None;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        paged.page_rx = None;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+            }
+            if !paged.source.active().complete.load(Ordering::Acquire) {
+                self.ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        if disconnected {
+            self.status = tr!("status_page_failed", { e: &"page worker terminated".to_string() });
+        }
+        if let Some(result) = loaded {
+            match result {
+                Ok(page) => {
+                    let path = self
+                        .paged
+                        .as_ref()
+                        .map(|p| p.source.base.path.clone())
+                        .unwrap();
+                    let goto = self.paged.as_mut().and_then(|p| p.goto_line.take());
+                    self.model.write_recover().replace_page(path, page.entries);
+                    self.selected_rows.clear();
+                    self.selection_anchor = None;
+                    self.selection_cursor = None;
+                    self.pending_scroll = None;
+                    self.cached_picker_col = None;
+                    self.refilter();
+                    if let Some(line) = goto {
+                        let row = self
+                            .model
+                            .read_recover()
+                            .entries
+                            .iter()
+                            .position(|entry| entry.line_no == line);
+                        if let Some(row) = row {
+                            let len = self.model.read_recover().entries.len();
+                            self.select_filtered_row_with_len(row, len);
+                        }
+                    }
+                    self.status = tr!("status_page_loaded", {
+                        page: &(page.page + 1).to_string(),
+                        rows: &page.total_rows.to_string()
+                    });
+                }
+                Err(e) => {
+                    self.status = tr!("status_page_failed", { e: &e.to_string() });
+                }
+            }
+        }
+        if let Some(paged) = &self.paged {
+            if let Some(error) = paged.source.active().error.lock_recover().clone() {
+                self.status = tr!("status_page_failed", { e: &error });
+            }
+        }
+    }
+
     fn encoding_choice(&self) -> EncodingChoice {
         match self.ui.encoding.as_str() {
             "local" => EncodingChoice::Local,
@@ -626,7 +785,47 @@ impl App {
         self.selection_anchor = None;
         self.selection_cursor = None;
         *self.shared_filter.write_recover() = self.ui.to_filter_spec();
+        if self.paged.is_some() {
+            self.rebuild_paged_filter();
+            return;
+        }
         self.refilter();
+    }
+
+    fn rebuild_paged_filter(&mut self) {
+        let spec = self.ui.to_filter_spec();
+        let mut disk_spec = spec.clone();
+        disk_spec.bookmarks_only = false;
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        let desired = (!disk_spec.is_passthrough()).then_some(disk_spec);
+        // Bookmarks refer to the current cache. Toggling their visibility must
+        // never reload that cache (replace_page clears page-local bookmarks).
+        if paged.filter_initialized && (spec.bookmarks_only || paged.filter == desired) {
+            self.refilter();
+            return;
+        }
+        paged.page_rx = None;
+        if let Some(old) = paged.source.filtered.take() {
+            old.cancel();
+        }
+        paged.filter = desired;
+        paged.filter_initialized = true;
+        if let Some(filter) = paged.filter.clone() {
+            match paged_file::build_filter_index(&paged.source.base, filter, self.ctx.clone()) {
+                Ok(index) => paged.source.filtered = Some(index),
+                Err(e) => {
+                    self.status = tr!("status_page_failed", { e: &e.to_string() });
+                    return;
+                }
+            }
+        }
+        paged.page = 0;
+        paged.goto_line = None;
+        if let Err(e) = self.request_paged_page(0) {
+            self.status = tr!("status_page_failed", { e: &e.to_string() });
+        }
     }
 
     /// Bump the filter generation and wake the filter thread to recompute
@@ -1049,6 +1248,7 @@ impl App {
         }
         self.exit_recording_error = None;
         self.stop_session();
+        self.paged = None;
         self.retire_recording();
         self.poll_recording();
         self.disk_budget.min_free.store(
@@ -1171,6 +1371,7 @@ impl App {
     }
 
     fn clear(&mut self) {
+        self.paged = None;
         let epoch = {
             let mut m = self.model.write_recover();
             let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1415,6 +1616,41 @@ impl App {
     }
 
     fn save_filtered(&mut self) {
+        if !self.ui.bookmarks_only {
+            if let Some(paged) = &self.paged {
+                let source = paged.source.base.clone();
+                let spec = self.ui.to_filter_spec();
+                let default_name = format!(
+                    "logfilter_filtered_{}.txt",
+                    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+                );
+                let Some(destination) = rfd::FileDialog::new()
+                    .set_file_name(default_name)
+                    .save_file()
+                else {
+                    return;
+                };
+                let (tx, rx) = bounded(1);
+                self.save_result_rx = Some(rx);
+                let ctx = self.ctx.clone();
+                thread::Builder::new()
+                    .name("paged-filter-export".into())
+                    .spawn(move || {
+                        let result = match paged_file::export_filtered(&source, &destination, &spec)
+                        {
+                            Ok(rows) => SaveOutcome::Saved {
+                                rows: rows as usize,
+                                path: destination,
+                            },
+                            Err(e) => SaveOutcome::Failed(e.to_string()),
+                        };
+                        let _ = tx.send(result);
+                        ctx.request_repaint();
+                    })
+                    .expect("spawn paged export");
+                return;
+            }
+        }
         if self.recording.is_some() && !self.ui.bookmarks_only {
             self.export_filtered_recording();
         } else {
@@ -2719,6 +2955,7 @@ impl eframe::App for App {
         }
 
         self.poll_device_refresh();
+        self.poll_paged();
 
         // A followed file was rotated/truncated: reload it from scratch. Taken
         // before other work so the fresh epoch is in place for this frame.
@@ -3312,6 +3549,61 @@ impl App {
                     }
                 }
             });
+            if let Some(paged) = &self.paged {
+                let active = paged.source.active();
+                let current = paged.page;
+                let pages = active.pages();
+                let complete = active.complete.load(Ordering::Acquire);
+                let progress = if active.file_len == 0 {
+                    1.0
+                } else {
+                    active.indexed_bytes.load(Ordering::Acquire) as f32 / active.file_len as f32
+                };
+                let mut requested = None;
+                let mut page_number = current + 1;
+                ui.horizontal(|ui| {
+                    ui.label(tr!("paged_mode"));
+                    if ui
+                        .add_enabled(current > 0, egui::Button::new(tr!("page_previous")))
+                        .clicked()
+                    {
+                        requested = Some(current - 1);
+                    }
+                    ui.label(tr!("page_label"));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut page_number)
+                                .range(1..=pages)
+                                .speed(1),
+                        )
+                        .changed()
+                    {
+                        requested = Some(page_number - 1);
+                    }
+                    ui.label(format!("/ {pages}"));
+                    if ui
+                        .add_enabled(
+                            current + 1 < pages && active.has_page(current + 1),
+                            egui::Button::new(tr!("page_next")),
+                        )
+                        .clicked()
+                    {
+                        requested = Some(current + 1);
+                    }
+                    if !complete {
+                        ui.add(
+                            egui::ProgressBar::new(progress.clamp(0.0, 1.0)).desired_width(160.0),
+                        );
+                        ui.label(tr!("paged_indexing"));
+                    }
+                    ui.label(tr!("page_rows", { n: &active.page_rows().to_string() }));
+                });
+                if let Some(page) = requested {
+                    if let Err(e) = self.request_paged_page(page) {
+                        self.status = tr!("status_page_failed", { e: &e.to_string() });
+                    }
+                }
+            }
         });
         if dirty {
             self.notify_filter();
@@ -3327,6 +3619,58 @@ impl App {
     ///   * visible in `filtered` → select + scroll to it
     ///   * hidden by the filter  → status message + scroll to nearest visible row
     fn goto_line(&mut self, row: usize) {
+        if self.paged.is_some() {
+            if self.ui.bookmarks_only
+                || self
+                    .paged
+                    .as_ref()
+                    .is_some_and(|paged| paged.filter.is_some())
+            {
+                self.status = tr!("status_goto_paged_filtered");
+                return;
+            }
+            let line = row as u64 + 1;
+            let total = self
+                .paged
+                .as_ref()
+                .unwrap()
+                .source
+                .base
+                .total_rows
+                .load(Ordering::Acquire);
+            if self
+                .paged
+                .as_ref()
+                .unwrap()
+                .source
+                .base
+                .complete
+                .load(Ordering::Acquire)
+                && line > total
+            {
+                self.status = tr!("status_goto_out_of_range", {
+                    n: &line.to_string(),
+                    total: &total.to_string()
+                });
+                return;
+            }
+            let Some(page) = self
+                .paged
+                .as_ref()
+                .unwrap()
+                .source
+                .base
+                .page_for_source_row(row as u64)
+            else {
+                self.status = tr!("status_page_not_indexed");
+                return;
+            };
+            self.paged.as_mut().unwrap().goto_line = Some(line);
+            if let Err(e) = self.request_paged_page(page) {
+                self.status = tr!("status_page_failed", { e: &e.to_string() });
+            }
+            return;
+        }
         let m = self.model.read_recover();
         let total = m.entries.len();
         let line_no = row + 1;
@@ -3407,14 +3751,37 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.label(format!("{} {}", if self.recording.is_some() { tr!("cached_rows") } else { tr!("total") }, model.entries.len()));
-                if model.first_line > 0 { ui.label(tr!("preview_evicted", { n: &model.first_line.to_string() })); }
+                let global_rows = self
+                    .paged
+                    .as_ref()
+                    .map(|paged| paged.source.active().total_rows.load(Ordering::Acquire));
+                ui.label(format!(
+                    "{} {}",
+                    if self.recording.is_some() {
+                        tr!("cached_rows")
+                    } else {
+                        tr!("total")
+                    },
+                    self.paged.as_ref().map(|paged| paged.source.base.total_rows.load(Ordering::Acquire))
+                        .unwrap_or(model.entries.len() as u64)
+                ));
+                if model.first_line > 0 {
+                    ui.label(tr!("preview_evicted", { n: &model.first_line.to_string() }));
+                }
                 ui.separator();
                 // When entries are loaded but the active filters hide every one of
                 // them, color the filtered count so the empty table has a visible
                 // cause (a typo'd Find, a stale column filter, or "bookmarks only"
                 // with no bookmarks all otherwise look identical).
-                let filtered_text = format!("{} {}", tr!("filtered"), model.filtered.len());
+                let filtered_text = format!(
+                    "{} {}",
+                    tr!("filtered"),
+                    if self.ui.bookmarks_only {
+                        model.filtered.len() as u64
+                    } else {
+                        global_rows.unwrap_or(model.filtered.len() as u64)
+                    }
+                );
                 if !model.entries.is_empty() && model.filtered.is_empty() {
                     ui.label(
                         egui::RichText::new(filtered_text)
@@ -4401,6 +4768,208 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn paged_file_browses_filters_and_jumps_without_loading_the_whole_file() {
+        use std::io::Write;
+        let path = tmp_txt("paged_integration");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..(paged_file::CHECKPOINT_ROWS * 2 + 17) {
+            let word = if i.is_multiple_of(10) {
+                "special"
+            } else {
+                "ordinary"
+            };
+            writeln!(file, "01-01 00:00:00.000  1  2 I Tag{}: {word} {i}", i % 3).unwrap();
+        }
+        drop(file);
+
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.paged_file_budget = 6 * 1024 * 1024;
+        app.open_paged_file(&path).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.model.read_recover().entries.len() == paged_file::CHECKPOINT_ROWS as usize
+                && app
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .base
+                    .complete
+                    .load(Ordering::Acquire)
+        });
+        assert_eq!(app.model.read_recover().entries[0].line_no, 1);
+        assert_eq!(app.paged.as_ref().unwrap().source.base.pages(), 3);
+
+        app.request_paged_page(2).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.paged.as_ref().unwrap().page_rx.is_none()
+                && app.model.read_recover().entries.len() == 17
+        });
+        assert_eq!(
+            app.model.read_recover().entries[0].line_no,
+            paged_file::CHECKPOINT_ROWS * 2 + 1
+        );
+
+        app.ui.find = "special".into();
+        app.ui.find_on = true;
+        app.notify_filter();
+        wait_until(|| {
+            app.poll_paged();
+            let paged = app.paged.as_ref().unwrap();
+            paged
+                .source
+                .filtered
+                .as_ref()
+                .is_some_and(|index| index.complete.load(Ordering::Acquire))
+                && paged.page_rx.is_none()
+                && !app.model.read_recover().entries.is_empty()
+                && app
+                    .model
+                    .read_recover()
+                    .entries
+                    .iter()
+                    .all(|entry| entry.message().contains("special"))
+        });
+        assert_eq!(
+            app.paged
+                .as_ref()
+                .unwrap()
+                .source
+                .active()
+                .total_rows
+                .load(Ordering::Acquire),
+            (paged_file::CHECKPOINT_ROWS * 2 + 26) / 10
+        );
+
+        app.ui.find.clear();
+        app.ui.find_on = false;
+        app.notify_filter();
+        wait_until(|| {
+            app.poll_paged();
+            app.paged.as_ref().unwrap().page_rx.is_none()
+        });
+        app.goto_line(paged_file::CHECKPOINT_ROWS as usize + 5);
+        wait_until(|| {
+            app.poll_paged();
+            !app.selected_rows.is_empty()
+        });
+        let selected = *app.selected_rows.iter().next().unwrap();
+        assert_eq!(
+            app.model.read_recover().entries[selected].line_no,
+            paged_file::CHECKPOINT_ROWS + 6
+        );
+
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn wait_paged_page(app: &mut App) {
+        wait_until(|| {
+            app.poll_paged();
+            let paged = app.paged.as_ref().unwrap();
+            paged.page_rx.is_none() && paged.source.active().complete.load(Ordering::Acquire)
+        });
+    }
+
+    #[test]
+    fn paged_bookmark_visibility_keeps_the_current_page_and_filter_index() {
+        let path = tmp_txt("paged_bookmarks");
+        std::fs::write(&path, b"keep first\nkeep second\nother\n").unwrap();
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.ui.find = "keep".into();
+        app.ui.find_on = true;
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+        let index = app.paged.as_ref().unwrap().source.active().clone();
+        app.toggle_bookmark(0);
+        app.ui.bookmarks_only = true;
+        app.notify_filter();
+        wait_paged_page(&mut app);
+        wait_until(|| app.model.read_recover().filtered == [0]);
+        assert!(app.model.read_recover().bookmarks.contains(&0));
+        assert!(Arc::ptr_eq(
+            &index,
+            app.paged.as_ref().unwrap().source.active()
+        ));
+        app.ui.bookmarks_only = false;
+        app.notify_filter();
+        wait_until(|| app.model.read_recover().filtered.len() == 2);
+        assert!(app.model.read_recover().bookmarks.contains(&0));
+        assert!(Arc::ptr_eq(
+            &index,
+            app.paged.as_ref().unwrap().source.active()
+        ));
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn paged_goto_uses_byte_boundaries_and_open_retires_the_old_capture() {
+        let path = tmp_txt("paged_byte_goto");
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!(
+                "{i}: {}\n",
+                "x".repeat(if i < 50 { 10 } else { 1000 })
+            ));
+        }
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.paged_file_budget = 4096;
+        let directory = app.recording_directory_override.as_ref().unwrap().clone();
+        let writer = recording::Writer::create(&directory).unwrap();
+        let state = writer.state.clone();
+        writer.record(std::io::Cursor::new(b"old capture\n"));
+        app.recording = Some(state.clone());
+        app.recording_full.store(true, Ordering::Relaxed);
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+        assert!(app.recording.is_none());
+        assert!(app.preview_rx.is_none());
+        assert!(!app.recording_full.load(Ordering::Relaxed));
+        app.goto_line(49);
+        app.goto_line(75);
+        wait_paged_page(&mut app);
+        let model = app.model.read_recover();
+        let selected = *app.selected_rows.iter().next().unwrap();
+        assert_eq!(model.entries[model.filtered[selected] as usize].line_no, 76);
+        assert!(model.estimated_bytes <= app.paged_file_budget);
+        assert!(app.paged.as_ref().unwrap().page > 1);
+        drop(model);
+        app.clear();
+        assert!(app.preview_rx.is_none());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&state.path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn automatic_large_file_mode_requires_utf8() {
+        let path = tmp_txt("large_mode_threshold");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(paged_file::FORCE_PAGING_BYTES)
+            .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.ui.encoding = "local".into();
+        assert!(app
+            .open_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+        assert!(app.paged.is_none());
+
+        app.ui.encoding = "utf-8".into();
+        app.open_file(&path).unwrap();
+        assert!(app.paged.is_some());
+        app.clear();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
