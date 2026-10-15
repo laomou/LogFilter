@@ -128,14 +128,6 @@ status_save_failed = Save failed: {e}
 status_log_full = File preview memory limit reached; only part of the file is shown
 recording_no_overwrite = Cannot overwrite the raw recording with a filtered export
 recording_export_scope = Exports recorded history using the current filters; bookmarks-only mode exports cached bookmarks.
-cache_settings = Cache settings…
-cache_settings_hint = Disk settings apply to the next capture. Preview memory: 0 = automatic.
-disk_cache_limit = Logs directory size limit
-disk_free_reserve = Keep disk space free
-preview_cache_limit = Preview memory limit
-disk_cache_usage = Logs: {used} / {limit} GiB
-recording_directory = Directory: {path}
-recording_path = File: {path}
 recording_force_exit = Close now
 recording_cancel_exit = Cancel exit
 recording_progress = Written {written} MiB · Preview backlog {backlog} MiB
