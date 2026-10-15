@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -242,6 +242,9 @@ pub fn device_serial(entry: &str) -> &str {
 
 pub struct Session {
     child: Child,
+    /// Private to this session: clearing advances it without letting an old
+    /// reader adopt the epoch of a replacement file or device session.
+    epoch: Arc<AtomicU64>,
     paused: Arc<std::sync::atomic::AtomicBool>,
     reader_thread: Option<thread::Thread>,
     reader_handle: Option<thread::JoinHandle<()>>,
@@ -302,6 +305,8 @@ impl Session {
         let read_error_thr = read_error.clone();
         let ended = Arc::new(AtomicBool::new(false));
         let ended_thr = ended.clone();
+        let epoch = Arc::new(AtomicU64::new(epoch));
+        let reader_epoch = epoch.clone();
         let handle = thread::Builder::new()
             .name("device-reader".into())
             .spawn(move || {
@@ -319,7 +324,8 @@ impl Session {
                     // amount *on the device*. The channel is unbounded (see
                     // `log_channel`), so this can neither block nor drop: a backlog
                     // just lives in memory until the ingest side catches up.
-                    tx.send((epoch, line)).is_ok()
+                    tx.send((reader_epoch.load(Ordering::Acquire), line))
+                        .is_ok()
                 });
                 if let Err(e) = outcome {
                     // Record why, so the UI can say "capture failed" rather than
@@ -358,6 +364,7 @@ impl Session {
 
         Ok(Self {
             child,
+            epoch,
             paused,
             reader_thread: Some(reader_thread),
             reader_handle: Some(handle),
@@ -367,6 +374,11 @@ impl Session {
             stderr: stderr_buf,
             read_error,
         })
+    }
+
+    /// Tag future lines with the epoch installed by the UI's clear operation.
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::Release);
     }
 
     /// True once the adb process's stdout has closed on its own (not via a
@@ -672,6 +684,39 @@ mod tests {
         assert!(session.reader_handle.is_none());
         assert!(session.stderr_handle.is_none());
         assert!(session.reader_thread.is_none());
+    }
+
+    #[test]
+    fn session_epoch_changes_only_future_lines_without_restarting_reader() {
+        let gate = std::env::temp_dir().join(format!(
+            "lf_epoch_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "printf 'before\\n'; while [ ! -e {} ]; do sleep 0.01; done; printf 'after\\n'",
+            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+        );
+        let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+        let (tx, rx) = log_channel();
+        let mut session =
+            Session::start(Transport::Adb, Some("/bin/sh"), None, &cmd, tx, 1).unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        // Leave the first line queued across the epoch change.
+        let deadline = std::time::Instant::now() + timeout;
+        while rx.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        session.set_epoch(2);
+        std::fs::write(&gate, b"").unwrap();
+        assert_eq!(rx.recv_timeout(timeout).unwrap(), (1, "before".into()));
+        assert_eq!(rx.recv_timeout(timeout).unwrap(), (2, "after".into()));
+        session.reap();
+        std::fs::remove_file(gate).unwrap();
     }
 
     #[test]

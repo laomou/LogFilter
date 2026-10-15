@@ -40,6 +40,11 @@ enum SaveOutcome {
     Failed(String),
 }
 
+struct DeviceRefresh {
+    transport: Transport,
+    rx: Receiver<Result<Vec<String>, String>>,
+}
+
 pub struct App {
     pub cfg: Config,
     pub model: Arc<RwLock<Model>>,
@@ -49,8 +54,8 @@ pub struct App {
     /// new load/adb-run bumps it; the ingest thread drops any queued line whose
     /// epoch != this, so a superseded load can't interleave into the new one.
     pub source_epoch: Arc<AtomicU64>,
-    /// Expected format for the current source; written before epoch bump so the
-    /// ingest thread can skip redundant regex attempts on homogeneous streams.
+    /// Expected format for the current source; changed together with its epoch
+    /// under the model lock.
     source_format_hint: Arc<Mutex<LogFormat>>,
     pub wake: Arc<(Mutex<bool>, Condvar)>,
     pub status: String,
@@ -74,10 +79,6 @@ pub struct App {
 
     // device session (adb / hdc)
     pub line_tx: Sender<(u64, String)>,
-    /// Bumped by `clear()`. The ingest thread drops any batch that was assembled
-    /// before the latest clear, so lines produced earlier cannot refill a view the
-    /// user just emptied.
-    clear_gen: Arc<AtomicU64>,
     pub session: Option<transport::Session>,
     pub devices: Vec<String>,
     pub selected_device: String,
@@ -105,7 +106,7 @@ pub struct App {
     /// `hdc list targets`). Keeping the probe off the UI thread prevents startup
     /// and the refresh button from freezing the window when the connector is
     /// slow or unavailable.
-    device_refresh_rx: Option<Receiver<Result<Vec<String>, String>>>,
+    device_refresh: Option<DeviceRefresh>,
 
     /// egui context, kept so background loaders/tail pollers can request a
     /// repaint and hand reload requests back to the UI thread.
@@ -414,7 +415,6 @@ impl App {
             last_window_size: None,
             user_font_stems: font_stems,
             line_tx,
-            clear_gen: Arc::new(AtomicU64::new(0)),
             session: None,
             devices: Vec::new(),
             selected_device,
@@ -427,7 +427,7 @@ impl App {
             last_saved_config,
             next_config_save: std::time::Instant::now(),
             autosave_config: true,
-            device_refresh_rx: None,
+            device_refresh: None,
             ctx: ctx.clone(),
             reload_request: Arc::new(Mutex::new(None)),
             detected_encoding: Arc::new(Mutex::new(None)),
@@ -486,13 +486,6 @@ impl App {
         // Stop any device session so its lines don't interleave with the file.
         self.stop_session();
 
-        // Claim a fresh source epoch *before* clearing so any lines still queued
-        // from a previous load/adb are dropped by the ingest thread. Write the
-        // format hint first so the ingest thread never reads a stale hint for
-        // this epoch.
-        *self.source_format_hint.lock_recover() = LogFormat::Unknown;
-        let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-
         // Whether this is a switch to a *different* file, as opposed to an
         // automatic reload of the same file after a truncation/rotation. Only a
         // genuine source change should drop the column-picker filters — reloading
@@ -502,12 +495,16 @@ impl App {
         let source_changed = self.model.read_recover().file_path.as_deref() != Some(path);
 
         // Reset the model synchronously (cheap) and let lines stream in.
-        {
+        let epoch = {
             let mut model = self.model.write_recover();
+            *self.source_format_hint.lock_recover() = LogFormat::Unknown;
+            let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             model.clear();
             model.file_path = Some(path.to_path_buf());
-        }
-        self.resume_recording();
+            self.recording_full.store(false, Ordering::Relaxed);
+            epoch
+        };
+        self.record_full_reported = false;
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -661,7 +658,6 @@ impl App {
         let full = self.recording_full.clone();
         let source_epoch = self.source_epoch.clone();
         let source_format_hint = self.source_format_hint.clone();
-        let clear_gen = self.clear_gen.clone();
         thread::Builder::new()
             .name("ingest".into())
             .spawn(move || {
@@ -669,18 +665,12 @@ impl App {
                 // Cached hint to avoid locking on every line; refreshed when the
                 // epoch changes. Locked to the first non-Unknown format seen so
                 // we skip the full 4-regex scan for homogeneous streams.
-                let mut hint = LogFormat::Unknown;
-                let mut hint_epoch: u64 = u64::MAX;
-                let mut seen_clear_generation = clear_gen.load(Ordering::Acquire);
+                let mut hint = (u64::MAX, LogFormat::Unknown);
                 loop {
                     // block for first line
                     let Ok(first) = rx.recv() else {
                         return;
                     };
-                    // Note the clear generation this batch started under: if a
-                    // `clear()` lands while the batch is still being assembled,
-                    // `append_batch` drops it (its lines all predate the clear).
-                    let generation_at_read = clear_gen.load(Ordering::Acquire);
                     batch.clear();
                     batch.push(first);
                     // drain more if available (up to 512 lines / 25ms)
@@ -695,35 +685,13 @@ impl App {
                             Err(_) => break,
                         }
                     }
-                    // A `clear()` that landed since the last batch means this batch —
-                    // and everything still queued behind it — was produced before
-                    // the user emptied the view. Discard both instead of refilling
-                    // the table. (The ingest thread owns the only receiver, so it is
-                    // the one that drains; a second handle held by the UI would keep
-                    // the channel connected forever and stop producers from noticing
-                    // that the consumer is gone.)
-                    if generation_at_read != seen_clear_generation {
-                        seen_clear_generation = generation_at_read;
-                        batch.clear();
-                        while rx.try_recv().is_ok() {}
-                        continue;
-                    }
-                    // Drop lines from a superseded source (an older file load / adb
-                    // session) so they never interleave into the current one.
-                    let cur = source_epoch.load(Ordering::Acquire);
-                    // Refresh hint on epoch change (new file or adb command).
-                    if cur != hint_epoch {
-                        hint = *source_format_hint.lock_recover();
-                        hint_epoch = cur;
-                    }
                     let was_full = full.load(Ordering::Relaxed);
                     let appended = append_batch(
                         &model,
                         &mut batch,
                         &BatchContext {
-                            source_epoch: cur,
-                            generation_at_read,
-                            clear_gen: &clear_gen,
+                            source_epoch: &source_epoch,
+                            source_format_hint: &source_format_hint,
                             budget,
                             full: &full,
                         },
@@ -751,22 +719,12 @@ impl App {
 
 /// Append a received batch to the model, returning whether anything was added.
 ///
-/// Two kinds of line are dropped: those from a superseded source (`source_epoch`
-/// has moved on), and — as a whole batch — those assembled before the latest
-/// `clear()`. Every line in such a batch predates the clear, so appending it would
-/// refill the table the user just emptied.
-///
-/// The generation is compared while holding the model write lock, which `clear()`
-/// takes *after* bumping it: a batch either appends before the clear (and is then
-/// wiped by it) or is dropped here, never appended into the emptied view.
-/// Everything `append_batch` needs beyond the model and the batch itself, so the
-/// "is this batch still wanted" and "is the log full" decisions stay together.
+/// Clear and source replacement advance the epoch under the same model lock.
+/// A batch can straddle that boundary: retain each new line and drop each old
+/// line using its producer's epoch, without discarding the rest of the queue.
 struct BatchContext<'a> {
-    /// Source the batch was read under; lines from a superseded one are dropped.
-    source_epoch: u64,
-    /// `clear_gen` as read when the batch was assembled.
-    generation_at_read: u64,
-    clear_gen: &'a AtomicU64,
+    source_epoch: &'a AtomicU64,
+    source_format_hint: &'a Mutex<LogFormat>,
     /// Resident budget for the in-memory log.
     budget: u64,
     /// Set when the budget stopped this batch, so the UI can say so.
@@ -777,32 +735,35 @@ fn append_batch(
     model: &RwLock<Model>,
     batch: &mut Vec<(u64, String)>,
     ctx: &BatchContext<'_>,
-    hint: &mut LogFormat,
+    hint: &mut (u64, LogFormat),
 ) -> bool {
     let mut appended = false;
     let mut m = model.write_recover();
-    // Re-read under the model lock: `clear()` bumps the generation *before* taking
-    // that lock, so this batch either appends ahead of the clear (and is wiped by
-    // it) or is dropped here — never appended into an already-emptied view.
-    let batch_is_current = ctx.generation_at_read == ctx.clear_gen.load(Ordering::Acquire);
-    if batch_is_current && m.estimated_bytes >= ctx.budget {
-        // The log reached its memory budget. The caller keeps draining the channel
-        // (the device's pipe must never back up) but nothing is appended until a
-        // `clear()` resets the accounting.
-        ctx.full.store(true, Ordering::Relaxed);
-        return false;
+    let epoch = ctx.source_epoch.load(Ordering::Acquire);
+    if hint.0 != epoch {
+        *hint = (epoch, *ctx.source_format_hint.lock_recover());
     }
     for (ep, line) in batch.drain(..) {
-        if !batch_is_current || ep != ctx.source_epoch {
+        if ep != epoch {
             continue;
         }
-        let (entry, fmt) = parse_line_hinted(line, *hint);
+        // Check every row before parsing/allocating its entry. Once a row no
+        // longer fits, stop recording until clear, but keep draining the pipe.
+        let cost = (line.len() as u64).saturating_add(crate::model::ENTRY_OVERHEAD);
+        if ctx.full.load(Ordering::Relaxed) || cost > ctx.budget.saturating_sub(m.estimated_bytes) {
+            ctx.full.store(true, Ordering::Relaxed);
+            continue;
+        }
+        let (entry, fmt) = parse_line_hinted(line, hint.1);
         // Lock in the format on the first matched line so subsequent lines skip
         // the full scan entirely.
-        if *hint == LogFormat::Unknown && fmt != LogFormat::Unknown {
-            *hint = fmt;
+        if hint.1 == LogFormat::Unknown && fmt != LogFormat::Unknown {
+            hint.1 = fmt;
         }
         m.append(entry);
+        if m.estimated_bytes >= ctx.budget {
+            ctx.full.store(true, Ordering::Relaxed);
+        }
         appended = true;
     }
     appended
@@ -1047,19 +1008,16 @@ impl App {
     /// and command, replacing any session or file tail currently feeding the view.
     fn run_session(&mut self) {
         self.stop_session();
-        // Write the format hint before bumping the epoch so the ingest thread
-        // never races between seeing the new epoch and reading a stale hint.
-        *self.source_format_hint.lock_recover() = detect_format_from_cmd(&self.selected_cmd);
-        let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-
-        // A fresh run starts from an empty table — clear any entries left from a
-        // previous run/file (mirrors the file-load path). The epoch bump above
-        // already ensures stale queued lines are dropped by the ingest thread.
-        {
+        // Install the source and empty dataset atomically with respect to ingest.
+        let epoch = {
             let mut model = self.model.write_recover();
+            *self.source_format_hint.lock_recover() = detect_format_from_cmd(&self.selected_cmd);
+            let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             model.clear();
-        }
-        self.resume_recording();
+            self.recording_full.store(false, Ordering::Relaxed);
+            epoch
+        };
+        self.record_full_reported = false;
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -1111,34 +1069,19 @@ impl App {
         }
     }
 
-    /// Clearing the table frees the memory budget, so recording resumes.
-    fn resume_recording(&mut self) {
-        self.recording_full.store(false, Ordering::Relaxed);
-        self.record_full_reported = false;
-    }
-
     fn clear(&mut self) {
-        // Bumping this makes the ingest thread drop the batch it holds *and* drain
-        // whatever is queued behind it: all of it predates this clear, so replaying
-        // it would immediately refill the table the user just emptied.
-        self.clear_gen.fetch_add(1, Ordering::AcqRel);
-        // Bump the epoch so a running file-tail (or any queued lines) stops
-        // feeding this cleared view — otherwise the tail poller would keep
-        // appending new lines into a table the user just emptied.
-        //
-        // Exception: while a device session is live, keep the epoch — the session
-        // bakes it into every line it emits, so bumping here would make all of
-        // its *future* lines be dropped by the ingest thread, silently killing
-        // the stream. Clearing during capture should empty the view yet keep new
-        // lines flowing. (run_session supersedes any file-tail, so none is active.)
-        if self.session.is_none() {
-            self.source_epoch.fetch_add(1, Ordering::AcqRel);
-        }
         {
             let mut m = self.model.write_recover();
+            let epoch = self.source_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            // Queued lines keep their old epoch. A live device tags future
+            // lines with the new one; file readers are cancelled by the bump.
+            if let Some(session) = &self.session {
+                session.set_epoch(epoch);
+            }
             m.clear();
+            self.recording_full.store(false, Ordering::Relaxed);
         }
-        self.resume_recording();
+        self.record_full_reported = false;
         self.selected_rows.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -1200,6 +1143,12 @@ impl App {
 
     fn copy_selected_rows_text(&self) -> String {
         let m = self.model.read_recover();
+        self.selected_rows_text(&m)
+    }
+
+    /// Reuse the table's locked snapshot; acquiring another model read lock
+    /// here can deadlock when an ingest/filter writer is already waiting.
+    fn selected_rows_text(&self, m: &Model) -> String {
         let mut rows: Vec<&usize> = self.selected_rows.iter().collect();
         rows.sort();
         let texts: Vec<String> = rows
@@ -1333,15 +1282,20 @@ impl App {
         self.notify_filter();
     }
 
-    /// Begin an asynchronous `adb devices` probe unless one is already active.
+    /// Reuse an active probe only for the same backend. Dropping an obsolete
+    /// receiver prevents its result from overwriting the new backend's devices.
     fn refresh_devices(&mut self, ctx: egui::Context) {
-        if self.device_refresh_rx.is_some() {
+        if self
+            .device_refresh
+            .as_ref()
+            .is_some_and(|p| p.transport == self.transport)
+        {
             return;
         }
         let tsp = self.transport;
         let override_path = self.transport_override();
         let (tx, rx) = bounded(1);
-        self.device_refresh_rx = Some(rx);
+        self.device_refresh = Some(DeviceRefresh { transport: tsp, rx });
         if let Err(e) = thread::Builder::new()
             .name("device-list".into())
             .spawn(move || {
@@ -1351,7 +1305,7 @@ impl App {
                 ctx.request_repaint();
             })
         {
-            self.device_refresh_rx = None;
+            self.device_refresh = None;
             self.status = tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &format!("{e}") });
         }
     }
@@ -1389,17 +1343,21 @@ impl App {
     /// the worker failed before reporting, so clear the busy state and surface
     /// a diagnostic rather than leaving the refresh control disabled forever.
     fn poll_device_refresh(&mut self) {
-        let Some(rx) = &self.device_refresh_rx else {
+        let Some(pending) = &self.device_refresh else {
             return;
         };
-        match rx.try_recv() {
+        if pending.transport != self.transport {
+            self.refresh_devices(self.ctx.clone());
+            return;
+        }
+        match pending.rx.try_recv() {
             Ok(result) => {
-                self.device_refresh_rx = None;
+                self.device_refresh = None;
                 self.apply_devices_result(result);
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.device_refresh_rx = None;
+                self.device_refresh = None;
                 self.status = tr!("status_dev_devices_failed", {
                     tool: self.transport.binary(),
                     e: &"device probe terminated unexpectedly".to_string()
@@ -2929,7 +2887,7 @@ impl App {
                             ui.selectable_value(&mut self.selected_device, d.clone(), d);
                         }
                     });
-                let refreshing_devices = self.device_refresh_rx.is_some();
+                let refreshing_devices = self.device_refresh.is_some();
                 if ui
                     .add_enabled(!refreshing_devices, egui::Button::new("↻"))
                     .on_hover_text(tr!("refresh_devices"))
@@ -3585,7 +3543,7 @@ impl App {
                                 }
                                 if ui.button(tr!("copy_row")).clicked() {
                                     if self.selected_rows.len() > 1 {
-                                        copy_cell_text = Some(self.copy_selected_rows_text());
+                                        copy_cell_text = Some(self.selected_rows_text(&model));
                                     } else {
                                         copy_cell_text = Some(self.visible_row_text(e));
                                     }
@@ -3872,91 +3830,50 @@ mod tests {
     }
 
     #[test]
-    fn append_batch_drops_a_batch_that_a_clear_overtook() {
+    fn append_batch_keeps_only_new_epoch_lines_after_source_replacement() {
         let model = RwLock::new(Model::default());
-        let mut hint = LogFormat::ThreadTime;
-        let clear_gen = AtomicU64::new(4);
-        // No budget here: this test is about the clear, not the memory cap.
+        let mut hint = (1, LogFormat::ThreadTime);
+        let source_epoch = AtomicU64::new(1);
+        let format = Mutex::new(LogFormat::Unknown);
         let full = AtomicBool::new(false);
+        // Context and parsed-format cache were acquired before the source switch.
+        let context = BatchContext {
+            source_epoch: &source_epoch,
+            source_format_hint: &format,
+            budget: u64::MAX,
+            full: &full,
+        };
 
-        // Batch assembled under generation 4, view still at generation 4.
         let mut batch = vec![(1u64, "a".to_string()), (1u64, "b".to_string())];
-        assert!(append_batch(
-            &model,
-            &mut batch,
-            &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 4,
-                clear_gen: &clear_gen,
-                budget: u64::MAX,
-                full: &full,
-            },
-            &mut hint
-        ));
+        assert!(append_batch(&model, &mut batch, &context, &mut hint));
         assert_eq!(model.read_recover().entries.len(), 2);
 
-        // A clear lands (generation 5) while this batch was being assembled: every
-        // line in it predates the clear, so it must be dropped rather than refill
-        // the view the user just emptied.
-        clear_gen.store(5, Ordering::Release);
-        let mut batch = vec![(1u64, "c".to_string())];
-        assert!(!append_batch(
-            &model,
-            &mut batch,
-            &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 4,
-                clear_gen: &clear_gen,
-                budget: u64::MAX,
-                full: &full,
-            },
-            &mut hint
-        ));
-        assert_eq!(
-            model.read_recover().entries.len(),
-            2,
-            "a batch the clear overtook must not be appended"
-        );
-
-        // Only that one batch is lost: the next one (assembled after the clear)
-        // lands normally.
-        let mut batch = vec![(1u64, "d".to_string())];
-        assert!(append_batch(
-            &model,
-            &mut batch,
-            &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 5,
-                clear_gen: &clear_gen,
-                budget: u64::MAX,
-                full: &full,
-            },
-            &mut hint
-        ));
-        assert_eq!(model.read_recover().entries.len(), 3);
-
-        // A superseded source is still filtered per line, as before.
-        let mut batch = vec![(9u64, "stale".to_string())];
-        assert!(!append_batch(
-            &model,
-            &mut batch,
-            &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 5,
-                clear_gen: &clear_gen,
-                budget: u64::MAX,
-                full: &full,
-            },
-            &mut hint
-        ));
-        assert_eq!(model.read_recover().entries.len(), 3);
+        // Hold the lock through replacement while the worker starts appending.
+        // It must read the epoch after acquiring the lock, not before it.
+        let mut guard = model.write_recover();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut batch = vec![(1, "stale".into()), (2, "fresh".into())];
+                assert!(append_batch(&model, &mut batch, &context, &mut hint));
+                assert!(batch.is_empty());
+            });
+            source_epoch.store(2, Ordering::Release);
+            guard.clear();
+            drop(guard);
+            worker.join().unwrap();
+        });
+        let m = model.read_recover();
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].raw(), "fresh");
+        assert_eq!(hint, (2, LogFormat::Unknown));
     }
 
     #[test]
     fn append_batch_stops_at_the_memory_budget_and_reports_it() {
         let model = RwLock::new(Model::default());
-        let mut hint = LogFormat::ThreadTime;
-        let clear_gen = AtomicU64::new(4);
+        let mut hint = (1, LogFormat::ThreadTime);
+        let source_epoch = AtomicU64::new(1);
+        let format = Mutex::new(LogFormat::Unknown);
         let full = AtomicBool::new(false);
 
         // The check compares the log's current usage against the budget, so start
@@ -3968,9 +3885,8 @@ mod tests {
             &model,
             &mut batch,
             &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 4,
-                clear_gen: &clear_gen,
+                source_epoch: &source_epoch,
+                source_format_hint: &format,
                 budget,
                 full: &full,
             },
@@ -3987,14 +3903,14 @@ mod tests {
 
         // Clearing frees the budget, so the next batch lands.
         model.write_recover().clear();
+        full.store(false, Ordering::Relaxed);
         let mut batch = vec![(1u64, "b".to_string())];
         assert!(append_batch(
             &model,
             &mut batch,
             &BatchContext {
-                source_epoch: 1,
-                generation_at_read: 4,
-                clear_gen: &clear_gen,
+                source_epoch: &source_epoch,
+                source_format_hint: &format,
                 budget: u64::MAX,
                 full: &full,
             },
@@ -4003,25 +3919,76 @@ mod tests {
         assert_eq!(model.read_recover().entries.len(), 1);
     }
 
+    #[test]
+    fn memory_budget_is_enforced_within_a_batch_and_stays_full() {
+        let model = RwLock::new(Model::default());
+        let epoch = AtomicU64::new(1);
+        let format = Mutex::new(LogFormat::Unknown);
+        let full = AtomicBool::new(false);
+        let context = BatchContext {
+            source_epoch: &epoch,
+            source_format_hint: &format,
+            budget: 8192,
+            full: &full,
+        };
+        let mut hint = (u64::MAX, LogFormat::Unknown);
+        let mut batch = (0..512).map(|_| (1, "x".repeat(4096))).collect();
+        assert!(append_batch(&model, &mut batch, &context, &mut hint));
+        assert!(batch.is_empty(), "all excess rows must still be drained");
+        assert!(full.load(Ordering::Relaxed));
+        let m = model.read_recover();
+        assert_eq!(m.entries.len(), 1);
+        assert!(m.estimated_bytes <= context.budget);
+        drop(m);
+        let mut batch = vec![(1, "small row that would fit".into())];
+        assert!(!append_batch(&model, &mut batch, &context, &mut hint));
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn memory_budget_reports_exact_fit_and_rejects_an_oversized_first_row() {
+        for line_len in [1, 1024] {
+            let model = RwLock::new(Model::default());
+            let epoch = AtomicU64::new(1);
+            let format = Mutex::new(LogFormat::Unknown);
+            let full = AtomicBool::new(false);
+            let context = BatchContext {
+                source_epoch: &epoch,
+                source_format_hint: &format,
+                budget: crate::model::ENTRY_OVERHEAD + 1,
+                full: &full,
+            };
+            let mut batch = vec![(1, "x".repeat(line_len))];
+            let appended = append_batch(&model, &mut batch, &context, &mut (0, LogFormat::Unknown));
+            assert_eq!(appended, line_len == 1);
+            assert!(
+                full.load(Ordering::Relaxed),
+                "no extra batch needed to report full"
+            );
+            assert!(model.read_recover().estimated_bytes <= context.budget);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn clear_discards_a_backlog_queued_during_capture() {
         let ctx = egui::Context::default();
         let mut app = App::new_for_test(&ctx);
         let epoch = app.source_epoch.load(Ordering::Acquire);
+        let gate = tmp_txt("capture_clear_gate");
+        let script = format!(
+            "while [ ! -e {} ]; do sleep 0.01; done; printf 'after clear\\n'",
+            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+        );
+        let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
 
-        // A live session is what makes this subtle: `clear()` must NOT bump the
-        // source epoch while capturing (that would drop the session's *future*
-        // lines too), so the queued lines below still carry the current epoch and
-        // the ingest thread would happily append them after the clear.
+        // Clearing a live session must discard the backlog and allow its new
+        // epoch through immediately, including the very first post-clear line.
         let session = transport::Session::start(
             Transport::Adb,
             Some("/bin/sh"),
             None,
-            // Exits immediately: the test only needs `session.is_some()` (so
-            // `clear()` skips the epoch bump), and a long-lived child would keep
-            // the stdout pipe open, making teardown wait for it.
-            "-c 'true'",
+            &cmd,
             app.line_tx.clone(),
             epoch,
         )
@@ -4035,25 +4002,74 @@ mod tests {
             app.line_tx.send((epoch, format!("line {i}"))).unwrap();
         }
         app.clear();
+        // Release the actual device reader after clear: this also checks that
+        // App updates the live session, rather than only its own source epoch.
+        std::fs::write(&gate, b"").unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
-            let n = app.model.read_recover().entries.len();
-            assert_eq!(n, 0, "cleared view refilled with {n} queued line(s)");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        wait_until(|| !app.model.read_recover().entries.is_empty());
+        let m = app.model.read_recover();
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].raw(), "after clear");
+        drop(m);
+        app.stop_session();
+        std::fs::remove_file(gate).unwrap();
+    }
+
+    #[test]
+    fn clear_then_open_preserves_every_line_of_the_new_file() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.line_tx.send((0, "initial".into())).unwrap();
+        wait_until(|| app.model.read_recover().entries.len() == 1);
+        app.clear();
+        let path = tmp_txt("clear_then_open");
+        std::fs::write(&path, "new one\nnew two\nnew three\n").unwrap();
+        app.open_file(&path).unwrap();
+        wait_until(|| app.model.read_recover().filtered.len() == 3);
+        let m = app.model.read_recover();
+        assert_eq!(
+            m.entries.iter().map(|e| e.raw()).collect::<Vec<_>>(),
+            ["new one", "new two", "new three"]
+        );
+        drop(m);
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background work timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
     #[test]
-    fn clear_bumps_the_generation_so_a_batch_in_flight_is_dropped() {
-        let ctx = egui::Context::default();
-        let mut app = App::new_for_test(&ctx);
-        let before = app.clear_gen.load(Ordering::Acquire);
-        app.clear();
-        assert!(
-            app.clear_gen.load(Ordering::Acquire) > before,
-            "clear() must bump the generation `append_batch` compares against"
-        );
+    fn selected_rows_copy_reuses_the_locked_model_snapshot() {
+        let (tx, rx) = bounded(1);
+        let worker = thread::spawn(move || {
+            let mut app = App::new_for_test(&egui::Context::default());
+            app.selected_rows.extend([2, 0]);
+            app.ui.col_message = true;
+            // An exclusive guard makes any accidental model reacquisition
+            // block on every platform, including recursive-reader friendly ones.
+            let mut m = app.model.write_recover();
+            append_rows(&mut m, 3, "copy");
+            m.filtered = vec![0, 1, 2];
+            let expected = format!(
+                "{}\n{}",
+                app.visible_row_text(&m.entries[0]),
+                app.visible_row_text(&m.entries[2])
+            );
+            assert_eq!(app.selected_rows_text(&m), expected);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("copy tried to reacquire the model lock");
+        worker.join().unwrap();
     }
 
     #[test]
@@ -4301,12 +4317,55 @@ mod tests {
         let mut app = App::new_for_test(&ctx);
         let (tx, rx) = bounded(1);
         tx.send(Ok(vec!["serial-1".into()])).unwrap();
-        app.device_refresh_rx = Some(rx);
+        app.device_refresh = Some(DeviceRefresh {
+            transport: app.transport,
+            rx,
+        });
 
         app.poll_device_refresh();
 
         assert_eq!(app.devices, vec!["serial-1"]);
-        assert!(app.device_refresh_rx.is_none());
+        assert!(app.device_refresh.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switching_backend_replaces_an_in_flight_device_probe() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        let (tx, rx) = bounded(1);
+        app.device_refresh = Some(DeviceRefresh {
+            transport: Transport::Adb,
+            rx,
+        });
+        app.transport = Transport::Hdc;
+        // echo deterministically returns "list targets", a valid hdc list line.
+        app.cfg.device.hdc_path = Some("/bin/echo".into());
+        app.refresh_devices(ctx.clone());
+        assert!(tx.send(Ok(vec!["stale-adb-serial".into()])).is_err());
+        assert_eq!(
+            app.device_refresh.as_ref().unwrap().transport,
+            Transport::Hdc
+        );
+        wait_until(|| {
+            app.poll_device_refresh();
+            app.device_refresh.is_none()
+        });
+        assert_eq!(app.devices, ["list targets"]);
+
+        // Also cover a completed stale error reaching poll before refresh.
+        let (tx, rx) = bounded(1);
+        tx.send(Err("old adb failure".into())).unwrap();
+        app.device_refresh = Some(DeviceRefresh {
+            transport: Transport::Adb,
+            rx,
+        });
+        app.poll_device_refresh();
+        assert!(!app.status.contains("old adb failure"));
+        assert_eq!(
+            app.device_refresh.as_ref().unwrap().transport,
+            Transport::Hdc
+        );
     }
 }
 
@@ -5122,20 +5181,17 @@ mod ui_tests {
         );
 
         // Clearing frees the budget, so recording resumes with the new epoch.
-        // Clearing frees the budget and resumes recording. The first batch after a
-        // clear is deliberately discarded together with the pre-clear backlog (see
-        // `clear_gen`), so keep feeding until one lands.
         h.state_mut().clear();
         assert!(!h.state().recording_full.load(Ordering::Relaxed));
+        let epoch = h.state().source_epoch.load(Ordering::Acquire);
+        h.state()
+            .line_tx
+            .send((epoch, "after clear".into()))
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while h.state().model.read().unwrap().entries.is_empty()
             && std::time::Instant::now() < deadline
         {
-            let epoch = h.state().source_epoch.load(Ordering::Acquire);
-            h.state()
-                .line_tx
-                .send((epoch, "after clear".into()))
-                .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
