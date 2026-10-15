@@ -2567,6 +2567,29 @@ fn open_dir(path: &std::path::Path) {
     let _ = std::process::Command::new(opener).arg(path).spawn();
 }
 
+/// Hide Windows' canonical-path prefix in labels only. Keep the original
+/// PathBuf for filesystem calls, including long paths and network shares.
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(tail) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{tail}");
+        }
+        if let Some(tail) = text.strip_prefix(r"\\?\") {
+            let bytes = tail.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return tail.to_owned();
+            }
+        }
+    }
+    text
+}
+
 fn fit_middle(ui: &egui::Ui, s: &str, max_width: f32) -> String {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let width = |t: &str| -> f32 {
@@ -3733,7 +3756,7 @@ impl App {
                 .or_else(config::recordings_dir);
             ui.horizontal(|ui| {
                 if let Some(path) = source_path {
-                    let full = path.display().to_string();
+                    let full = display_path(&path);
                     let budget = (ui.available_width() * 0.5).max(80.0);
                     ui.label(fit_middle(ui, &full, budget)).on_hover_ui(|ui| {
                         ui.add(egui::Label::new(full).wrap_mode(egui::TextWrapMode::Extend));
