@@ -11,6 +11,7 @@ mod io;
 mod lock;
 mod memory;
 mod model;
+mod paged_file;
 mod parser;
 mod recording;
 mod transport;

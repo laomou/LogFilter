@@ -86,6 +86,12 @@ pub fn preview_budget(configured_mib: u64, log_budget: u64) -> u64 {
     requested.clamp(4 * 1024 * 1024, log_budget.max(4 * 1024 * 1024))
 }
 
+/// Parsed rows for one large-file page may use more RAM on larger machines,
+/// while still leaving half of the overall log budget for the UI and indexes.
+pub fn paged_file_budget(log_budget: u64) -> u64 {
+    (log_budget / 2).clamp(32 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +115,13 @@ mod tests {
     #[test]
     fn budget_falls_back_when_the_platform_cannot_report_memory() {
         assert_eq!(budget_from(None), FALLBACK_BUDGET);
+    }
+
+    #[test]
+    fn paged_file_budget_scales_and_is_clamped() {
+        assert_eq!(paged_file_budget(2 * GIB), GIB);
+        assert_eq!(paged_file_budget(128 * 1024 * 1024), 64 * 1024 * 1024);
+        assert_eq!(paged_file_budget(64 * GIB), 8 * GIB);
     }
 
     #[cfg(target_os = "linux")]

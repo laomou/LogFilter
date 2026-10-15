@@ -11,6 +11,8 @@ LogFilter is a desktop viewer and filter for Android (logcat via adb) and Harmon
 ## Features
 
 - Open local log files, including drag-and-drop and recent-file history.
+- Browse large UTF-8 logs with an estimated-memory switch, a sparse disk index,
+  and RAM-adaptive pages, without loading the complete file into memory.
 - Stream logs from a device over adb (Android) or hdc (HarmonyOS), with selectable device and command presets.
 - Automatically record original device output to disk, with a bounded live preview cache.
 - Parse common Android logcat formats (`threadtime`, `time`, `brief`, kernel) and HarmonyOS `hilog`.
@@ -108,6 +110,38 @@ cargo run -- path/to/log.txt
 ```
 
 You can also open files from the File menu or drop a file onto the window.
+
+### Large-file paging
+
+Files under 256 MiB load normally. From 256 MiB to 4 GiB, LogFilter samples the
+first 8 MiB and estimates full parsed memory from raw bytes, row count, per-row
+structure/index overhead, and a 25% safety margin. It enters paging when that
+estimate exceeds 60% of the log-memory budget. Files at least 4 GiB always page.
+
+Paged mode scans the file in the background and stores a byte-offset checkpoint
+for each page. The parsed-row budget is half of the log-memory budget, clamped
+to 32 MiB–8 GiB. Sampling selects a row cap of 20,000–5,000,000, but each page
+also obeys a conservative byte budget, including invalid UTF-8 expansion and
+row/index overhead. Long rows therefore produce smaller pages without skipping
+source lines. Index memory grows with page count, not individual row count.
+Pages become available progressively; Goto locates the page by its source-line
+checkpoint. Superseded reads are cancelled, and only one page read per file
+allocates at a time, alongside the currently displayed page.
+
+Find, remove, level, PID, TID, and tag filters scan the complete file in the
+background and build a separate sparse match index. Filtered pages preserve the
+original source line numbers. Goto uses the source line number when no global
+filter is active. Filtered export streams the complete file with a snapshot of
+the current filters. Bookmarks remain scoped to the loaded page.
+Column-picker counts and bookmark markers describe the loaded page; selecting a
+column value still applies that value as a global disk filter.
+
+Paged mode currently supports UTF-8. Files are treated as a snapshot: if they
+change while indexed, reopen them. Page reads and exports validate the original
+snapshot before and after reading; failed exports remove their partial output.
+Source lines larger than 64 MiB, or too large for the page budget, produce an
+explicit error. The budget estimates parsed data rather than total process RSS;
+rendering, indexing, and bounded I/O buffers also use memory.
 
 ## adb Streaming
 
