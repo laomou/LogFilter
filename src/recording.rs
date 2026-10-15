@@ -185,6 +185,8 @@ impl Writer {
             } else {
                 format!("logfilter_{stamp}_{sequence}.log")
             };
+            // Keep the active file visibly marked until close/final sync. Startup
+            // counts these incomplete recordings against the directory limit.
             let path = directory.join(name);
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => {
@@ -481,14 +483,13 @@ fn push_preview(
 
 /// Export only the byte range already written when the user requested it. The
 /// source file can continue growing, and filter changes cannot alter this job.
-/// None copies original bytes; Some streams normalized matching text lines.
 pub fn export(
     source: &Path,
     length: u64,
     destination: &Path,
-    filter: Option<&FilterSpec>,
+    filter: &FilterSpec,
 ) -> io::Result<u64> {
-    if filter.is_some_and(|spec| spec.bookmarks_only) {
+    if filter.bookmarks_only {
         return Err(io::Error::other(
             "bookmark export is available for the cached view only",
         ));
@@ -505,29 +506,27 @@ pub fn export(
             "recording was truncated before export",
         ));
     }
-    let output = File::create(destination)?;
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
     let mut writer = io::BufWriter::new(output);
     let mut reader = input.take(length);
-    let amount = if let Some(filter) = filter {
-        let bookmarks = std::collections::HashSet::new();
-        let mut rows = 0u64;
-        let mut hint = LogFormat::Unknown;
-        crate::io::visit_utf8_lines(&mut reader, |line| {
-            let (entry, format) = parse_line_hinted(line, hint);
-            if hint == LogFormat::Unknown {
-                hint = format;
-            }
-            if filter.matches(&entry, 0, &bookmarks) {
-                writer.write_all(entry.raw().as_bytes())?;
-                writer.write_all(b"\n")?;
-                rows += 1;
-            }
-            Ok(())
-        })?;
-        rows
-    } else {
-        io::copy(&mut reader, &mut writer)?
-    };
+    let bookmarks = std::collections::HashSet::new();
+    let mut rows = 0u64;
+    let mut hint = LogFormat::Unknown;
+    crate::io::visit_utf8_lines(&mut reader, |line| {
+        let (entry, format) = parse_line_hinted(line, hint);
+        if hint == LogFormat::Unknown {
+            hint = format;
+        }
+        if filter.matches(&entry, 0, &bookmarks) {
+            writer.write_all(entry.raw().as_bytes())?;
+            writer.write_all(b"\n")?;
+            rows += 1;
+        }
+        Ok(())
+    })?;
     if reader.limit() != 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -536,7 +535,7 @@ pub fn export(
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
-    Ok(amount)
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -843,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_and_filtered_exports_use_the_requested_disk_snapshot() {
+    fn filtered_export_uses_the_requested_disk_snapshot() {
         let writer = writer();
         let state = writer.state.clone();
         let raw = b"I/Tag( 1): keep first\r\nE/Tag( 1): remove second\r\n";
@@ -855,26 +854,19 @@ mod tests {
             .unwrap()
             .write_all(b"I/Tag( 1): keep later\n")
             .unwrap();
-        let copy = state.path.with_extension("copy");
-        assert_eq!(
-            export(&state.path, raw.len() as u64, &copy, None).unwrap(),
-            raw.len() as u64
-        );
-        assert_eq!(std::fs::read(&copy).unwrap(), raw);
         let filtered = state.path.with_extension("filtered");
         let spec = FilterSpec {
             find: vec!["keep".into()],
             ..Default::default()
         };
         assert_eq!(
-            export(&state.path, raw.len() as u64, &filtered, Some(&spec)).unwrap(),
+            export(&state.path, raw.len() as u64, &filtered, &spec).unwrap(),
             1
         );
         assert_eq!(
             std::fs::read(&filtered).unwrap(),
             b"I/Tag( 1): keep first\n"
         );
-        std::fs::remove_file(copy).unwrap();
         std::fs::remove_file(filtered).unwrap();
         cleanup(&state);
     }
@@ -884,15 +876,16 @@ mod tests {
         let writer = writer();
         let state = writer.state.clone();
         writer.record(Cursor::new(b"original\n"));
-        assert!(export(&state.path, 9, &state.path, None).is_err());
+        let spec = FilterSpec::default();
+        assert!(export(&state.path, 9, &state.path, &spec).is_err());
         assert_eq!(std::fs::read(&state.path).unwrap(), b"original\n");
         let output = state.path.with_extension("export");
-        assert!(export(&state.path, 100, &output, None).is_err());
+        assert!(export(&state.path, 100, &output, &spec).is_err());
         assert!(!output.exists());
         #[cfg(unix)]
         {
             std::fs::hard_link(&state.path, &output).unwrap();
-            assert!(export(&state.path, 9, &output, None).is_err());
+            assert!(export(&state.path, 9, &output, &spec).is_err());
             assert_eq!(std::fs::read(&state.path).unwrap(), b"original\n");
             std::fs::remove_file(output).unwrap();
         }

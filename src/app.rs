@@ -82,6 +82,7 @@ pub struct App {
     pub line_tx: Sender<(u64, String)>,
     pub session: Option<transport::Session>,
     recording: Option<Arc<Recording>>,
+    last_recording: Option<Arc<Recording>>,
     previous_recordings: Vec<Arc<Recording>>,
     recording_error_reported: bool,
     preview_rx: Option<Receiver<PreviewBatch>>,
@@ -92,6 +93,7 @@ pub struct App {
     exit_recording_error: Option<String>,
     recording_directory: Option<recording::RecordingDirectory>,
     recording_directory_override: Option<PathBuf>,
+    last_recording_path: Option<PathBuf>,
     disk_budget: Arc<recording::DiskBudget>,
     show_cache_settings: bool,
     pub devices: Vec<String>,
@@ -432,6 +434,7 @@ impl App {
             line_tx,
             session: None,
             recording: None,
+            last_recording: None,
             previous_recordings: Vec::new(),
             recording_error_reported: false,
             preview_rx: None,
@@ -442,6 +445,7 @@ impl App {
             exit_recording_error: None,
             recording_directory: None,
             recording_directory_override: None,
+            last_recording_path: None,
             disk_budget,
             show_cache_settings: false,
             devices: Vec::new(),
@@ -1102,6 +1106,8 @@ impl App {
             }
         };
         let recorded = writer.state.clone();
+        self.last_recording_path = Some(recorded.path.clone());
+        self.last_recording = Some(recorded.clone());
         // Install the source and empty dataset atomically with respect to ingest.
         let epoch = {
             let mut model = self.model.write_recover();
@@ -1311,7 +1317,7 @@ impl App {
                     self.status = tr!("status_recording_failed", { e: &e });
                 }
             }
-            false
+            true
         });
     }
 
@@ -1446,7 +1452,7 @@ impl App {
         if self.save_result_rx.is_some() {
             return;
         }
-        let Some(recorded) = &self.recording else {
+        let Some(recorded) = self.recording.as_ref().or(self.last_recording.as_ref()) else {
             return;
         };
         let source = recorded.path.clone();
@@ -1465,7 +1471,7 @@ impl App {
         thread::Builder::new()
             .name("recording-export".into())
             .spawn(move || {
-                let result = match recording::export(&source, length, &destination, Some(&filter)) {
+                let result = match recording::export(&source, length, &destination, &filter) {
                     Ok(rows) => SaveOutcome::Saved {
                         rows: rows as usize,
                         path: destination,
@@ -3423,16 +3429,16 @@ impl App {
     fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
-            if self.recording.is_none() {
-                if let Some(directory) = self.recording_directory_override.clone().or_else(config::recordings_dir) {
-                    ui.label(tr!("recording_directory", { path: &directory.display().to_string() }));
-                }
+            let current_recording = self.recording.as_ref();
+            if let Some(path) = self.last_recording_path.as_ref() {
+                ui.label(tr!("recording_directory", { path: &path.parent().unwrap_or(Path::new(".")).display().to_string() }));
+                ui.label(tr!("recording_path", { path: &path.display().to_string() }));
+            } else if let Some(directory) = self.recording_directory_override.clone().or_else(config::recordings_dir) {
+                ui.label(tr!("recording_directory", { path: &directory.display().to_string() }));
             }
-            if let Some(recorded) = &self.recording {
+            if let Some(recorded) = current_recording {
                 let recorded_bytes = recorded.written.load(Ordering::Acquire);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(tr!("recording_directory", { path: &recorded.path.parent().unwrap_or(Path::new(".")).display().to_string() }));
-                    ui.label(tr!("recording_path", { path: &recorded.path.display().to_string() }));
                     ui.label(tr!("disk_cache_usage", {
                         used: &format!("{:.1}", self.disk_budget.used.load(Ordering::Acquire) as f64 / 1073741824.0),
                         limit: &format!("{:.1}", self.disk_budget.limit.load(Ordering::Acquire) as f64 / 1073741824.0)
@@ -4532,7 +4538,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            recording::export(&state.path, raw.len() as u64, &export, Some(&spec)).unwrap(),
+            recording::export(&state.path, raw.len() as u64, &export, &spec).unwrap(),
             2500
         );
         assert_eq!(std::fs::read(&export).unwrap(), raw.as_bytes());
