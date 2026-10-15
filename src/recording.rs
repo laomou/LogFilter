@@ -32,46 +32,16 @@ impl RecordingDirectory {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    pub fn used_bytes(&self) -> io::Result<u64> {
-        let mut total = 0u64;
-        for entry in std::fs::read_dir(&self.path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                total = total.saturating_add(entry.metadata()?.len());
-            }
-        }
-        Ok(total)
-    }
 }
 
 pub struct DiskBudget {
-    pub limit: AtomicU64,
     pub min_free: AtomicU64,
-    pub used: AtomicU64,
 }
 
 impl DiskBudget {
-    pub fn new(limit: u64, min_free: u64) -> Arc<Self> {
+    pub fn new(min_free: u64) -> Arc<Self> {
         Arc::new(Self {
-            limit: AtomicU64::new(limit),
             min_free: AtomicU64::new(min_free),
-            used: AtomicU64::new(0),
-        })
-    }
-    fn reserve(self: &Arc<Self>, bytes: u64) -> io::Result<Reservation> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|total| *total <= self.limit.load(Ordering::Relaxed))
-            })
-            .map_err(|_| {
-                io::Error::other(
-                    "logs directory size limit reached; capture stopped, original files retained",
-                )
-            })?;
-        Ok(Reservation {
-            budget: self.clone(),
-            remaining: bytes,
         })
     }
     fn check_space(&self, available: u64) -> io::Result<()> {
@@ -87,16 +57,6 @@ impl DiskBudget {
         } else {
             Ok(())
         }
-    }
-}
-
-struct Reservation {
-    budget: Arc<DiskBudget>,
-    remaining: u64,
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.remaining, Ordering::AcqRel);
     }
 }
 
@@ -168,15 +128,10 @@ pub struct Writer {
 impl Writer {
     #[cfg(test)]
     pub fn create(directory: &Path) -> io::Result<Self> {
-        Self::create_with_budget(directory, DiskBudget::new(u64::MAX, 0))
+        Self::create_with_budget(directory, DiskBudget::new(0))
     }
 
     pub fn create_with_budget(directory: &Path, budget: Arc<DiskBudget>) -> io::Result<Self> {
-        if budget.used.load(Ordering::Acquire) >= budget.limit.load(Ordering::Relaxed) {
-            return Err(io::Error::other(
-                "logs directory size limit reached; manage existing logs or raise the limit",
-            ));
-        }
         std::fs::create_dir_all(directory)?;
         let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
         for sequence in 0..1000 {
@@ -285,7 +240,6 @@ fn copy_raw<R: Read, W: Write>(
             if state.paused.load(Ordering::Acquire) {
                 continue;
             }
-            let mut reservation = state.budget.reserve(n as u64)?;
             let mut offset = 0;
             while offset < n {
                 match writer.write(&buf[offset..n]) {
@@ -298,7 +252,6 @@ fn copy_raw<R: Read, W: Write>(
                     Ok(count) => {
                         offset += count;
                         state.written.fetch_add(count as u64, Ordering::Release);
-                        reservation.remaining -= count as u64;
                         bytes_since_space_check += count;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -570,13 +523,8 @@ mod tests {
         let second_state = second.state.clone();
         first.record(Cursor::new(b"one\n"));
         second.record(Cursor::new(b"two\n"));
-        assert_eq!(
-            RecordingDirectory::create(&directory)
-                .unwrap()
-                .used_bytes()
-                .unwrap(),
-            8
-        );
+        assert_eq!(std::fs::metadata(&first_state.path).unwrap().len(), 4);
+        assert_eq!(std::fs::metadata(&second_state.path).unwrap().len(), 4);
         let first_path = first_state.path.clone();
         drop(first_state);
         assert_eq!(std::fs::read(&first_path).unwrap(), b"one\n");
@@ -586,25 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn directory_limit_stops_capture_and_retains_the_written_prefix() {
-        let writer = writer();
-        let state = writer.state.clone();
-        state.budget.limit.store(70 * 1024, Ordering::Relaxed);
-        writer.record(io::repeat(b'x').take(100 * 1024));
-        assert_eq!(state.written.load(Ordering::Acquire), BLOCK as u64);
-        assert_eq!(std::fs::metadata(&state.path).unwrap().len(), BLOCK as u64);
-        assert!(state
-            .error
-            .lock_recover()
-            .as_ref()
-            .unwrap()
-            .contains("size limit"));
-        cleanup(&state);
-    }
-
-    #[test]
     fn free_space_guard_has_a_safety_margin() {
-        let budget = DiskBudget::new(u64::MAX, 1024 * 1024);
+        let budget = DiskBudget::new(1024 * 1024);
         assert!(budget.check_space(1024 * 1024).is_err());
         assert!(budget.check_space(1024 * 1024 + BLOCK as u64 - 1).is_err());
         assert!(budget.check_space(1024 * 1024 + BLOCK as u64).is_ok());
