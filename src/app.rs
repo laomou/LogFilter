@@ -3075,24 +3075,28 @@ impl eframe::App for App {
                 self.close_ready = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
-                egui::Window::new(tr!("recording_finishing"))
-                    .collapsible(false)
-                    .show(&ctx, |ui| {
-                        ui.label(tr!("recording_exit_wait"));
-                        if let Some(error) = &self.exit_recording_error {
+                // Normal shutdown finishes in the background without a progress
+                // dialog. Only an actual write failure needs a user decision.
+                if let Some(error) = &self.exit_recording_error {
+                    egui::Window::new(tr!("close"))
+                        .collapsible(false)
+                        .show(&ctx, |ui| {
                             ui.label(error);
-                        }
-                        if ui
-                            .add_enabled(!saving, egui::Button::new(tr!("recording_force_exit")))
-                            .clicked()
-                        {
-                            self.close_ready = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if ui.button(tr!("recording_cancel_exit")).clicked() {
-                            self.closing = false;
-                        }
-                    });
+                            if ui
+                                .add_enabled(
+                                    !saving,
+                                    egui::Button::new(tr!("recording_force_exit")),
+                                )
+                                .clicked()
+                            {
+                                self.close_ready = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if ui.button(tr!("recording_cancel_exit")).clicked() {
+                                self.closing = false;
+                            }
+                        });
+                }
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
@@ -3169,11 +3173,7 @@ impl App {
                         }
                     });
                     ui.separator();
-                    if ui
-                        .button(tr!("save_filtered"))
-                        .on_hover_text(tr!("recording_export_scope"))
-                        .clicked()
-                    {
+                    if ui.button(tr!("save_filtered")).clicked() {
                         self.save_filtered();
                         ui.close();
                     }
@@ -3824,22 +3824,9 @@ impl App {
                     ui.separator();
                     ui.label(tr!("selected_n", { n: &n.to_string() }));
                 }
-                if let Some(recorded) = &self.recording {
-                    if recorded.finished.load(Ordering::Acquire) {
-                        ui.separator();
-                        ui.label(if recorded.error.lock_recover().is_some() {
-                            tr!("recording_incomplete")
-                        } else {
-                            tr!("recording_complete")
-                        });
-                    } else if self.session.is_none() {
-                        ui.separator();
-                        ui.label(tr!("recording_finishing"));
-                    }
-                    if self.preview_omitted > 0 {
-                        ui.separator();
-                        ui.label(tr!("preview_omitted", { n: &self.preview_omitted.to_string() }));
-                    }
+                if self.recording.is_some() && self.preview_omitted > 0 {
+                    ui.separator();
+                    ui.label(tr!("preview_omitted", { n: &self.preview_omitted.to_string() }));
                 }
                 // Shown alongside the selection count, not instead of it, so a
                 // message never hides the count (and needs no expiry to reveal it).
