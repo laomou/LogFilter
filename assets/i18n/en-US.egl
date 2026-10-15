@@ -143,7 +143,6 @@ recording_no_overwrite = Cannot overwrite the raw recording with a filtered expo
 recording_export_scope = Exports recorded history using the current filters; bookmarks-only mode exports cached bookmarks.
 recording_force_exit = Close now
 recording_cancel_exit = Cancel exit
-recording_progress = Written {written} MiB · Preview backlog {backlog} MiB
 recording_complete = Captured
 recording_incomplete = Capture failed — received data is retained in the file
 recording_finishing = Finishing recording…
