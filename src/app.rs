@@ -3810,7 +3810,7 @@ impl App {
                     } else {
                         ui.label(filtered_text);
                     }
-                    if model.bookmarks.len() > 0 {
+                    if !model.bookmarks.is_empty() {
                         ui.separator();
                         ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                     }
