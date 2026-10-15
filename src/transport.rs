@@ -241,7 +241,7 @@ pub fn device_serial(entry: &str) -> &str {
 }
 
 pub struct Session {
-    child: Child,
+    child: Option<Child>,
     /// Private to this session: clearing advances it without letting an old
     /// reader adopt the epoch of a replacement file or device session.
     epoch: Arc<AtomicU64>,
@@ -249,11 +249,8 @@ pub struct Session {
     reader_thread: Option<thread::Thread>,
     reader_handle: Option<thread::JoinHandle<()>>,
     stderr_handle: Option<thread::JoinHandle<()>>,
-    stopped: bool,
-    /// Set true when the adb stdout closes (process exited / stream ended), so
-    /// the UI can detect a session that died on its own and stop showing it as
-    /// live. Distinct from `stop()`, which the user initiated.
-    ended: Arc<AtomicBool>,
+    /// Stop forwarding lines while asynchronous cleanup waits for pipe closure.
+    stop_requested: Arc<AtomicBool>,
     /// Captured stderr from the adb child. Populated by a reader thread; read by
     /// the UI when the session ends to surface the reason (device offline,
     /// unknown command, etc.) instead of a silent empty stream.
@@ -303,8 +300,8 @@ impl Session {
         let paused_thr = paused.clone();
         let read_error = Arc::new(Mutex::new(None));
         let read_error_thr = read_error.clone();
-        let ended = Arc::new(AtomicBool::new(false));
-        let ended_thr = ended.clone();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let reader_stop_requested = stop_requested.clone();
         let epoch = Arc::new(AtomicU64::new(epoch));
         let reader_epoch = epoch.clone();
         let handle = thread::Builder::new()
@@ -312,6 +309,9 @@ impl Session {
             .spawn(move || {
                 let reader = BufReader::new(stdout);
                 let outcome = stream_lossy_lines(reader, |line| {
+                    if reader_stop_requested.load(Ordering::Acquire) {
+                        return false;
+                    }
                     // "Pause Capture" stops *recording*, not *reading*: keep
                     // draining the kernel pipe so adb doesn't back up and the
                     // device's logd doesn't rotate our logs away.
@@ -334,9 +334,6 @@ impl Session {
                         *slot = Some(e.to_string());
                     }
                 }
-                // stdout closed → the adb process ended (or was killed). Signal the
-                // UI so it doesn't keep showing a live session that emits nothing.
-                ended_thr.store(true, Ordering::Release);
             })?;
         let reader_thread = handle.thread().clone();
 
@@ -363,14 +360,13 @@ impl Session {
         };
 
         Ok(Self {
-            child,
+            child: Some(child),
             epoch,
             paused,
             reader_thread: Some(reader_thread),
             reader_handle: Some(handle),
             stderr_handle,
-            stopped: false,
-            ended,
+            stop_requested,
             stderr: stderr_buf,
             read_error,
         })
@@ -381,15 +377,15 @@ impl Session {
         self.epoch.store(epoch, Ordering::Release);
     }
 
-    /// True once the adb process's stdout has closed on its own (not via a
-    /// user-initiated `stop()`).
-    pub fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+    /// The stdout reader has finished. This does not imply the child exited:
+    /// a command can close stdout and keep running or only write to stderr.
+    pub fn stdout_ended(&self) -> bool {
+        self.reader_handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
     /// The I/O error that stopped the reader, if it stopped for that reason.
     ///
-    /// `None` means the stream ended normally (EOF); see [`Self::has_ended`].
+    /// `None` means the stream ended normally (EOF); see [`Self::stdout_ended`].
     pub fn read_error_text(&self) -> Option<String> {
         self.read_error.lock().ok().and_then(|g| g.clone())
     }
@@ -417,38 +413,57 @@ impl Session {
     }
 
     pub fn stop(&mut self) {
-        if self.stopped {
+        let Some(mut child) = self.child.take() else {
             return;
+        };
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = child.kill();
+        let reader = self.reader_handle.take();
+        let stderr = self.stderr_handle.take();
+        self.reader_thread = None;
+        // Neither process exit nor pipe closure is guaranteed to be immediate.
+        // In particular, descendants may retain stdout/stderr after the direct
+        // child dies. Stop, Restart, file-open and Drop must never join on the UI.
+        if let Err(e) = thread::Builder::new()
+            .name("device-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+                if let Some(handle) = reader {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr {
+                    let _ = handle.join();
+                }
+            })
+        {
+            tracing::warn!("failed to spawn device cleanup worker: {e}");
         }
-        self.stopped = true;
-        let _ = self.child.kill();
-        // Wake the reader so it can see the broken pipe / empty read and exit.
-        self.paused.store(false, Ordering::Relaxed);
-        if let Some(t) = &self.reader_thread {
-            t.unpark();
-        }
-        let _ = self.child.wait();
-        self.join_workers();
     }
 
-    /// Reap a session that ended on its own (its stdout closed, which set
-    /// `ended`): wait on the child and join the stdout/stderr workers so the
-    /// captured stderr is COMPLETE before it is read. Unlike `stop()` this does
-    /// not kill the child — it has already exited. Without this, reading
-    /// `stderr_text()` the instant `has_ended()` flips races the stderr thread
-    /// still flushing, and the failure reason (device offline, unknown command…)
-    /// can be lost.
-    pub fn reap(&mut self) {
-        if self.stopped {
-            return;
+    /// Non-blocking natural completion check, safe to call from the UI. Keep
+    /// the session stoppable until both the process and its pipe workers end.
+    /// Completed workers are joined before the UI reads their final diagnostics.
+    pub fn try_reap(&mut self) -> std::io::Result<bool> {
+        let Some(child) = &mut self.child else {
+            return Ok(true);
+        };
+        if child.try_wait()?.is_none() {
+            return Ok(false);
         }
-        self.stopped = true;
-        let _ = self.child.wait();
+        if !self.stdout_ended()
+            || self
+                .stderr_handle
+                .as_ref()
+                .is_some_and(|h| !h.is_finished())
+        {
+            return Ok(false);
+        }
         self.join_workers();
+        self.child = None;
+        Ok(true)
     }
 
-    /// Join the stdout/stderr workers after the child has exited. Handles are
-    /// consumed so a later `Drop` cannot attempt to join them twice.
+    /// Called only after is_finished() succeeded for every worker.
     fn join_workers(&mut self) {
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
@@ -524,6 +539,32 @@ fn stream_lossy_lines<R: BufRead>(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_reap(session: &mut Session) {
+        wait_until(|| session.try_reap().unwrap());
+    }
+
+    fn gate_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lf_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn parse_device_lines_labels_non_ready_states() {
@@ -656,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_reaps_stdout_and_stderr_workers() {
+    fn stop_hands_off_stdout_and_stderr_cleanup() {
         let (tx, rx) = crossbeam_channel::bounded(4);
         let mut session = Session::start(
             Transport::Adb,
@@ -669,18 +710,20 @@ mod tests {
         .expect("shell-backed session should start");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !session.has_ended() && std::time::Instant::now() < deadline {
+        while !session.stdout_ended() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            session.has_ended(),
+            session.stdout_ended(),
             "stdout worker should observe process exit"
         );
 
         session.stop();
 
         assert_eq!(rx.try_recv(), Ok((1, "output".into())));
+        wait_until(|| session.stderr_text() == "error");
         assert_eq!(session.stderr_text(), "error");
+        assert!(session.child.is_none());
         assert!(session.reader_handle.is_none());
         assert!(session.stderr_handle.is_none());
         assert!(session.reader_thread.is_none());
@@ -715,15 +758,12 @@ mod tests {
         std::fs::write(&gate, b"").unwrap();
         assert_eq!(rx.recv_timeout(timeout).unwrap(), (1, "before".into()));
         assert_eq!(rx.recv_timeout(timeout).unwrap(), (2, "after".into()));
-        session.reap();
+        wait_for_reap(&mut session);
         std::fs::remove_file(gate).unwrap();
     }
 
     #[test]
-    fn reap_drains_stderr_of_a_self_ended_session() {
-        // A child that writes to stderr and exits. After it ends on its own,
-        // reap() must join the stderr worker so the reason is fully captured —
-        // this is the path the UI takes when has_ended() flips.
+    fn try_reap_waits_for_complete_stderr_of_a_self_ended_session() {
         let (tx, _rx) = crossbeam_channel::bounded(4);
         let mut session = Session::start(
             Transport::Adb,
@@ -736,12 +776,12 @@ mod tests {
         .expect("shell-backed session should start");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !session.has_ended() && std::time::Instant::now() < deadline {
+        while !session.stdout_ended() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(session.has_ended(), "process should end on its own");
+        assert!(session.stdout_ended(), "stdout reader should finish");
 
-        session.reap();
+        wait_for_reap(&mut session);
         assert_eq!(
             session.stderr_text(),
             "device offline",
@@ -749,6 +789,86 @@ mod tests {
         );
         assert!(session.stderr_handle.is_none(), "stderr worker joined");
         assert!(session.reader_handle.is_none(), "stdout worker joined");
+    }
+
+    #[test]
+    fn stdout_eof_does_not_block_on_a_running_child_or_lose_late_stderr() {
+        let gate = gate_path("stdout_eof");
+        let script = format!(
+            "exec 1>&-; while [ ! -e {} ]; do sleep 0.01; done; printf 'late error' >&2",
+            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+        );
+        let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+        let (tx, _rx) = log_channel();
+        let mut session =
+            Session::start(Transport::Adb, Some("/bin/sh"), None, &cmd, tx, 1).unwrap();
+        wait_until(|| session.stdout_ended());
+        assert!(session
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let done = session.try_reap().unwrap();
+            done_tx.send((done, session)).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release even on failure, so a regressed blocking wait can unwind.
+        std::fs::write(&gate, b"").unwrap();
+        let (done, mut session) = result.expect("try_reap blocked waiting for child exit");
+        assert!(!done, "stdout EOF must not be treated as process exit");
+        worker.join().unwrap();
+        wait_for_reap(&mut session);
+        assert_eq!(session.stderr_text(), "late error");
+        assert!(session.child.is_none());
+        assert!(session.try_reap().unwrap(), "completion is idempotent");
+        std::fs::remove_file(gate).unwrap();
+    }
+
+    #[test]
+    fn inherited_stderr_does_not_block_poll_stop_or_drop() {
+        for drop_session in [false, true] {
+            let gate = gate_path("inherited_stderr");
+            let script = format!(
+                "exec 1>&-; (while [ ! -e {} ]; do sleep 0.01; done; printf 'descendant error' >&2) & exit 0",
+                shlex::try_quote(gate.to_str().unwrap()).unwrap());
+            let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+            let (tx, _rx) = log_channel();
+            let mut session =
+                Session::start(Transport::Adb, Some("/bin/sh"), None, &cmd, tx, 1).unwrap();
+            wait_until(|| session.stdout_ended());
+            wait_until(|| {
+                session
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_some()
+            });
+            let stderr = session.stderr.clone();
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let worker = thread::spawn(move || {
+                // The direct child has exited, but joining stderr would block.
+                assert!(!session.try_reap().unwrap());
+                if !drop_session {
+                    session.stop();
+                    session.stop();
+                }
+                drop(session);
+                done_tx.send(()).unwrap();
+            });
+            let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+            std::fs::write(&gate, b"").unwrap();
+            result.expect("pipe cleanup blocked the caller");
+            worker.join().unwrap();
+            wait_until(|| stderr.lock().unwrap().as_str() == "descendant error");
+            std::fs::remove_file(gate).unwrap();
+        }
     }
 
     /// A `Read` that replays scripted steps, so a mid-stream I/O error or a
@@ -916,14 +1036,14 @@ mod tests {
         .expect("shell-backed session should start");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !session.has_ended() && std::time::Instant::now() < deadline {
+        while !session.stdout_ended() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            session.has_ended(),
+            session.stdout_ended(),
             "the reader must not wait for the log channel"
         );
-        session.reap();
+        wait_for_reap(&mut session);
 
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert_eq!(lines.len(), 20_000, "no line may be lost");
@@ -948,14 +1068,14 @@ mod tests {
         session.set_paused(true);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !session.has_ended() && std::time::Instant::now() < deadline {
+        while !session.stdout_ended() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            session.has_ended(),
+            session.stdout_ended(),
             "a paused reader must still drain to EOF, not stall the pipe"
         );
-        session.reap();
+        wait_for_reap(&mut session);
 
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert!(
