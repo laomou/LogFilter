@@ -50,10 +50,10 @@ finalizes in the background, and normal window close waits for final synchroniza
 Periodic synchronization occurs during writes; sudden power loss can still lose
 data not yet synchronized. Disk capacity and write throughput remain finite.
 
-The GUI exposes cache settings. Defaults are a 10 GiB limit for all files in
-`logs/`, a 1 GiB free-space reserve, and an automatic memory preview budget.
-When either disk guard is reached, capture stops with an error and existing files
-remain intact. LogFilter does not silently delete or overwrite old recordings.
+Defaults are a 10 GiB limit for all files in `logs/`, a 1 GiB free-space
+reserve, and an automatic memory preview budget. When either disk guard is
+reached, capture stops with an error and existing files remain intact.
+LogFilter does not silently delete or overwrite old recordings.
 
 Optional configuration:
 
