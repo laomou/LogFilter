@@ -419,6 +419,10 @@ fn send_decoded_lines_with_enc(
 ) -> std::io::Result<Tail> {
     let identity = file_identity(&file)?;
     let mut reader = BufReader::with_capacity(8192, file);
+    // A decoder may override the locale encoding when it sees a BOM. Resolve
+    // that override here as well so tailing uses the same encoding and byte
+    // alignment as the initial load. fill_buf leaves the BOM for the decoder.
+    let enc = Encoding::for_bom(reader.fill_buf()?).map_or(enc, |(detected, _)| detected);
     let mut decoder = enc.new_decoder();
     // Accumulate decoded text across chunks so we can split into lines only when
     // a full line is available — avoids splitting a multibyte character mid-sequence.
@@ -841,6 +845,90 @@ mod tests {
         );
         assert_eq!(tail.encoding_name(), "UTF-16LE");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn local_utf16_bom_is_preserved_for_incremental_tail_decoding() {
+        for enc in [encoding_rs::UTF_16LE, encoding_rs::UTF_16BE] {
+            let path = unique_tmp(enc.name());
+            let encode = |text: &str| {
+                text.encode_utf16()
+                    .flat_map(|unit| {
+                        if enc == encoding_rs::UTF_16LE {
+                            unit.to_le_bytes()
+                        } else {
+                            unit.to_be_bytes()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            std::fs::write(&path, encode("\u{feff}first\n")).unwrap();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let source_epoch = Arc::new(AtomicU64::new(1));
+            let tail = send_decoded_lines(
+                File::open(&path).unwrap(),
+                tx.clone(),
+                1,
+                source_epoch,
+                EncodingChoice::Local,
+            )
+            .unwrap();
+            assert_eq!(rx.try_iter().map(|(_, s)| s).collect::<Vec<_>>(), ["first"]);
+            assert_eq!(tail.encoding_name(), enc.name());
+            let Tail::Append {
+                offset,
+                enc: actual,
+                ..
+            } = tail
+            else {
+                panic!("newline-terminated file must tail incrementally");
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let appended = encode("日志😀\n");
+            // Splitting a UTF-16 code unit between polls must hold back the row.
+            file.write_all(&appended[..3]).unwrap();
+            let partial = read_appended(&path, offset, actual, &tx, 1).unwrap();
+            assert_eq!(partial.offset, offset);
+            assert!(rx.is_empty());
+            file.write_all(&appended[3..]).unwrap();
+            let done = read_appended(&path, offset, actual, &tx, 1).unwrap();
+            assert_eq!(done.offset, offset + appended.len() as u64);
+            assert_eq!(
+                rx.try_iter().map(|(_, s)| s).collect::<Vec<_>>(),
+                ["日志😀"]
+            );
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_utf16_partial_initial_line_retains_detected_encoding() {
+        let path = unique_tmp("local_utf16_partial");
+        let data: Vec<u8> = "\u{feff}partial"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        std::fs::write(&path, data).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tail = send_decoded_lines(
+            File::open(&path).unwrap(),
+            tx,
+            1,
+            Arc::new(AtomicU64::new(1)),
+            EncodingChoice::Local,
+        )
+        .unwrap();
+        assert!(matches!(tail, Tail::ReloadOnChange { .. }));
+        assert_eq!(tail.encoding_name(), "UTF-16LE");
+        assert_eq!(
+            rx.try_iter().map(|(_, s)| s).collect::<Vec<_>>(),
+            ["partial"]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
