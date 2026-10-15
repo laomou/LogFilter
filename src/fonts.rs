@@ -71,6 +71,13 @@ pub fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, Str
         }
     }
 
+    // egui's built-in fonts carry no CJK glyphs, so without this every
+    // Chinese/Japanese/Korean character renders as a tofu box unless the user
+    // manually picks a CJK font. Append a system CJK font as a fallback in the
+    // Proportional family; the mirror below copies it into Monospace too, so both
+    // the menu chrome and the table show CJK out of the box.
+    push_cjk_fallback_from(&mut fonts, system_cjk_candidates());
+
     // Mirror Proportional → Monospace so the table matches the menu chrome.
     if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
         fonts.families.insert(egui::FontFamily::Monospace, prop);
@@ -84,6 +91,72 @@ pub fn install_ui_font(ctx: &egui::Context, primary: &str, stems: &[(String, Str
             .insert(0, primary.to_string());
     }
     ctx.set_fonts(fonts);
+}
+
+/// System fonts that carry CJK (and broad Unicode) glyphs, tried in order. Used
+/// as a fallback so CJK text renders without the user importing a font.
+fn system_cjk_candidates() -> &'static [(&'static str, u32)] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            (r"C:\Windows\Fonts\msyh.ttc", 0), // Microsoft YaHei (SC)
+            (r"C:\Windows\Fonts\msyh.ttf", 0),
+            (r"C:\Windows\Fonts\simhei.ttf", 0), // SimHei
+            (r"C:\Windows\Fonts\simsun.ttc", 0), // SimSun
+            (r"C:\Windows\Fonts\msjh.ttc", 0),   // MS JhengHei (TC)
+            (r"C:\Windows\Fonts\meiryo.ttc", 0), // Meiryo (JP)
+            (r"C:\Windows\Fonts\malgun.ttf", 0), // Malgun Gothic (KR)
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/System/Library/Fonts/STHeiti Light.ttc", 0),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+            ("/Library/Fonts/Arial Unicode.ttf", 0),
+        ]
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        &[
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+            (
+                "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+                0,
+            ),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+            (
+                "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+                0,
+            ),
+        ]
+    }
+}
+
+/// Load the first available font in `candidates` and append it as a fallback in
+/// the Proportional family (so it fills in glyphs the earlier fonts lack, e.g.
+/// CJK). Returns true if one was loaded. `.1` is the face index for `.ttc`
+/// collections. Kept separate + parameterized so it can be unit-tested.
+fn push_cjk_fallback_from(fonts: &mut egui::FontDefinitions, candidates: &[(&str, u32)]) -> bool {
+    for (path, index) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let name = "system-cjk".to_string();
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = *index;
+            fonts
+                .font_data
+                .insert(name.clone(), std::sync::Arc::new(data));
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push(name);
+            return true;
+        }
+    }
+    false
 }
 
 /// Find a font's path on disk given its file stem and the stems list.
@@ -116,4 +189,47 @@ pub fn bump_global_text_sizes(ctx: &egui::Context) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cjk_candidates_are_listed_for_this_platform() {
+        // Every supported platform should offer at least one candidate path.
+        assert!(!system_cjk_candidates().is_empty());
+    }
+
+    #[test]
+    fn cjk_fallback_no_op_when_nothing_found() {
+        let mut fonts = egui::FontDefinitions::default();
+        let before = fonts.font_data.len();
+        assert!(!push_cjk_fallback_from(
+            &mut fonts,
+            &[("/no/such/font-xyz.ttf", 0)]
+        ));
+        assert_eq!(fonts.font_data.len(), before, "nothing added on a miss");
+    }
+
+    #[test]
+    fn cjk_fallback_appends_to_proportional_when_font_exists() {
+        // Only asserts the positive path if a real CJK font is present (it is on
+        // most Linux dev/CI images via Noto); otherwise the miss path above covers it.
+        let real = system_cjk_candidates()
+            .iter()
+            .find(|(p, _)| std::path::Path::new(p).exists());
+        let Some(&(path, index)) = real else {
+            return;
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        assert!(push_cjk_fallback_from(&mut fonts, &[(path, index)]));
+        assert!(fonts.font_data.contains_key("system-cjk"));
+        assert!(
+            fonts.families[&egui::FontFamily::Proportional]
+                .iter()
+                .any(|n| n == "system-cjk"),
+            "CJK font must be a Proportional fallback"
+        );
+    }
 }
