@@ -50,8 +50,8 @@ device_any = (any)
 refresh_devices = Refresh devices
 run = Run
 restart = Restart
-pause = Pause preview
-resume = Resume preview
+pause = Pause
+resume = Resume
 stop = Stop
 clear = Clear
 goto = Goto:
@@ -148,8 +148,8 @@ preview_evicted = {n} older preview rows are on disk
 preview_omitted = {n} oversized rows omitted from preview; original bytes are retained in the file
 status_recording_failed = Recording stopped: {e}
 status_preview_failed = Preview stopped (raw recording is independent): {e}
-status_preview_paused = Preview paused; recording continues to disk
-status_preview_resumed = Preview resumed
+status_preview_paused = Paused; logs received during the pause are not saved
+status_preview_resumed = Resumed
 
 # goto status
 status_goto_out_of_range = Line {n} out of range (total {total})

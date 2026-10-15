@@ -5627,10 +5627,15 @@ mod ui_tests {
     fn disk_recording_survives_pause_clear_and_resume_after_process_exit() {
         let mut h = harness();
         h.step();
-        let gate = std::env::temp_dir().join(format!("lf_disk_ui_gate_{}", std::process::id()));
+        let gate1 = std::env::temp_dir().join(format!("lf_disk_ui_gate1_{}", std::process::id()));
+        let gate2 = std::env::temp_dir().join(format!("lf_disk_ui_gate2_{}", std::process::id()));
+        let paused_done =
+            std::env::temp_dir().join(format!("lf_disk_ui_paused_done_{}", std::process::id()));
         let script = format!(
-            "printf 'first\\n'; while [ ! -e {} ]; do sleep 0.01; done; printf 'second\\n'",
-            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+            "printf 'first\\n'; while [ ! -e {} ]; do sleep 0.01; done; printf 'second\\n'; touch {}; while [ ! -e {} ]; do sleep 0.01; done; printf 'third\\n'",
+            shlex::try_quote(gate1.to_str().unwrap()).unwrap(),
+            shlex::try_quote(paused_done.to_str().unwrap()).unwrap(),
+            shlex::try_quote(gate2.to_str().unwrap()).unwrap()
         );
         h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
         h.state_mut().selected_cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
@@ -5644,16 +5649,21 @@ mod ui_tests {
         }
         h.state_mut().toggle_pause();
         h.state_mut().clear();
-        std::fs::write(&gate, b"").unwrap();
+        std::fs::write(&gate1, b"").unwrap();
+        while !paused_done.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            h.step();
+        }
+        assert_eq!(std::fs::read(&state.path).unwrap(), b"first\n");
+        h.state_mut().toggle_pause();
+        std::fs::write(&gate2, b"").unwrap();
         while !state.finished.load(Ordering::Acquire) || h.state().session.is_some() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
             h.step();
         }
-        assert!(h.state().model.read_recover().entries.is_empty());
-        assert_eq!(std::fs::read(&state.path).unwrap(), b"first\nsecond\n");
-        // Resume must work after the process ended, to finish previewing the file.
-        h.state_mut().toggle_pause();
+        assert_eq!(std::fs::read(&state.path).unwrap(), b"first\nthird\n");
         while h.state().model.read_recover().entries.is_empty() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
@@ -5661,15 +5671,17 @@ mod ui_tests {
         }
         let m = h.state().model.read_recover();
         assert_eq!(m.entries.len(), 1);
-        assert_eq!(m.entries[0].raw(), "second");
+        assert_eq!(m.entries[0].raw(), "third");
         drop(m);
         assert!(state.error.lock_recover().is_none());
         let old_path = state.path.clone();
         h.state_mut().run_session();
         assert_ne!(h.state().recording.as_ref().unwrap().path, old_path);
-        assert_eq!(std::fs::read(&old_path).unwrap(), b"first\nsecond\n");
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"first\nthird\n");
         h.state_mut().stop_session();
-        std::fs::remove_file(gate).unwrap();
+        std::fs::remove_file(gate1).unwrap();
+        std::fs::remove_file(gate2).unwrap();
+        std::fs::remove_file(paused_done).unwrap();
     }
 
     #[test]
