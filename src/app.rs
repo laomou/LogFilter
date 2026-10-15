@@ -3738,7 +3738,7 @@ impl App {
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             let model = self.model.read_recover();
             // File viewing identifies that file; capture identifies its actual
-            // output, including after Stop/Clear. Before capture, show logs/.
+            // output, including after Stop/Clear. An idle view has no source.
             let source_path = model
                 .file_path
                 .clone()
@@ -3751,9 +3751,11 @@ impl App {
                     self.recording_directory
                         .as_ref()
                         .map(|directory| directory.path().to_path_buf())
-                })
-                .or_else(|| self.recording_directory_override.clone())
-                .or_else(config::recordings_dir);
+                });
+            // Counts describe a loaded file, a live stream, or a capture; an
+            // idle view has nothing to count, so it shows only "no file".
+            let has_content =
+                model.file_path.is_some() || self.recording.is_some() || self.session.is_some();
             ui.horizontal(|ui| {
                 if let Some(path) = source_path {
                     let full = display_path(&path);
@@ -3764,51 +3766,55 @@ impl App {
                 } else {
                     ui.label(tr!("no_file"));
                 }
-                ui.separator();
-                let global_rows = self
-                    .paged
-                    .as_ref()
-                    .map(|paged| paged.source.active().total_rows.load(Ordering::Acquire));
-                ui.label(format!(
-                    "{} {}",
-                    if self.recording.is_some() {
-                        tr!("cached_rows")
-                    } else {
-                        tr!("total")
-                    },
-                    self.paged
+                if has_content {
+                    ui.separator();
+                    let global_rows = self
+                        .paged
                         .as_ref()
-                        .map(|paged| paged.source.base.total_rows.load(Ordering::Acquire))
-                        .unwrap_or(model.entries.len() as u64)
-                ));
-                if model.first_line > 0 {
-                    ui.label(tr!("preview_evicted", { n: &model.first_line.to_string() }));
-                }
-                ui.separator();
-                // When entries are loaded but the active filters hide every one of
-                // them, color the filtered count so the empty table has a visible
-                // cause (a typo'd Find, a stale column filter, or "bookmarks only"
-                // with no bookmarks all otherwise look identical).
-                let filtered_text = format!(
-                    "{} {}",
-                    tr!("filtered"),
-                    if self.ui.bookmarks_only {
-                        model.filtered.len() as u64
-                    } else {
-                        global_rows.unwrap_or(model.filtered.len() as u64)
+                        .map(|paged| paged.source.active().total_rows.load(Ordering::Acquire));
+                    ui.label(format!(
+                        "{} {}",
+                        if self.recording.is_some() {
+                            tr!("cached_rows")
+                        } else {
+                            tr!("total")
+                        },
+                        self.paged
+                            .as_ref()
+                            .map(|paged| paged.source.base.total_rows.load(Ordering::Acquire))
+                            .unwrap_or(model.entries.len() as u64)
+                    ));
+                    if model.first_line > 0 {
+                        ui.label(tr!("preview_evicted", { n: &model.first_line.to_string() }));
                     }
-                );
-                if !model.entries.is_empty() && model.filtered.is_empty() {
-                    ui.label(
-                        egui::RichText::new(filtered_text)
-                            .color(Color32::from_rgb(230, 126, 34))
-                            .strong(),
+                    ui.separator();
+                    // When entries are loaded but the active filters hide every one of
+                    // them, color the filtered count so the empty table has a visible
+                    // cause (a typo'd Find, a stale column filter, or "bookmarks only"
+                    // with no bookmarks all otherwise look identical).
+                    let filtered_text = format!(
+                        "{} {}",
+                        tr!("filtered"),
+                        if self.ui.bookmarks_only {
+                            model.filtered.len() as u64
+                        } else {
+                            global_rows.unwrap_or(model.filtered.len() as u64)
+                        }
                     );
-                } else {
-                    ui.label(filtered_text);
+                    if !model.entries.is_empty() && model.filtered.is_empty() {
+                        ui.label(
+                            egui::RichText::new(filtered_text)
+                                .color(Color32::from_rgb(230, 126, 34))
+                                .strong(),
+                        );
+                    } else {
+                        ui.label(filtered_text);
+                    }
+                    if model.bookmarks.len() > 0 {
+                        ui.separator();
+                        ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
+                    }
                 }
-                ui.separator();
-                ui.label(format!("{} {}", tr!("bookmarks"), model.bookmarks.len()));
                 // Encoding only applies to a loaded file (resolves "Local" to the
                 // sniffed codepage). An adb stream is always UTF-8-lossy and an
                 // empty view has no source, so showing an encoding there is stale
