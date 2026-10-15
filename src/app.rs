@@ -4683,9 +4683,8 @@ mod ui_tests {
     #[test]
     fn clear_in_file_mode_bumps_epoch_to_stop_tail() {
         // With no device session, Clear must bump the source epoch so the file-tail
-        // poller stops feeding the just-emptied view. (The adb-live branch, which
-        // must NOT bump so the live stream survives, needs a real Session and is
-        // covered by review rather than a unit test.)
+        // poller stops feeding the just-emptied view. Live capture's epoch update
+        // is covered by clear_discards_a_backlog_queued_during_capture.
         let mut h = harness();
         h.run();
         inject(h.state_mut(), 10);
@@ -4702,19 +4701,33 @@ mod ui_tests {
     #[test]
     fn click_run_no_panic_and_status_updates() {
         let mut h = harness();
-        h.run();
+        h.step();
 
-        // Click "Run" — on CI (no adb): fails gracefully with error status.
-        // On dev machines (adb present): starts a session. Either way: no panic,
-        // and status is set to something non-empty.
+        #[cfg(unix)]
+        {
+            // Keep a deterministic session alive on Linux and macOS, without
+            // depending on adb availability or how fast a missing device exits.
+            // exec avoids leaving a sleeping grandchild after test cleanup.
+            h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
+            h.state_mut().selected_cmd = "-c 'exec sleep 30'".into();
+        }
+
+        // A live session requests periodic repaints to poll process completion.
+        // Harness::run waits for repainting to settle, which cannot happen here.
         let label = tr!("run");
         h.get_by_label(label.as_str()).click();
-        h.run();
+        for _ in 0..6 {
+            h.step();
+        }
+
+        #[cfg(unix)]
+        assert!(h.state().session.is_some(), "test process must stay alive");
 
         assert!(
             !h.state().status.is_empty(),
             "clicking Run should update status (success or error)"
         );
+        h.state_mut().stop_session();
     }
 
     // ─── FilterSpec sync ─────────────────────────────────────────────────
