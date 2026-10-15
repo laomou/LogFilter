@@ -408,10 +408,8 @@ impl App {
         let init_palette_raw = cfg.colors.highlights.clone();
         let init_level_colors = parse_level_colors(&cfg);
         let init_col_widths = cfg.view.columns;
-        let disk_budget = recording::DiskBudget::new(
-            cfg.recording.max_disk_mib.max(1).saturating_mul(1048576),
-            cfg.recording.min_free_mib.max(64).saturating_mul(1048576),
-        );
+        let disk_budget =
+            recording::DiskBudget::new(cfg.recording.min_free_mib.max(64).saturating_mul(1048576));
         let mut app = Self {
             cfg,
             model: Arc::new(RwLock::new(Model::default())),
@@ -1053,14 +1051,6 @@ impl App {
         self.stop_session();
         self.retire_recording();
         self.poll_recording();
-        self.disk_budget.limit.store(
-            self.cfg
-                .recording
-                .max_disk_mib
-                .max(1)
-                .saturating_mul(1048576),
-            Ordering::Relaxed,
-        );
         self.disk_budget.min_free.store(
             self.cfg
                 .recording
@@ -1077,17 +1067,6 @@ impl App {
                     .or_else(config::recordings_dir)
                     .ok_or_else(|| std::io::Error::other("logs directory is unavailable"))?;
                 self.recording_directory = Some(recording::RecordingDirectory::create(&parent)?);
-            }
-            if self
-                .previous_recordings
-                .iter()
-                .all(|r| r.finished.load(Ordering::Acquire))
-            {
-                // Include files left by earlier runs and notice user cleanup.
-                self.disk_budget.used.store(
-                    self.recording_directory.as_ref().unwrap().used_bytes()?,
-                    Ordering::Release,
-                );
             }
             recording::Writer::create_with_budget(
                 self.recording_directory.as_ref().unwrap().path(),

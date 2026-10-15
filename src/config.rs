@@ -21,7 +21,6 @@ pub struct Config {
 pub struct RecordingConfig {
     /// Zero selects an automatic preview-cache budget. Raw recordings are on disk.
     pub cache_mib: u64,
-    pub max_disk_mib: u64,
     pub min_free_mib: u64,
 }
 
@@ -29,7 +28,6 @@ impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
             cache_mib: 0,
-            max_disk_mib: 10 * 1024,
             min_free_mib: 1024,
         }
     }

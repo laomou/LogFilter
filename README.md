@@ -50,17 +50,16 @@ finalizes in the background, and normal window close waits for final synchroniza
 Periodic synchronization occurs during writes; sudden power loss can still lose
 data not yet synchronized. Disk capacity and write throughput remain finite.
 
-Defaults are a 10 GiB limit for all files in `logs/`, a 1 GiB free-space
-reserve, and an automatic memory preview budget. When either disk guard is
-reached, capture stops with an error and existing files remain intact.
-LogFilter does not silently delete or overwrite old recordings.
+Capture keeps a 1 GiB free-space reserve on the disk by default and uses an
+automatic memory preview budget. When the reserve is reached, capture stops
+with an error and existing files remain intact. LogFilter does not silently
+delete or overwrite old recordings.
 
 Optional configuration:
 
 ```toml
 [recording]
 cache_mib = 0 # automatic; set e.g. 2048 for a larger preview cache
-max_disk_mib = 10240
 min_free_mib = 1024
 ```
 
