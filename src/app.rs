@@ -549,7 +549,10 @@ impl App {
                         // A mid-stream read error truncated the load; record it so
                         // the UI surfaces "partially loaded" rather than silence.
                         if let Ok(mut slot) = load_error.lock() {
-                            *slot = Some(format!("{src}: {e}"));
+                            if source_epoch.load(Ordering::Acquire) == epoch {
+                                *slot = Some(format!("{src}: {e}"));
+                                ctx.request_repaint();
+                            }
                         }
                         return;
                     }
@@ -5082,6 +5085,31 @@ mod ui_tests {
     }
 
     // ─── Open local file ─────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_initial_line_reports_a_load_error_in_the_ui() {
+        let mut h = harness();
+        h.step();
+        let path = std::env::temp_dir().join(format!("lf_oversized_ui_{}.log", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(100 * 1024 * 1024)
+            .unwrap();
+        h.state_mut().open_file(&path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !h.state().status.contains("decoded limit") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "load error was not displayed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            h.step();
+        }
+        assert!(h.state().model.read_recover().entries.is_empty());
+        assert!(h.state().detected_encoding.lock_recover().is_none());
+        h.state_mut().clear();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn open_file_loads_entries_into_model() {
