@@ -367,7 +367,8 @@ impl Session {
                 match output {
                     Output::Recording(writer) => {
                         // Disk I/O is the only backpressure on the device pipe.
-                        // Preview pause, filters and rendering never gate this path.
+                        // Filters and rendering never gate this path. Pause keeps
+                        // reading stdout but Writer deliberately skips disk writes.
                         let state = writer.state.clone();
                         writer.record(stdout);
                         let error = state.error.lock_recover().clone();

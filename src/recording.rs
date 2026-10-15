@@ -282,6 +282,9 @@ fn copy_raw<R: Read, W: Write>(
             if n == 0 {
                 break;
             }
+            if state.paused.load(Ordering::Acquire) {
+                continue;
+            }
             let mut reservation = state.budget.reserve(n as u64)?;
             let mut offset = 0;
             while offset < n {
@@ -358,10 +361,6 @@ pub fn preview(
                 loop {
                     if source_epoch.load(Ordering::Acquire) != epoch {
                         return Ok(());
-                    }
-                    if state.paused.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
-                        continue;
                     }
                     let done = state.finished.load(Ordering::Acquire);
                     let end = state.written.load(Ordering::Acquire);
@@ -612,14 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn raw_bytes_are_saved_verbatim_even_while_preview_is_paused() {
+    fn paused_recording_discards_bytes_without_writing() {
         let writer = writer();
         let state = writer.state.clone();
         state.paused.store(true, Ordering::Relaxed);
         let bytes = b"\xef\xbb\xbffirst\r\n\xff\x00\nunterminated";
         writer.record(Cursor::new(bytes));
-        assert_eq!(std::fs::read(&state.path).unwrap(), bytes);
-        assert_eq!(state.written.load(Ordering::Acquire), bytes.len() as u64);
+        assert!(std::fs::read(&state.path).unwrap().is_empty());
+        assert_eq!(state.written.load(Ordering::Acquire), 0);
         assert!(state.finished.load(Ordering::Acquire));
         assert!(state.error.lock_recover().is_none());
         cleanup(&state);
@@ -664,10 +663,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_catches_up_in_order_after_pause_and_keeps_final_partial_line() {
+    fn preview_catches_up_in_order_and_keeps_final_partial_line() {
         let writer = writer();
         let state = writer.state.clone();
-        state.paused.store(true, Ordering::Relaxed);
         let epoch = Arc::new(AtomicU64::new(1));
         let rx = preview(state.clone(), 0, 1, epoch, egui::Context::default()).unwrap();
         let text = (0..3000)
@@ -675,8 +673,6 @@ mod tests {
             .collect::<String>()
             + "final";
         writer.record(Cursor::new(text.as_bytes()));
-        assert!(rx.is_empty());
-        state.paused.store(false, Ordering::Relaxed);
         let mut got = Vec::new();
         while let Ok(batch) = rx.recv_timeout(Duration::from_secs(5)) {
             assert!(batch.entries.len() <= 512);

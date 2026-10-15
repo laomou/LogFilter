@@ -29,7 +29,8 @@ Clear or application exit. The GUI shows both the directory and current full
 file path.
 
 The reader writes original stdout bytes to disk before the preview reads them.
-Rendering, filtering and paused preview do not hold up the writer. Clear starts
+Rendering and filtering do not hold up the writer. Pause keeps draining the
+device pipe but does not save logs received during the pause. Clear starts
 the preview at the current recording position and preserves the entire file.
 Older preview rows (and their in-memory bookmarks) are evicted at the cache budget.
 The disk backlog is displayed when the preview is behind. Lines larger than 1 MiB
