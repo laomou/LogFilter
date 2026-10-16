@@ -151,11 +151,11 @@ impl PagedIndex {
     }
 }
 
-impl Drop for PagedIndex {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-    }
-}
+// Note: there is deliberately no `Drop` here that cancels the scan. Every
+// scan/page worker holds its own `Arc<PagedIndex>` clone, so a drop could only
+// run after those workers are already gone — the cancel would be a no-op that
+// merely implies (wrongly) that dropping the last reference stops a running
+// scan. Cancellation is driven explicitly, from `PagedSource::drop`.
 
 pub struct PagedSource {
     pub base: Arc<PagedIndex>,

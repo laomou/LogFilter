@@ -525,11 +525,20 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
+        self.open_file_impl(path, true)
+    }
+
+    /// Open a file for the view. `allow_paged` selects the bounded-memory paged
+    /// viewer when the file outgrows the in-memory budget. A failed paged index
+    /// build retries through this method with `allow_paged = false` (see
+    /// [`Self::poll_paged`]); the flag keeps that retry from re-entering the
+    /// paged path and looping.
+    fn open_file_impl(&mut self, path: &Path, allow_paged: bool) -> Result<()> {
         // Open the file here to validate access and hold the handle through the
         // background load — avoids TOCTOU (open-to-use race) and eliminates the
         // duplicate open in the reader thread.
         let file = std::fs::File::open(path)?;
-        if paged_file::should_page(path, self.log_budget)? {
+        if allow_paged && paged_file::should_page(path, self.log_budget)? {
             if self.encoding_choice() != EncodingChoice::Utf8 {
                 return Err(anyhow!(tr!("paged_utf8_only")));
             }
@@ -761,11 +770,68 @@ impl App {
                 }
             }
         }
-        if let Some(paged) = &self.paged {
-            if let Some(error) = paged.source.active().error.lock_recover().clone() {
-                self.status = tr!("status_page_failed", { e: &error });
+        // A *completed* index error is a dead end: every further page request
+        // fails and nothing in the view can recover it. Recover by construction:
+        //  * failed *filtered* index — the base index is still usable, so drop
+        //    the filter claim and keep browsing unfiltered pages;
+        //  * failed *base* index — the file is unviewable in paged mode, so
+        //    fall back to the streaming load, which tolerates what broke the
+        //    sparse index (notably a single over-budget line) with a partial
+        //    load and a clear status instead of an empty, stuck view.
+        // Collect the decision under the immutable borrow, then act, so the
+        // guards do not live across the &mut self recovery calls.
+        let recovery = self.paged.as_ref().and_then(|paged| {
+            let active = paged.source.active();
+            if !active.complete.load(Ordering::Acquire) {
+                return None;
+            }
+            let error = active.error.lock_recover().clone()?;
+            let base = paged.source.base.path.clone();
+            let base_broken = paged.source.base.complete.load(Ordering::Acquire)
+                && paged.source.base.error.lock_recover().is_some();
+            let filtered_active = paged.source.filtered.is_some();
+            Some((base, error, filtered_active && !base_broken))
+        });
+        if let Some((base, error, keep_paged)) = recovery {
+            if keep_paged {
+                self.revert_paged_filter(&error);
+            } else {
+                self.fallback_from_paged(&base, &error);
             }
         }
+    }
+
+    /// The base index is unusable, so the paged view has no data source. Reopen
+    /// the same file through the streaming loader, which bounds memory
+    /// differently and reports what it could read.
+    fn fallback_from_paged(&mut self, path: &Path, index_error: &str) {
+        // Cancels the failed indexes and their workers.
+        self.paged = None;
+        match self.open_file_impl(path, false) {
+            Ok(()) => {
+                self.status = tr!("status_paged_fallback", { e: index_error });
+            }
+            Err(e) => {
+                self.status = tr!("status_failed_open", { e: &e.to_string() });
+            }
+        }
+    }
+
+    /// The filtered index is unusable but the base one is not: stop claiming a
+    /// filter and reload page 0 of the base index. The next filter edit
+    /// rebuilds (and retries) the filtered index.
+    fn revert_paged_filter(&mut self, filter_error: &str) {
+        if let Some(paged) = self.paged.as_mut() {
+            if let Some(old) = paged.source.filtered.take() {
+                old.cancel();
+            }
+            paged.filter = None;
+            paged.filter_initialized = false;
+            paged.page = 0;
+            paged.goto_line = None;
+        }
+        let _ = self.request_paged_page(0);
+        self.status = tr!("status_paged_filter_fallback", { e: filter_error });
     }
 
     fn encoding_choice(&self) -> EncodingChoice {
@@ -810,21 +876,31 @@ impl App {
         if let Some(old) = paged.source.filtered.take() {
             old.cancel();
         }
-        paged.filter = desired;
-        paged.filter_initialized = true;
-        if let Some(filter) = paged.filter.clone() {
+        // Never claim a filter that has no index behind it: that would leave
+        // unfiltered base pages on screen while the view believes it is
+        // filtered. On a build failure (worker spawn error) drop the claim and
+        // fall through to reload page 0 of the base index; the next filter
+        // edit retries the build.
+        let mut claimed = desired;
+        let mut build_error: Option<String> = None;
+        if let Some(filter) = claimed.clone() {
             match paged_file::build_filter_index(&paged.source.base, filter, self.ctx.clone()) {
                 Ok(index) => paged.source.filtered = Some(index),
                 Err(e) => {
-                    self.status = tr!("status_page_failed", { e: &e.to_string() });
-                    return;
+                    build_error = Some(e.to_string());
+                    claimed = None;
                 }
             }
         }
+        paged.filter = claimed;
+        paged.filter_initialized = true;
         paged.page = 0;
         paged.goto_line = None;
         if let Err(e) = self.request_paged_page(0) {
             self.status = tr!("status_page_failed", { e: &e.to_string() });
+        }
+        if let Some(e) = build_error {
+            self.status = tr!("status_page_failed", { e: &e });
         }
     }
 
@@ -4900,6 +4976,41 @@ mod tests {
             let paged = app.paged.as_ref().unwrap();
             paged.page_rx.is_none() && paged.source.active().complete.load(Ordering::Acquire)
         });
+    }
+
+    #[test]
+    fn a_failed_base_index_falls_back_to_the_streaming_load() {
+        // A single line over the paged line budget used to leave the view stuck:
+        // an empty table, a persistent error, and every page control operating
+        // on a dead index. The recovery is to reopen the same file through the
+        // streaming loader, which tolerates the line (it is far below the
+        // streaming 64 MiB decoded cap). The failure is detected and acted on
+        // within one poll, so wait for the end state: no paged view, and every
+        // row (including the 3 MiB one) in the model. No retry loop is possible
+        // because the fallback opens with paging disabled.
+        use std::io::Write;
+        let path = tmp_txt("paged_fallback");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "01-01 00:00:00.000  1  2 I Tag: before").unwrap();
+        // 3 MiB of one line: over the paged budget below, under the streaming cap.
+        file.write_all(&vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+        writeln!(file, "01-01 00:00:00.001  1  2 I Tag: after").unwrap();
+        drop(file);
+
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.paged_file_budget = 6 * 1024 * 1024; // max line ≈ 2 MiB < 3 MiB
+        app.open_paged_file(&path).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.paged.is_none() && app.model.read_recover().entries.len() == 3
+        });
+        assert_eq!(
+            app.model.read_recover().file_path.as_deref(),
+            Some(path.as_path())
+        );
+        app.clear();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
