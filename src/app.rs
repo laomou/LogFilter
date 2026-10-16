@@ -5014,6 +5014,127 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_filtered_index_reverts_to_the_unfiltered_base_pages() {
+        // A failed *filtered* index must not drag the view down with it: the
+        // base index is still healthy, so the view drops the filter claim and
+        // goes back to unfiltered base pages, and the next filter change
+        // rebuilds (retries) the filtered index. The async failure itself
+        // (a `thread::spawn` error inside `build_filter_index`, or a scan that
+        // dies mid-flight) cannot be forced hermetically, so the test sets up
+        // the exact end state that failure leaves — a completed index that now
+        // carries an error — and drives the recovery through `poll_paged`,
+        // which is the code path that notices it.
+        use std::io::Write;
+        let path = tmp_txt("paged_filter_revert");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..(paged_file::CHECKPOINT_ROWS * 2 + 17) {
+            let word = if i.is_multiple_of(10) {
+                "special"
+            } else {
+                "ordinary"
+            };
+            writeln!(file, "01-01 00:00:00.000  1  2 I Tag: {word} {i}").unwrap();
+        }
+        drop(file);
+
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.paged_file_budget = 6 * 1024 * 1024;
+        app.open_paged_file(&path).unwrap();
+        // Base index completes and page 0 (unfiltered) loads.
+        wait_until(|| {
+            app.poll_paged();
+            let paged = app.paged.as_ref().unwrap();
+            paged.page_rx.is_none()
+                && paged.source.base.complete.load(Ordering::Acquire)
+                && app.model.read_recover().entries.len() as u64 == paged_file::CHECKPOINT_ROWS
+        });
+
+        // Activate a filter; the filtered index builds and its page 0 replaces
+        // the model with only the matching rows.
+        app.ui.find = "special".into();
+        app.ui.find_on = true;
+        app.notify_filter();
+        wait_until(|| {
+            app.poll_paged();
+            let paged = app.paged.as_ref().unwrap();
+            paged
+                .source
+                .filtered
+                .as_ref()
+                .is_some_and(|index| index.complete.load(Ordering::Acquire))
+                && paged.page_rx.is_none()
+                && !app.model.read_recover().entries.is_empty()
+                && app
+                    .model
+                    .read_recover()
+                    .entries
+                    .iter()
+                    .all(|entry| entry.message().contains("special"))
+        });
+        let old_filtered = app
+            .paged
+            .as_ref()
+            .unwrap()
+            .source
+            .filtered
+            .clone()
+            .expect("a filtered index should be active");
+
+        // Simulate the end state of the async failure: the index is complete
+        // and now reports an error, while the base index is untouched.
+        *old_filtered.error.lock_recover() = Some("simulated filter index failure".into());
+
+        // The next poll notices the completed-but-failed active (filtered)
+        // index with a healthy base and reverts to unfiltered base pages.
+        app.poll_paged();
+        wait_until(|| {
+            app.poll_paged();
+            let paged = app.paged.as_ref().unwrap();
+            paged.page_rx.is_none()
+                && paged.source.filtered.is_none()
+                && app.model.read_recover().entries.len() as u64 == paged_file::CHECKPOINT_ROWS
+        });
+
+        let paged = app.paged.as_ref().unwrap();
+        // The base index survived and is the active source again.
+        assert!(paged.source.base.complete.load(Ordering::Acquire));
+        assert!(paged.source.base.error.lock_recover().is_none());
+        assert!(Arc::ptr_eq(paged.source.active(), &paged.source.base));
+        // The filter claim was dropped, so a later change can rebuild.
+        assert!(paged.filter.is_none());
+        assert!(!paged.filter_initialized);
+        assert_eq!(paged.page, 0);
+        // The page holds unfiltered content, not the stale filtered rows.
+        let has_ordinary = app
+            .model
+            .read_recover()
+            .entries
+            .iter()
+            .any(|entry| entry.message().contains("ordinary"));
+        assert!(has_ordinary, "page must be unfiltered base content");
+
+        // A later filter change must retry: the revert reset `filter_initialized`,
+        // so the rebuild is not short-circuited and spawns a fresh index.
+        app.ui.find = "ordinary".into();
+        app.notify_filter();
+        let new_filtered = app
+            .paged
+            .as_ref()
+            .unwrap()
+            .source
+            .filtered
+            .as_ref()
+            .expect("a filter change after the revert must retry the filtered index");
+        assert!(
+            !Arc::ptr_eq(new_filtered, &old_filtered),
+            "the retry must build a new index, not reuse the failed one"
+        );
+
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn paged_bookmark_visibility_keeps_the_current_page_and_filter_index() {
         let path = tmp_txt("paged_bookmarks");
         std::fs::write(&path, b"keep first\nkeep second\nother\n").unwrap();
