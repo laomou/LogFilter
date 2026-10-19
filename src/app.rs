@@ -772,15 +772,24 @@ impl App {
                     self.cached_picker_col = None;
                     self.refilter();
                     if let Some(line) = goto {
-                        let row = self
-                            .model
-                            .read_recover()
-                            .entries
-                            .iter()
-                            .position(|entry| entry.line_no == line);
-                        if let Some(row) = row {
-                            let len = self.model.read_recover().entries.len();
-                            self.select_filtered_row_with_len(row, len);
+                        let selected = {
+                            let m = self.model.read_recover();
+                            m.entries
+                                .iter()
+                                .position(|entry| entry.line_no == line)
+                                .and_then(|entry_row| {
+                                    m.filtered
+                                        .iter()
+                                        .position(|&row| row as usize == entry_row)
+                                        .map(|visible| (visible, m.filtered.len()))
+                                })
+                        };
+                        // `select_filtered_row_with_len` takes a *visible* row, so
+                        // the entry index must be mapped through `filtered` — using
+                        // the entry index directly selected an unrelated row
+                        // whenever the page was filtered.
+                        if let Some((visible, len)) = selected {
+                            self.select_filtered_row_with_len(visible, len);
                         }
                     }
                     self.status = tr!("status_page_loaded", {
@@ -2376,6 +2385,40 @@ impl App {
         self.selection_cursor = Some(new);
     }
 
+    /// Extend the selection to the clicked visible row (shift+click).
+    ///
+    /// Mirrors [`Self::extend_selection`]: the anchor is the fixed end and the
+    /// clicked row the moving end, and the range is rebuilt rather than only added
+    /// to — so clicking closer to the anchor shrinks the selection, and a stale
+    /// anchor can never expand it past the last visible row.
+    fn extend_selection_to(&mut self, row: usize) {
+        let len = self.model.read_recover().filtered.len();
+        if len == 0 {
+            return;
+        }
+        let max = len.saturating_sub(1);
+        let clicked = row.min(max);
+        // Without a stored anchor (startup, or right after a filter change) the
+        // range starts at the clicked row.
+        let anchor = self
+            .selection_anchor
+            .or(self.selection_cursor)
+            .unwrap_or(clicked)
+            .min(max);
+        let (lo, hi) = if clicked < anchor {
+            (clicked, anchor)
+        } else {
+            (anchor, clicked)
+        };
+        self.selected_rows.clear();
+        for i in lo..=hi {
+            self.selected_rows.insert(i);
+        }
+        self.selection_anchor = Some(anchor);
+        self.selection_cursor = Some(clicked);
+        self.status = tr!("status_shift_click", { n: &self.selected_rows.len().to_string() });
+    }
+
     fn adjust_table_font_size(&mut self, delta: f32) {
         self.cfg.view.font_size = adjusted_table_font_size(self.cfg.view.font_size, delta);
     }
@@ -3930,11 +3973,17 @@ impl App {
     ///   * hidden by the filter  → status message + scroll to nearest visible row
     fn goto_line(&mut self, row: usize) {
         if self.paged.is_some() {
+            // Paged goto maps a source line to a page, and the row it selects must
+            // be a position in the *unfiltered* page. Refuse whenever the view is
+            // filtered: a disk filter index, the bookmarks-only view, or a UI
+            // filter that has no index behind it (the state a failed filter-index
+            // build reverts to).
             if self.ui.bookmarks_only
                 || self
                     .paged
                     .as_ref()
                     .is_some_and(|paged| paged.filter.is_some())
+                || !self.ui.to_filter_spec().is_passthrough()
             {
                 self.status = tr!("status_goto_paged_filtered");
                 return;
@@ -4631,21 +4680,7 @@ impl App {
                     self.status =
                         tr!("status_ctrl_click", { n: &self.selected_rows.len().to_string() });
                 } else if shift {
-                    // Use the stored anchor (fixed end), not an arbitrary HashSet
-                    // element. Clamp it to the current filtered length so a stale
-                    // anchor can never expand the range past the visible rows
-                    // (mirrors the keyboard extend_selection clamp).
-                    let len = self.model.read_recover().filtered.len();
-                    let max = len.saturating_sub(1);
-                    let anchor = self.selection_anchor.unwrap_or(r).min(max);
-                    let r = r.min(max);
-                    let (lo, hi) = if r < anchor { (r, anchor) } else { (anchor, r) };
-                    for i in lo..=hi {
-                        self.selected_rows.insert(i);
-                    }
-                    self.selection_cursor = Some(r);
-                    self.status =
-                        tr!("status_shift_click", { n: &self.selected_rows.len().to_string() });
+                    self.extend_selection_to(r);
                 } else {
                     self.selected_rows.clear();
                     self.selected_rows.insert(r);
@@ -5301,6 +5336,35 @@ mod tests {
             app.paged.is_none()
         });
         wait_until(|| app.model.read_recover().entries.len() == total as usize + 2);
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn paged_goto_is_refused_while_a_ui_filter_has_no_index() {
+        // The state a failed filter-index build reverts to: the UI is filtered but
+        // `paged.filter` is None. Goto used to pass the guard and then select an
+        // unrelated row because the entry index was used as a visible position.
+        let path = tmp_txt("paged_goto_guard");
+        std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+
+        app.ui.find = "alpha".into();
+        app.ui.find_on = true;
+        app.goto_line(0);
+        assert_eq!(app.status, tr!("status_goto_paged_filtered"));
+        assert!(app.selected_rows.is_empty());
+
+        // Clearing the filter makes goto work again.
+        app.ui.find.clear();
+        app.ui.find_on = false;
+        app.goto_line(1);
+        wait_until(|| {
+            app.poll_paged();
+            !app.selected_rows.is_empty()
+        });
         app.clear();
         std::fs::remove_file(path).unwrap();
     }
@@ -6208,6 +6272,48 @@ mod ui_tests {
         h.run();
 
         assert!(h.state().selected_rows.contains(&0), "should stay at 0");
+    }
+
+    fn sorted_rows(rows: &std::collections::HashSet<usize>) -> Vec<usize> {
+        let mut rows: Vec<usize> = rows.iter().copied().collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn shift_click_ranges_shrink_like_the_keyboard() {
+        // Shift+click used to only ever *add* rows: clicking back towards the
+        // anchor kept the wider range, and with no stored anchor (right after a
+        // filter change) two clicks selected two disjoint single rows.
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 10);
+
+        let app = h.state_mut();
+        app.selected_rows.clear();
+        app.selected_rows.insert(2);
+        app.selection_anchor = Some(2);
+        app.selection_cursor = Some(2);
+
+        app.extend_selection_to(6);
+        assert_eq!(sorted_rows(&app.selected_rows), vec![2, 3, 4, 5, 6]);
+        // Towards the anchor: the range shrinks instead of accumulating.
+        app.extend_selection_to(4);
+        assert_eq!(sorted_rows(&app.selected_rows), vec![2, 3, 4]);
+        assert_eq!(app.selection_anchor, Some(2), "the anchor stays fixed");
+        assert_eq!(app.selection_cursor, Some(4), "the click moves the cursor");
+        // Extending backwards rebuilds from the same anchor.
+        app.extend_selection_to(0);
+        assert_eq!(sorted_rows(&app.selected_rows), vec![0, 1, 2]);
+
+        // Without an anchor the first shift+click starts a new range.
+        app.selection_anchor = None;
+        app.selection_cursor = None;
+        app.selected_rows.clear();
+        app.extend_selection_to(3);
+        assert_eq!(sorted_rows(&app.selected_rows), vec![3]);
+        app.extend_selection_to(6);
+        assert_eq!(sorted_rows(&app.selected_rows), vec![3, 4, 5, 6]);
     }
 
     #[test]
