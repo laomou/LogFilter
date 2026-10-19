@@ -223,7 +223,11 @@ fn copy_raw<R: Read, W: Write>(
     let mut bytes_since_space_check = 1024 * 1024;
     let read_result = (|| {
         loop {
+            // A paused capture writes nothing, so a free-space failure it would
+            // report can only come from other writers filling the disk; do not
+            // stop the recording over bytes it never needed to write.
             if state.budget.min_free.load(Ordering::Relaxed) > 0
+                && !state.paused.load(Ordering::Acquire)
                 && (bytes_since_space_check >= 1024 * 1024
                     || last_sync.elapsed() >= Duration::from_secs(1))
             {
@@ -234,6 +238,13 @@ fn copy_raw<R: Read, W: Write>(
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => result?,
             };
+            // Stop wins over pause: checking it only after the write path would
+            // make a paused capture that never reaches EOF (a descendant still
+            // holding the pipe) discard data forever, never finish, and leave the
+            // window unable to close.
+            if state.stop.load(Ordering::Acquire) {
+                break;
+            }
             if n == 0 {
                 break;
             }
@@ -262,9 +273,6 @@ fn copy_raw<R: Read, W: Write>(
                 writer.flush()?;
                 sync(writer)?;
                 last_sync = Instant::now();
-            }
-            if state.stop.load(Ordering::Acquire) {
-                break;
             }
         }
         Ok(())
@@ -467,26 +475,36 @@ pub fn export(
     let bookmarks = std::collections::HashSet::new();
     let mut rows = 0u64;
     let mut hint = LogFormat::Unknown;
-    crate::io::visit_utf8_lines(&mut reader, |line| {
-        let (entry, format) = parse_line_hinted(line, hint);
-        if hint == LogFormat::Unknown {
-            hint = format;
+    let body: io::Result<()> = (|| {
+        crate::io::visit_utf8_lines(&mut reader, |line| {
+            let (entry, format) = parse_line_hinted(line, hint);
+            if hint == LogFormat::Unknown {
+                hint = format;
+            }
+            if filter.matches(&entry, 0, &bookmarks) {
+                writer.write_all(entry.raw().as_bytes())?;
+                writer.write_all(b"\n")?;
+                rows += 1;
+            }
+            Ok(())
+        })?;
+        if reader.limit() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "recording was truncated during export",
+            ));
         }
-        if filter.matches(&entry, 0, &bookmarks) {
-            writer.write_all(entry.raw().as_bytes())?;
-            writer.write_all(b"\n")?;
-            rows += 1;
-        }
-        Ok(())
-    })?;
-    if reader.limit() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "recording was truncated during export",
-        ));
+        writer.flush()?;
+        writer.get_ref().sync_all()
+    })();
+    if let Err(e) = body {
+        // Never leave a partial export behind: `create_new` would then make a
+        // retry to the same path fail with "already exists", and the truncated
+        // file looks exactly like a successful export.
+        drop(writer);
+        let _ = std::fs::remove_file(destination);
+        return Err(e);
     }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
     Ok(rows)
 }
 
@@ -552,6 +570,53 @@ mod tests {
         assert_eq!(state.written.load(Ordering::Acquire), 0);
         assert!(state.finished.load(Ordering::Acquire));
         assert!(state.error.lock_recover().is_none());
+        cleanup(&state);
+    }
+
+    /// A reader that hands out `remaining` newline bytes and counts the reads it
+    /// served, so a test can tell "stopped early" from "drained the whole pipe".
+    struct CountingReader {
+        remaining: usize,
+        reads: usize,
+    }
+
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            self.reads += 1;
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(b'\n');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stop_ends_a_paused_recording_without_draining_the_pipe() {
+        // A paused capture used to check `stop` only at the end of the write path,
+        // so with a descendant still holding stdout (no EOF) it escaped the loop
+        // never, discarded data forever and kept `finished` unset — which is also
+        // what wedges the window's close flow.
+        let writer = writer();
+        let state = writer.state.clone();
+        state.paused.store(true, Ordering::Relaxed);
+        state.stop.store(true, Ordering::Release);
+        let mut reader = CountingReader {
+            remaining: 64 * BLOCK,
+            reads: 0,
+        };
+
+        writer.record(&mut reader);
+
+        assert!(state.finished.load(Ordering::Acquire));
+        assert_eq!(state.written.load(Ordering::Acquire), 0);
+        assert!(
+            reader.reads <= 1,
+            "stop must be observed before the pipe is drained ({} blocks read)",
+            reader.reads
+        );
         cleanup(&state);
     }
 
@@ -759,7 +824,16 @@ mod tests {
     fn disk_full_stops_recording_and_marks_the_file_incomplete() {
         let mut writer = writer();
         let state = writer.state.clone();
-        writer.file = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        // `/dev/full` is unavailable in some sandboxes and containers (seccomp,
+        // device cgroup, non-Linux emulation layers) even though the platform is
+        // Linux. That is an environment limitation, not a recording failure, so
+        // skip instead of failing the suite for it.
+        let Ok(full) = OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("skipping: /dev/full is not writable in this environment");
+            cleanup(&state);
+            return;
+        };
+        writer.file = full;
         writer.record(Cursor::new(b"cannot fit\n"));
         assert!(state.finished.load(Ordering::Acquire));
         assert!(state.stop.load(Ordering::Acquire));
