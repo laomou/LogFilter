@@ -10,7 +10,7 @@ use crate::model::{LogEntry, LogFormat};
 use crate::parser::parse_line_hinted;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -322,7 +322,13 @@ fn scan_index(
     let mut hint = LogFormat::Unknown;
     loop {
         let start = offset;
-        let n = read_bounded_line(&mut reader, &mut raw, index.max_line_bytes(), &cancelled)?;
+        let n = crate::io::read_line_bounded(
+            &mut reader,
+            &mut raw,
+            index.max_line_bytes(),
+            &cancelled,
+            line_too_long_message(index.max_line_bytes()),
+        )?;
         if n == 0 {
             break;
         }
@@ -459,7 +465,13 @@ fn load_page_cancellable(
     let mut entries = Vec::new();
     let mut hint = LogFormat::Unknown;
     while entries.len() < index.page_rows as usize {
-        let n = read_bounded_line(&mut reader, &mut raw, index.max_line_bytes(), &cancelled)?;
+        let n = crate::io::read_line_bounded(
+            &mut reader,
+            &mut raw,
+            index.max_line_bytes(),
+            &cancelled,
+            line_too_long_message(index.max_line_bytes()),
+        )?;
         if n == 0 {
             break;
         }
@@ -501,52 +513,12 @@ fn load_page_cancellable(
     })
 }
 
-fn read_bounded_line(
-    reader: &mut impl BufRead,
-    output: &mut Vec<u8>,
-    max_bytes: usize,
-    cancelled: &impl Fn() -> bool,
-) -> io::Result<usize> {
-    output.clear();
-    let mut total = 0usize;
-    loop {
-        check_cancelled(cancelled())?;
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(total);
-        }
-        let take = available
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(available.len(), |i| i + 1);
-        if total.saturating_add(take) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                if max_bytes < MAX_LINE_BYTES {
-                    "log line exceeds the page memory budget"
-                } else {
-                    "log line exceeds the 64 MiB paged-view limit"
-                },
-            ));
-        }
-        if total + take > output.capacity() {
-            let capacity = output
-                .capacity()
-                .saturating_mul(2)
-                .max(total + take)
-                .min(max_bytes);
-            output
-                .try_reserve_exact(capacity - output.len())
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate paged log line")
-                })?;
-        }
-        output.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        total += take;
-        if output.last() == Some(&b'\n') {
-            return Ok(total);
-        }
+/// Why a line was refused, depending on which cap applied.
+fn line_too_long_message(max_bytes: usize) -> &'static str {
+    if max_bytes < MAX_LINE_BYTES {
+        "log line exceeds the page memory budget"
+    } else {
+        "log line exceeds the 64 MiB paged-view limit"
     }
 }
 
@@ -599,7 +571,13 @@ fn export_to(
     let mut source_line = 0u64;
     loop {
         // An explicitly requested export may finish after the view is closed.
-        let n = read_bounded_line(&mut reader, &mut raw, index.max_line_bytes(), &|| false)?;
+        let n = crate::io::read_line_bounded(
+            &mut reader,
+            &mut raw,
+            index.max_line_bytes(),
+            &|| false,
+            line_too_long_message(index.max_line_bytes()),
+        )?;
         if n == 0 {
             break;
         }
@@ -631,7 +609,7 @@ fn export_to(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, Write};
 
     fn file(lines: usize) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -933,9 +911,13 @@ mod tests {
             block: [b'x'; 1024],
         };
         let mut raw = Vec::new();
-        let error = read_bounded_line(&mut reader, &mut raw, MAX_LINE_BYTES, &|| {
-            cancel.load(Ordering::Acquire)
-        })
+        let error = crate::io::read_line_bounded(
+            &mut reader,
+            &mut raw,
+            MAX_LINE_BYTES,
+            &|| cancel.load(Ordering::Acquire),
+            line_too_long_message(MAX_LINE_BYTES),
+        )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(raw.len(), 1024);

@@ -54,6 +54,14 @@ struct PagedView {
     filter_initialized: bool,
     filter: Option<FilterSpec>,
     goto_line: Option<u64>,
+    /// Bookmarked source lines (1-based, global across the file).
+    ///
+    /// A paged row index only means something inside its own page — the cache is
+    /// replaced on every page change — so bookmarks are keyed by line number and
+    /// mirrored into `Model::bookmarks` for the current page (see
+    /// [`App::sync_paged_bookmarks`]). Otherwise navigating away from a page
+    /// silently discarded its bookmarks.
+    bookmarks: std::collections::HashSet<u64>,
 }
 
 pub struct App {
@@ -683,6 +691,7 @@ impl App {
             filter_initialized: false,
             filter: None,
             goto_line: None,
+            bookmarks: std::collections::HashSet::new(),
         });
         self.status = tr!("status_paged_indexing");
         self.notify_filter();
@@ -746,6 +755,9 @@ impl App {
                         .unwrap();
                     let goto = self.paged.as_mut().and_then(|p| p.goto_line.take());
                     self.model.write_recover().replace_page(path, page.entries);
+                    // `replace_page` clears row-index bookmarks with the rest of the
+                    // cache; restore the ones that belong to this page.
+                    self.sync_paged_bookmarks();
                     self.selected_rows.clear();
                     self.selection_anchor = None;
                     self.selection_cursor = None;
@@ -1123,6 +1135,12 @@ fn follow_file(
             // deliberately did not read (reads are chunked). Drain that backlog
             // without waiting for the next tick: the memory per read stays
             // bounded while the tail still catches up at disk speed.
+            //
+            // The bytes just before `offset`, re-captured after every advance:
+            // they prove the consumed prefix is still the same file content, so a
+            // `copytruncate` rewrite (same inode, possibly the same length) is
+            // detected instead of being spliced onto the old offset.
+            let mut anchor = crate::io::tail_anchor(path, offset);
             let mut wait = POLL;
             loop {
                 if !wait.is_zero() {
@@ -1132,7 +1150,7 @@ fn follow_file(
                 if source_epoch.load(Ordering::Acquire) != epoch {
                     return; // superseded by a newer load
                 }
-                match read_appended_checked(path, offset, enc, tx, epoch, Some(identity)) {
+                match read_appended_checked(path, offset, enc, tx, epoch, Some(identity), &anchor) {
                     Ok(a) if a.truncated => {
                         request_reload();
                         return;
@@ -1140,6 +1158,7 @@ fn follow_file(
                     Ok(a) => {
                         if a.offset != offset {
                             offset = a.offset;
+                            anchor = crate::io::tail_anchor(path, offset);
                             ctx.request_repaint();
                         }
                         if a.more {
@@ -1332,7 +1351,9 @@ fn detect_format_from_cmd(cmd: &str) -> LogFormat {
     for w in parts.windows(2) {
         if w[0] == "-v" {
             return match w[1] {
-                "threadtime" | "long" => LogFormat::ThreadTime,
+                // `usec`/`year` only change the timestamp shape, and `epoch`
+                // replaces it entirely; all still use the threadtime field order.
+                "threadtime" | "long" | "usec" | "year" | "epoch" => LogFormat::ThreadTime,
                 "time" => LogFormat::Time,
                 "brief" | "process" | "tag" => LogFormat::Brief,
                 _ => LogFormat::Unknown,
@@ -2149,7 +2170,23 @@ impl App {
     }
 
     fn toggle_bookmark(&mut self, entry_idx: u32) {
-        {
+        if self.paged.is_some() {
+            let Some(line_no) = self
+                .model
+                .read_recover()
+                .entries
+                .get(entry_idx as usize)
+                .map(|entry| entry.line_no)
+            else {
+                return;
+            };
+            if let Some(paged) = self.paged.as_mut() {
+                if !paged.bookmarks.remove(&line_no) {
+                    paged.bookmarks.insert(line_no);
+                }
+            }
+            self.sync_paged_bookmarks();
+        } else {
             let mut m = self.model.write_recover();
             if m.bookmarks.contains(&entry_idx) {
                 m.bookmarks.remove(&entry_idx);
@@ -2170,6 +2207,24 @@ impl App {
             self.selection_cursor = None;
             self.refilter();
         }
+    }
+
+    /// Mirror the paged view's bookmarked line numbers into `Model::bookmarks`
+    /// (row indices of the loaded page) so the bookmark column and the
+    /// "bookmarks only" filter see them.
+    fn sync_paged_bookmarks(&self) {
+        let Some(paged) = self.paged.as_ref() else {
+            return;
+        };
+        let lines = paged.bookmarks.clone();
+        let mut m = self.model.write_recover();
+        m.bookmarks = m
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| lines.contains(&entry.line_no))
+            .map(|(row, _)| row as u32)
+            .collect();
     }
 
     fn toggle_selected_bookmark(&mut self) {
@@ -3249,8 +3304,9 @@ impl eframe::App for App {
                 self.close_ready = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
-                // Normal shutdown finishes in the background without a progress
-                // dialog. Only an actual write failure needs a user decision.
+                // Normal shutdown finishes in the background without a dialog: the
+                // pending recording flush and any export simply complete, then the
+                // window closes. Only an actual write failure needs a user decision.
                 if let Some(error) = &self.exit_recording_error {
                     egui::Window::new(tr!("close"))
                         .collapsible(false)
@@ -5068,6 +5124,68 @@ mod tests {
             paged_file::CHECKPOINT_ROWS + 6
         );
 
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn paged_bookmarks_survive_page_navigation() {
+        // Row indices are page-local: `replace_page` clears the cache on every
+        // page change. Bookmarks are keyed by source line so they survive.
+        use std::io::Write;
+        let path = tmp_txt("paged_bookmark_pages");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..(paged_file::CHECKPOINT_ROWS * 2 + 17) {
+            writeln!(file, "01-01 00:00:00.000  1  2 I Tag: row {i}").unwrap();
+        }
+        drop(file);
+
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.paged_file_budget = 6 * 1024 * 1024;
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+
+        app.toggle_bookmark(0);
+        assert!(app.model.read_recover().bookmarks.contains(&0));
+        app.ui.bookmarks_only = true;
+        app.notify_filter();
+        wait_until(|| app.model.read_recover().filtered == [0]);
+
+        // Page 1 has none of the bookmarked rows, but the bookmark itself lives on.
+        app.request_paged_page(1).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.model
+                .read_recover()
+                .entries
+                .first()
+                .is_some_and(|entry| entry.line_no == paged_file::CHECKPOINT_ROWS + 1)
+        });
+        assert!(app.model.read_recover().bookmarks.is_empty());
+
+        // Going back restores the row-index bookmark from the line identity.
+        app.request_paged_page(0).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.model
+                .read_recover()
+                .entries
+                .first()
+                .is_some_and(|entry| entry.line_no == 1)
+        });
+        assert!(
+            app.model.read_recover().bookmarks.contains(&0),
+            "the bookmark must survive a page change"
+        );
+        assert!(
+            app.paged.as_ref().unwrap().bookmarks.contains(&1u64),
+            "the line identity is what persists"
+        );
+
+        // Unbookmarking removes it from both representations.
+        app.toggle_bookmark(0);
+        assert!(app.model.read_recover().bookmarks.is_empty());
+        assert!(app.paged.as_ref().unwrap().bookmarks.is_empty());
         app.clear();
         std::fs::remove_file(path).unwrap();
     }

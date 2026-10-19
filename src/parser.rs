@@ -6,7 +6,7 @@ fn re_threadtime() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?:(?P<uid>\d+)\s+)?(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+            r"^(?P<date>(?:\d{4}-)?\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?:(?P<uid>\d+)\s+)?(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -34,7 +34,7 @@ fn re_time() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+(?P<lv>[VDIWEFA])/(?P<tag>[^()]+?)\(\s*(?P<pid>\d+)\s*\):\s?(?P<msg>.*)$",
+            r"^(?P<date>(?:\d{4}-)?\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<lv>[VDIWEFA])/(?P<tag>[^()]+?)\(\s*(?P<pid>\d+)\s*\):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -45,6 +45,36 @@ fn re_brief() -> &'static Regex {
     R.get_or_init(|| {
         Regex::new(r"^(?P<lv>[VDIWEFA])/(?P<tag>[^()]+?)\(\s*(?P<pid>\d+)\s*\):\s?(?P<msg>.*)$")
             .unwrap()
+    })
+}
+
+/// logcat `-v epoch`: `SECONDS.millis PID TID Level Tag: message`.
+///
+/// There is no calendar date or wall-clock time, so the epoch value is shown in
+/// the time column and the date column stays empty.
+fn re_epoch() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"^(?P<time>\d{9,}(?:\.\d{1,9})?)\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+        )
+        .unwrap()
+    })
+}
+
+/// logcat `-v long`: `[ MM-DD HH:MM:SS.mmm  PID:  TID LEVEL/TAG ] message`.
+///
+/// The message usually continues on the following lines, which this viewer shows
+/// as separate rows (it parses one line at a time); the header row still carries
+/// the level, tag, pid and tid, so level/tag filters no longer hide the whole
+/// stream the way an unparsed `Unknown` row was.
+fn re_long() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"^\[\s*(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+):\s*(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])/(?P<tag>[^\]]*?)\s*\]\s?(?P<msg>.*)$",
+        )
+        .unwrap()
     })
 }
 
@@ -108,6 +138,50 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                         span(&c, "pid"),
                         span(&c, "tid"),
                         span(&c, "uid"),
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
+        let try_long = |s: &str| {
+            re_long().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::ThreadTime,
+                    lv,
+                    [
+                        span(&c, "date"),
+                        span(&c, "time"),
+                        span(&c, "pid"),
+                        span(&c, "tid"),
+                        EMPTY,
+                        trim_span(s, span(&c, "tag")),
+                        span(&c, "msg"),
+                    ],
+                )
+            })
+        };
+        let try_epoch = |s: &str| {
+            re_epoch().captures(s).map(|c| {
+                let lv = c["lv"]
+                    .chars()
+                    .next()
+                    .and_then(LevelMask::from_char)
+                    .unwrap_or(LevelMask::V);
+                (
+                    LogFormat::ThreadTime,
+                    lv,
+                    [
+                        EMPTY,
+                        span(&c, "time"),
+                        span(&c, "pid"),
+                        span(&c, "tid"),
+                        EMPTY,
                         trim_span(s, span(&c, "tag")),
                         span(&c, "msg"),
                     ],
@@ -202,9 +276,17 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             })
         };
 
+        // The `-v long`, `-v epoch` and plain threadtime layouts share the same
+        // LogFormat: date/time + pid + tid + level, so one hint covers them all.
+        let try_threadtime_family = |s: &str| {
+            try_threadtime(s)
+                .or_else(|| try_long(s))
+                .or_else(|| try_epoch(s))
+        };
+
         // Try the hinted format first; fall back to the full scan only on a miss.
         let hinted = match hint {
-            LogFormat::ThreadTime => try_threadtime(s),
+            LogFormat::ThreadTime => try_threadtime_family(s),
             LogFormat::HiLog => try_hilog(s),
             LogFormat::Time => try_time(s),
             LogFormat::Brief => try_brief(s),
@@ -220,7 +302,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             // tried before ThreadTime because a hilog line would otherwise match
             // threadtime with the domain glued onto the tag.
             match hint {
-                LogFormat::HiLog => try_threadtime(s)
+                LogFormat::HiLog => try_threadtime_family(s)
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
@@ -229,19 +311,19 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
                 LogFormat::Time => try_hilog(s)
-                    .or_else(|| try_threadtime(s))
+                    .or_else(|| try_threadtime_family(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
                 LogFormat::Brief => try_hilog(s)
-                    .or_else(|| try_threadtime(s))
+                    .or_else(|| try_threadtime_family(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_kernel(s)),
                 LogFormat::Kernel => try_hilog(s)
-                    .or_else(|| try_threadtime(s))
+                    .or_else(|| try_threadtime_family(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s)),
                 LogFormat::Unknown => try_hilog(s)
-                    .or_else(|| try_threadtime(s))
+                    .or_else(|| try_threadtime_family(s))
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
@@ -301,6 +383,90 @@ mod tests {
         assert_eq!(e.level, LevelMask::I);
         assert_eq!(e.tag(), "ActivityManager");
         assert_eq!(e.message(), "Start proc");
+    }
+
+    #[test]
+    fn parses_threadtime_with_microseconds() {
+        // logcat -v usec: three extra fractional digits.
+        let line = "01-01 12:34:56.789123  1234  5678 I ActivityManager: Start proc";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.date(), "01-01");
+        assert_eq!(e.time(), "12:34:56.789123");
+        assert_eq!(e.pid(), "1234");
+        assert_eq!(e.tid(), "5678");
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.tag(), "ActivityManager");
+        assert_eq!(e.message(), "Start proc");
+    }
+
+    #[test]
+    fn parses_time_with_microseconds() {
+        let line = "01-01 12:34:56.789123 I/ActivityManager( 1234): Start proc";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::Time);
+        assert_eq!(e.time(), "12:34:56.789123");
+        assert_eq!(e.tag(), "ActivityManager");
+        assert_eq!(e.message(), "Start proc");
+    }
+
+    #[test]
+    fn parses_threadtime_with_a_year() {
+        // logcat -v year:
+        let line = "2024-01-01 12:34:56.789  1234  5678 I ActivityManager: Start proc";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.date(), "2024-01-01");
+        assert_eq!(e.time(), "12:34:56.789");
+        assert_eq!(e.tag(), "ActivityManager");
+    }
+
+    #[test]
+    fn parses_time_with_a_year() {
+        let line = "2024-01-01 12:34:56.789 E/ActivityManager( 1234): boom";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::Time);
+        assert_eq!(e.date(), "2024-01-01");
+        assert_eq!(e.level, LevelMask::E);
+        assert_eq!(e.message(), "boom");
+    }
+
+    #[test]
+    fn parses_epoch_timestamps() {
+        // logcat -v epoch: seconds since the Unix epoch, no calendar date.
+        let line = "1704067200.123  1234  5678 W ActivityManager: Start proc";
+        let (e, f) = parse_line(line.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.date(), "", "epoch carries no calendar date");
+        assert_eq!(e.time(), "1704067200.123");
+        assert_eq!(e.pid(), "1234");
+        assert_eq!(e.tid(), "5678");
+        assert_eq!(e.level, LevelMask::W);
+        assert_eq!(e.tag(), "ActivityManager");
+        assert_eq!(e.message(), "Start proc");
+    }
+
+    #[test]
+    fn parses_long_format_headers() {
+        // logcat -v long keeps the message on following lines; the header still
+        // carries the fields the filters need.
+        let with_message = "[ 08-07 12:02:47.453  1234:  5678 I/ActivityManager ] Start proc";
+        let (e, f) = parse_line(with_message.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.date(), "08-07");
+        assert_eq!(e.time(), "12:02:47.453");
+        assert_eq!(e.pid(), "1234");
+        assert_eq!(e.tid(), "5678");
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.tag(), "ActivityManager");
+        assert_eq!(e.message(), "Start proc");
+
+        let header_only = "[ 08-07 12:02:47.453  1234:  5678 E/MyTag ]";
+        let (e, f) = parse_line(header_only.to_string());
+        assert_eq!(f, LogFormat::ThreadTime);
+        assert_eq!(e.level, LevelMask::E);
+        assert_eq!(e.tag(), "MyTag");
+        assert_eq!(e.message(), "");
     }
 
     #[test]

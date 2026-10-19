@@ -471,24 +471,40 @@ pub fn export(
         .create_new(true)
         .open(destination)?;
     let mut writer = io::BufWriter::new(output);
-    let mut reader = input.take(length);
+    let mut reader = io::BufReader::new(input.take(length));
     let bookmarks = std::collections::HashSet::new();
     let mut rows = 0u64;
     let mut hint = LogFormat::Unknown;
+    let mut raw = Vec::new();
     let body: io::Result<()> = (|| {
-        crate::io::visit_utf8_lines(&mut reader, |line| {
-            let (entry, format) = parse_line_hinted(line, hint);
+        loop {
+            let n = crate::io::read_line_bounded(
+                &mut reader,
+                &mut raw,
+                crate::io::MAX_INITIAL_LINE_BYTES,
+                &|| false,
+                "log line exceeds the 64 MiB export limit",
+            )?;
+            if n == 0 {
+                break;
+            }
+            // Match on the decoded text but write the *original bytes*: a raw
+            // recording deliberately keeps invalid UTF-8, CRLF line endings and
+            // any BOM, and a filtered export is a copy of the matching rows.
+            // Decoding the output would turn invalid bytes into U+FFFD and
+            // normalise line endings.
+            let text = String::from_utf8_lossy(&raw);
+            let (entry, format) =
+                parse_line_hinted(text.trim_end_matches(['\r', '\n']).to_string(), hint);
             if hint == LogFormat::Unknown {
                 hint = format;
             }
             if filter.matches(&entry, 0, &bookmarks) {
-                writer.write_all(entry.raw().as_bytes())?;
-                writer.write_all(b"\n")?;
+                writer.write_all(&raw)?;
                 rows += 1;
             }
-            Ok(())
-        })?;
-        if reader.limit() != 0 {
+        }
+        if reader.get_ref().limit() != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "recording was truncated during export",
@@ -843,6 +859,34 @@ mod tests {
     }
 
     #[test]
+    fn filtered_export_preserves_the_original_bytes() {
+        // A raw recording keeps invalid UTF-8, CRLF and a possible BOM; the
+        // filtered export must copy the matching rows byte for byte instead of
+        // rewriting them as lossy UTF-8.
+        let writer = writer();
+        let state = writer.state.clone();
+        let raw: &[u8] =
+            b"\xef\xbb\xbfI/Tag( 1): keep \xff\xfe bytes\r\nE/Tag( 1): drop\nI/Tag( 2): keep tail";
+        writer.record(Cursor::new(raw));
+        let filtered = state.path.with_extension("filtered");
+        let spec = FilterSpec {
+            find: vec!["keep".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            export(&state.path, raw.len() as u64, &filtered, &spec).unwrap(),
+            2
+        );
+        assert_eq!(
+            std::fs::read(&filtered).unwrap(),
+            b"\xef\xbb\xbfI/Tag( 1): keep \xff\xfe bytes\r\nI/Tag( 2): keep tail",
+            "invalid bytes, CRLF and the missing final newline must survive"
+        );
+        std::fs::remove_file(filtered).unwrap();
+        cleanup(&state);
+    }
+
+    #[test]
     fn filtered_export_uses_the_requested_disk_snapshot() {
         let writer = writer();
         let state = writer.state.clone();
@@ -864,9 +908,11 @@ mod tests {
             export(&state.path, raw.len() as u64, &filtered, &spec).unwrap(),
             1
         );
+        // The original line ending is preserved: the export copies raw rows
+        // instead of re-encoding them.
         assert_eq!(
             std::fs::read(&filtered).unwrap(),
-            b"I/Tag( 1): keep first\n"
+            b"I/Tag( 1): keep first\r\n"
         );
         std::fs::remove_file(filtered).unwrap();
         cleanup(&state);
