@@ -105,6 +105,9 @@ pub struct App {
     recording_directory_override: Option<PathBuf>,
     disk_budget: Arc<recording::DiskBudget>,
     pub devices: Vec<String>,
+    /// Whether a device probe already reported to the status bar. The startup
+    /// probe must not replace a message produced while it was in flight.
+    devices_probed: bool,
     pub selected_device: String,
     pub selected_cmd: String,
     /// Device-connector backend (adb / hdc). Chosen in the toolbar, persisted.
@@ -456,6 +459,7 @@ impl App {
             recording_directory_override: None,
             disk_budget,
             devices: Vec::new(),
+            devices_probed: false,
             selected_device,
             selected_cmd,
             transport,
@@ -866,9 +870,13 @@ impl App {
             return;
         };
         let desired = (!disk_spec.is_passthrough()).then_some(disk_spec);
-        // Bookmarks refer to the current cache. Toggling their visibility must
-        // never reload that cache (replace_page clears page-local bookmarks).
-        if paged.filter_initialized && (spec.bookmarks_only || paged.filter == desired) {
+        // Bookmarks refer to the current cache, and `replace_page` clears it, so
+        // toggling their *visibility* must not reload that cache. That is already
+        // covered by comparing `desired` — which excludes `bookmarks_only` — and
+        // NOT by short-circuiting on `spec.bookmarks_only`: doing that also
+        // skipped rebuilds after a real filter change (Find/level/PID/…), leaving
+        // pages filtered by the old spec while the UI claimed the new one.
+        if paged.filter_initialized && paged.filter == desired {
             self.refilter();
             return;
         }
@@ -1254,9 +1262,35 @@ fn write_filtered_rows(
     indices: &[u32],
     dest: &Path,
 ) -> std::io::Result<(usize, ExportEnd)> {
+    // Stream into a sibling temp file and rename it over `dest` only after the
+    // write finished: an I/O failure must not leave a truncated file where an
+    // existing export used to be, and a crash must not expose a half-written
+    // export under the user's chosen name. A *partial* export is different: it
+    // is the documented result of a source change mid-export, so it is renamed
+    // into place and reported to the user as incomplete.
+    let tmp = config::temp_sibling(dest);
+    match write_filtered_rows_to(model, source_generation, indices, &tmp) {
+        Ok((written, end)) => {
+            std::fs::rename(&tmp, dest)?;
+            config::sync_parent_dir(dest);
+            Ok((written, end))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_filtered_rows_to(
+    model: &RwLock<Model>,
+    source_generation: u64,
+    indices: &[u32],
+    path: &Path,
+) -> std::io::Result<(usize, ExportEnd)> {
     use std::io::{BufWriter, Write};
 
-    let file = std::fs::File::create(dest)?;
+    let file = std::fs::File::create(path)?;
     let mut writer = BufWriter::new(file);
     let mut written = 0usize;
     let mut end = ExportEnd::Complete;
@@ -1281,6 +1315,7 @@ fn write_filtered_rows(
         written += chunk.len();
     }
     writer.flush()?;
+    writer.get_ref().sync_all()?;
     Ok((written, end))
 }
 
@@ -1691,7 +1726,30 @@ impl App {
         }
     }
 
+    /// Whether `dest` is the local file currently shown in the table.
+    ///
+    /// Identity (device/inode, or volume/file index on Windows) is compared
+    /// rather than the path text, so a symlink, a hardlink or a differently
+    /// spelled path to the same file is still recognised. A missing destination
+    /// is never the viewed file; nothing would be overwritten.
+    fn view_file_is(&self, dest: &Path) -> bool {
+        let Some(viewed) = self.model.read_recover().file_path.clone() else {
+            return false;
+        };
+        let (Ok(dest_file), Ok(viewed_file)) =
+            (std::fs::File::open(dest), std::fs::File::open(&viewed))
+        else {
+            return false;
+        };
+        crate::io::same_file(&dest_file, &viewed_file).unwrap_or(false)
+    }
+
     fn save_filtered(&mut self) {
+        // Another export is still running: its result would be dropped with the
+        // replaced receiver, and the shutdown flow only tracks the newest one.
+        if self.save_result_rx.is_some() {
+            return;
+        }
         if !self.ui.bookmarks_only {
             if let Some(paged) = &self.paged {
                 let source = paged.source.base.clone();
@@ -1706,6 +1764,10 @@ impl App {
                 else {
                     return;
                 };
+                if self.view_file_is(&destination) {
+                    self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+                    return;
+                }
                 let (tx, rx) = bounded(1);
                 self.save_result_rx = Some(rx);
                 let ctx = self.ctx.clone();
@@ -1813,6 +1875,15 @@ impl App {
             self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
             return;
         }
+        // The export replaces the destination, so it must never be the file the
+        // viewer is reading: that file is the user's only copy of the source log,
+        // and the save dialog opens in its directory with a name that invites
+        // picking it. The recording paths protect themselves the same way (see
+        // `recording::export`); this is the local-file equivalent.
+        if self.view_file_is(&dest) {
+            self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+            return;
+        }
 
         // The background thread streams the rows out in chunks. The snapshot
         // costs 4 bytes per row; the rows themselves are never all copied at once
@@ -1894,6 +1965,12 @@ impl App {
     /// Apply a completed device probe without disturbing a still-valid explicit
     /// selection. Called only from the UI thread.
     fn apply_devices_result(&mut self, result: Result<Vec<String>, String>) {
+        // The startup probe runs while the initial file open is still reporting;
+        // its result must not replace that (or any other) message, because the
+        // file error is the only place the user would ever see it. Later probes
+        // (the device picker, a transport switch) always report as before.
+        let may_report = self.devices_probed || self.status.is_empty();
+        self.devices_probed = true;
         match result {
             Ok(list) => {
                 let n = list.len();
@@ -1906,16 +1983,22 @@ impl App {
                 {
                     self.selected_device = String::new();
                 }
-                self.status = if n == 0 {
-                    tr!("status_dev_devices_zero")
-                } else {
-                    tr!("status_dev_devices", { tool: self.transport.binary(), n: n })
-                };
+                if may_report {
+                    self.status = if n == 0 {
+                        tr!("status_dev_devices_zero")
+                    } else {
+                        tr!("status_dev_devices", { tool: self.transport.binary(), n: n })
+                    };
+                }
             }
             Err(e) => {
                 self.devices.clear();
-                self.status =
-                    tr!("status_dev_devices_failed", { tool: self.transport.binary(), e: &e });
+                if may_report {
+                    self.status = tr!("status_dev_devices_failed", {
+                        tool: self.transport.binary(),
+                        e: &e
+                    });
+                }
             }
         }
     }
@@ -2077,7 +2160,14 @@ impl App {
         // When the "bookmarks only" filter is active, the set of matching rows
         // just changed, so the filtered view must be recomputed — otherwise an
         // unbookmarked row lingers (or a newly bookmarked one stays hidden).
+        // The recompute is asynchronous and renumbers every visible row, so the
+        // selection (which holds row positions) no longer designates the same
+        // log lines; drop it exactly as a filter-spec change does, instead of
+        // letting Ctrl+C / Ctrl+F2 act on the wrong rows.
         if self.ui.bookmarks_only {
+            self.selected_rows.clear();
+            self.selection_anchor = None;
+            self.selection_cursor = None;
             self.refilter();
         }
     }
@@ -2572,15 +2662,7 @@ impl App {
                     self.ui.allowed_tags = Some(selected.clone());
                 }
                 PickerCol::Level => {
-                    let masks = crate::model::LEVEL_MASKS;
-                    let labels = ['V', 'D', 'I', 'W', 'E', 'F'];
-                    let mut mask = LevelMask::empty();
-                    for (i, lb) in labels.iter().enumerate() {
-                        if selected.contains(&lb.to_string()) {
-                            mask |= masks[i];
-                        }
-                    }
-                    self.ui.allowed_levels = Some(mask);
+                    self.ui.allowed_levels = level_mask_from_selection(&selected);
                 }
             }
             self.notify_filter();
@@ -2787,6 +2869,22 @@ fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
 
 fn adjusted_table_font_size(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(13.0, 18.0)
+}
+
+/// The level filter for a picker selection.
+///
+/// `None` means "no level filter"; an *empty* mask would intersect no level at
+/// all and hide every row, so an empty selection must map to `None` rather than
+/// to `Some(LevelMask::empty())`.
+fn level_mask_from_selection(selected: &HashSet<String>) -> Option<LevelMask> {
+    let masks = crate::model::LEVEL_MASKS;
+    let mut mask = LevelMask::empty();
+    for (i, label) in ['V', 'D', 'I', 'W', 'E', 'F'].iter().enumerate() {
+        if selected.contains(&label.to_string()) {
+            mask |= masks[i];
+        }
+    }
+    (!mask.is_empty()).then_some(mask)
 }
 
 fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
@@ -3772,6 +3870,10 @@ impl App {
         }
         let m = self.model.read_recover();
         let total = m.entries.len();
+        // `row` is a global display line number, so the range message must speak
+        // in the same units: a live preview's cache starts at `first_line`, and
+        // reporting only the resident rows would understate the log's length.
+        let total_lines = m.first_line + total;
         let line_no = row + 1;
         let before_cache = row < m.first_line;
         let row = row.saturating_sub(m.first_line);
@@ -3779,7 +3881,7 @@ impl App {
             drop(m);
             self.status = tr!("status_goto_out_of_range", {
                 n: &line_no.to_string(),
-                total: &total.to_string()
+                total: &total_lines.to_string()
             });
         } else if let Some(pos) = m.filtered.iter().position(|&e| e as usize == row) {
             drop(m);
@@ -5597,6 +5699,174 @@ mod tests {
         assert_eq!(
             app.device_refresh.as_ref().unwrap().transport,
             Transport::Hdc
+        );
+    }
+
+    #[test]
+    fn view_file_is_recognises_the_open_log_through_any_path() {
+        let path = tmp_txt("view_guard");
+        std::fs::write(&path, b"x\n").unwrap();
+        let app = App::new_for_test(&egui::Context::default());
+        app.model.write_recover().file_path = Some(path.clone());
+        assert!(app.view_file_is(&path), "the viewed file must be refused");
+        assert!(!app.view_file_is(&tmp_txt("view_guard_other")));
+        #[cfg(unix)]
+        {
+            let link = tmp_txt("view_guard_link");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(
+                app.view_file_is(&link),
+                "a symlink to the viewed file must be refused too"
+            );
+            std::fs::remove_file(&link).unwrap();
+        }
+        app.model.write_recover().file_path = None;
+        assert!(
+            !app.view_file_is(&path),
+            "no viewed file → nothing to protect"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn saving_a_filtered_view_replaces_the_destination_without_leaving_a_temp_file() {
+        let model = model_with_rows(3);
+        let (generation, indices) = snapshot(&model);
+        let dest = tmp_txt("save_atomic");
+        std::fs::write(&dest, b"stale content\n").unwrap();
+
+        let (written, end) = write_filtered_rows(&model, generation, &indices, &dest).unwrap();
+        assert!(matches!(end, ExportEnd::Complete));
+        assert_eq!(written, 3);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "row-00000\nrow-00001\nrow-00002\n",
+            "the destination must hold exactly the export"
+        );
+
+        // The sibling temp file the export streams into must be renamed away.
+        let prefix = format!("{}.", dest.file_name().unwrap().to_string_lossy());
+        let leftovers: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp export file left behind: {leftovers:?}"
+        );
+        std::fs::remove_file(dest).unwrap();
+    }
+
+    #[test]
+    fn toggling_a_bookmark_drops_row_positions_when_bookmarks_only_is_active() {
+        // Row positions index the *old* filtered list; the bookmarks-only
+        // recompute renumbers it, so a surviving selection would designate
+        // different log lines (wrong Ctrl+C / Ctrl+F2 target).
+        let path = tmp_txt("bookmark_selection");
+        std::fs::write(&path, b"a\nb\nc\n").unwrap();
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.open_file(&path).unwrap();
+        wait_until(|| app.model.read_recover().entries.len() == 3);
+        app.ui.bookmarks_only = true;
+        app.selected_rows.insert(1);
+        app.selection_anchor = Some(1);
+        app.selection_cursor = Some(1);
+
+        app.toggle_bookmark(1);
+
+        assert!(
+            app.selected_rows.is_empty(),
+            "stale row positions must not survive the recompute"
+        );
+        assert!(app.selection_anchor.is_none());
+        assert!(app.selection_cursor.is_none());
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn paged_filter_rebuilds_while_bookmarks_only_is_active() {
+        // Regression: the bookmarks-only short-circuit used to skip *every*
+        // rebuild, so changing Find while it was on kept the old pages and the
+        // table showed nothing.
+        let path = tmp_txt("paged_bookmark_rebuild");
+        std::fs::write(&path, b"keep one\nother\nkeep two\n").unwrap();
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.ui.find = "keep".into();
+        app.ui.find_on = true;
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+        let original = app
+            .paged
+            .as_ref()
+            .unwrap()
+            .source
+            .filtered
+            .clone()
+            .expect("a filtered index should exist");
+
+        // Turning bookmarks-only on alone must not reload the page cache.
+        app.ui.bookmarks_only = true;
+        app.notify_filter();
+        assert!(
+            Arc::ptr_eq(
+                app.paged
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .filtered
+                    .as_ref()
+                    .unwrap(),
+                &original
+            ),
+            "a bookmarks-only toggle must not rebuild the paged index"
+        );
+
+        // A real filter change while it is on must rebuild.
+        app.ui.find = "other".into();
+        app.notify_filter();
+        let rebuilt = app
+            .paged
+            .as_ref()
+            .unwrap()
+            .source
+            .filtered
+            .clone()
+            .expect("a filter change must recreate the paged index");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &original),
+            "a Find change during bookmarks-only must rebuild the paged index"
+        );
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_first_device_probe_does_not_replace_a_startup_message() {
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.status = "startup error".into();
+        app.apply_devices_result(Ok(vec!["serial (device)".into()]));
+        assert_eq!(
+            app.status, "startup error",
+            "the startup probe must not hide the message it raced with"
+        );
+        // A later probe (refresh button, transport switch) reports as usual.
+        app.apply_devices_result(Ok(vec!["serial (device)".into()]));
+        assert_ne!(app.status, "startup error");
+    }
+
+    #[test]
+    fn an_empty_level_selection_means_no_level_filter() {
+        assert_eq!(level_mask_from_selection(&HashSet::new()), None);
+        let selected: HashSet<String> = ["E".to_string()].into();
+        assert_eq!(level_mask_from_selection(&selected), Some(LevelMask::E));
+        let both: HashSet<String> = ["E".to_string(), "W".to_string()].into();
+        assert_eq!(
+            level_mask_from_selection(&both),
+            Some(LevelMask::E | LevelMask::W)
         );
     }
 }

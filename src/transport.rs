@@ -244,6 +244,40 @@ pub fn device_serial(entry: &str) -> &str {
     entry.split(" (").next().unwrap_or(entry)
 }
 
+/// Kills and reaps a freshly spawned child unless the session takes ownership.
+///
+/// `Child::drop` neither kills nor waits, so a failure between `spawn()` and the
+/// point where the `Session` owns the child would leave a live adb/hdc process
+/// behind. Dropping this guard on the error path terminates it instead.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn get(&mut self) -> &mut Child {
+        self.0
+            .as_mut()
+            .expect("child is present until the session takes it")
+    }
+
+    fn take(&mut self) -> Child {
+        self.0
+            .take()
+            .expect("child is present until the session takes it")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct Session {
     child: Option<Child>,
     /// Private to this session: clearing advances it without letting an old
@@ -335,13 +369,22 @@ impl Session {
         // Capture stderr so device/command errors are visible instead of being
         // inherited into the parent's console (invisible in a GUI build).
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|e| {
+        // `Child::drop` neither kills nor waits, so without this guard every
+        // fallible step between `spawn()` and the session taking ownership
+        // (pipe setup, worker-thread spawn) would leak a running adb/hdc — and a
+        // stderr-thread failure would additionally leave the already-started
+        // reader draining a recording that nothing can ever stop.
+        let mut child = ChildGuard::new(command.spawn().map_err(|e| {
             anyhow!(
                 "failed to spawn {}: {e} (is it on PATH?)",
                 transport.binary()
             )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        })?);
+        let stdout = child
+            .get()
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("no stdout"))?;
         let paused = match &output {
             Output::Recording(writer) => writer.state.paused.clone(),
             #[cfg(test)]
@@ -410,7 +453,7 @@ impl Session {
         let stderr_buf = Arc::new(Mutex::new(String::new()));
 
         // Drain stderr on its own thread into the buffer created above.
-        let stderr_handle = if let Some(mut es) = child.stderr.take() {
+        let stderr_handle = if let Some(mut es) = child.get().stderr.take() {
             let buf = stderr_buf.clone();
             Some(
                 thread::Builder::new()
@@ -441,7 +484,7 @@ impl Session {
         };
 
         Ok(Self {
-            child: Some(child),
+            child: Some(child.take()),
             epoch,
             paused,
             reader_thread: Some(reader_thread),

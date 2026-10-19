@@ -23,7 +23,9 @@ fn main() -> eframe::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    // `args_os` rather than `args`: the latter panics on a non-UTF-8 argument,
+    // and the release GUI build has no console to show that panic.
+    let initial_file: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
     // Load once so the saved dimensions used by the native viewport and the
     // configuration owned by App can never diverge.
     let cfg = config::load();

@@ -317,17 +317,61 @@ pub fn save(cfg: &Config) -> Result<()> {
     write_config(&path, cfg)
 }
 
+/// A per-process sibling path used to replace `path` atomically.
+///
+/// The process id keeps two instances from fighting over one temp name (a fixed
+/// name would let them interleave writes and rename half of each other's data).
+pub(crate) fn temp_sibling(path: &std::path::Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("logfilter"));
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Flush the directory entry changed by a create/rename to disk.
+///
+/// Declared as no-op on non-Unix targets, where a directory cannot be opened as
+/// a file; the rename itself is still atomic there.
+pub(crate) fn sync_parent_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Write the config atomically: a crash/power-loss mid-write would otherwise
 /// leave a truncated (unparseable) file that wipes every setting on next launch.
-/// Write to a sibling temp file, then rename over the target.
+/// Write and `fsync` a sibling temp file, rename it over the target, then flush
+/// the directory entry — a rename whose data never reached the disk is exactly
+/// the empty config the loader would treat as corrupt.
 fn write_config(path: &std::path::Path, cfg: &Config) -> Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    let tmp = temp_sibling(path);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_parent_dir(path);
     Ok(())
 }
 
@@ -394,6 +438,12 @@ fn parse_properties(text: &str) -> std::collections::HashMap<String, String> {
     out
 }
 
+/// Upper bound on the element count one legacy INI list may declare.
+///
+/// The old Java tool wrote small lists; a corrupt or hostile count must not size
+/// an allocation (or drive a loop) from an untrusted file.
+const MAX_IMPORTED_ENTRIES: usize = 1000;
+
 /// Look for LogFilter.ini + siblings in `dir`; if present, produce a new Config
 /// mirroring the Java Properties values. Missing keys keep Config defaults.
 pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
@@ -444,10 +494,12 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
                 *dst = v.clone();
             }
         }
+        // Bounded: a corrupt/hostile count must not size an allocation from an
+        // untrusted file (the loop would also spin for that many entries).
         let count: usize = p
             .get("INI_HIGILIGHT_COUNT")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .map_or(0, |n: usize| n.min(MAX_IMPORTED_ENTRIES));
         if count > 0 {
             let mut hls = Vec::with_capacity(count);
             for i in 0..count {
@@ -463,7 +515,10 @@ pub fn import_from_ini(dir: &std::path::Path) -> Option<Config> {
 
     if let Ok(text) = std::fs::read_to_string(dir.join("LogFilterCmd.ini")) {
         let p = parse_properties(&text);
-        let count: usize = p.get("CMD_COUNT").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let count: usize = p
+            .get("CMD_COUNT")
+            .and_then(|s| s.parse().ok())
+            .map_or(0, |n: usize| n.min(MAX_IMPORTED_ENTRIES));
         if count > 0 {
             let mut cmds = Vec::with_capacity(count);
             for i in 0..count {
@@ -516,6 +571,36 @@ mod tests {
             recordings_dir().unwrap(),
             std::env::current_dir().unwrap().join("logs")
         );
+    }
+
+    #[test]
+    fn ini_import_clamps_an_absurd_list_count() {
+        // A corrupt/hostile legacy INI must not size an allocation (or drive a
+        // loop) from an untrusted count; the import has to clamp it and keep the
+        // entries it actually finds.
+        let dir = std::env::temp_dir().join(format!("lf_ini_counts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("LogFilter.ini"), "INI_WIDTH=800\n").unwrap();
+        std::fs::write(
+            dir.join("LogFilterColor.ini"),
+            "INI_HIGILIGHT_COUNT=4000000000\nINI_HIGILIGHT_0=alpha\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("LogFilterCmd.ini"),
+            "CMD_COUNT=4000000000\nCMD_0=logcat -v threadtime\n",
+        )
+        .unwrap();
+
+        let cfg = import_from_ini(&dir).expect("legacy INI should import");
+        assert_eq!(cfg.window.width, 800.0);
+        assert_eq!(cfg.colors.highlights, vec!["alpha".to_string()]);
+        assert_eq!(
+            cfg.device.adb_commands,
+            vec!["logcat -v threadtime".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
