@@ -149,6 +149,7 @@ status_page_not_indexed = 该页尚未完成索引
 status_page_loading = 正在加载第 {page} 页…
 status_page_loaded = 已加载第 {page} 页，共索引 {rows} 行
 status_page_failed = 分页文件错误：{e}
+status_paged_reloading = 文件已在磁盘上改变（{e}），正在重建磁盘索引
 status_paged_fallback = 磁盘索引构建失败（{e}），已改用普通方式重新加载该文件
 status_paged_filter_fallback = 过滤索引构建失败（{e}），当前显示未过滤的分页内容
 paged_utf8_only = 大文件分页浏览目前仅支持 UTF-8

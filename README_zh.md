@@ -25,7 +25,9 @@ LogFilter 是一款用 Rust 和 egui 开发的桌面端日志查看与过滤工�
 
 ## 设备录制与文件导出
 
-每次运行或重启采集都会在当前工作目录的 `logs/` 下创建新的时间戳 `.log` 文件。
+每次运行或重启采集都会在用户数据目录下的 `logs/` 中创建新的时间戳 `.log` 文件
+（例如 Linux 的 `~/.local/share/logfilter/logs`、Windows 的
+`%LOCALAPPDATA%\logfilter\logs`）。
 这是持久文件，不是临时文件；清空预览和退出程序都不会删除它。GUI 同时显示
 `logs` 目录和当前文件的完整路径。
 
