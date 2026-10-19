@@ -29,6 +29,21 @@ struct Checkpoint {
     offset: u64,
 }
 
+/// The file on disk no longer matches the indexed snapshot.
+///
+/// A distinct type (rather than a message string) so the viewer can tell "the
+/// file changed, rebuild the index" apart from any other read failure.
+#[derive(Debug)]
+pub struct FileChangedError;
+
+impl std::fmt::Display for FileChangedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file changed while the paged snapshot was open; reopen it")
+    }
+}
+
+impl std::error::Error for FileChangedError {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
@@ -54,9 +69,7 @@ impl FileStamp {
         if Self::from_file(file)? == self && Self::read(path)? == self {
             Ok(())
         } else {
-            Err(io::Error::other(
-                "file changed while the paged snapshot was open; reopen it",
-            ))
+            Err(io::Error::other(FileChangedError))
         }
     }
 }

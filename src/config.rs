@@ -33,8 +33,18 @@ impl Default for RecordingConfig {
     }
 }
 
+/// Where raw captures are written.
+///
+/// A per-user data directory, not the process working directory: launched from a
+/// desktop shortcut or start-menu entry the CWD is the install directory (often
+/// not writable), which made recording fail outright, and launching from
+/// different shells scattered the recordings across directories.
 pub fn recordings_dir() -> Option<PathBuf> {
-    Some(std::env::current_dir().ok()?.join("logs"))
+    Some(
+        ProjectDirs::from("", "", "logfilter")?
+            .data_local_dir()
+            .join("logs"),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,11 +264,17 @@ pub fn load() -> Config {
 
 fn load_raw() -> Config {
     if let Some(path) = config_path() {
-        if let Some(cfg) = read_config(&path) {
-            return cfg;
+        match load_config_file(&path) {
+            ConfigFile::Loaded(cfg) | ConfigFile::Recovered(cfg) => return cfg,
+            // A file that exists but cannot be read (permissions, a sharing
+            // violation, a directory in its place) must not be mistaken for a
+            // fresh install: falling through to the INI migration would write a
+            // config from decade-old values over the real one.
+            ConfigFile::Unreadable => return Config::default(),
+            ConfigFile::Missing => {}
         }
     }
-    // Fall back to INI migration if the user is launching from the old repo dir.
+    // Fall back to INI migration only when there is no config at all.
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(cfg) = import_from_ini(&cwd) {
             let _ = save(&cfg);
@@ -266,6 +282,106 @@ fn load_raw() -> Config {
         }
     }
     Config::default()
+}
+
+/// What the config file on disk turned out to be.
+enum ConfigFile {
+    /// Parsed cleanly; nothing to report.
+    Loaded(Config),
+    /// Some fields were unusable. The readable sections were kept and the bad
+    /// file was backed up.
+    Recovered(Config),
+    /// No config file yet.
+    Missing,
+    /// The file exists but could not be read.
+    Unreadable,
+}
+
+fn load_config_file(path: &std::path::Path) -> ConfigFile {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConfigFile::Missing,
+        Err(e) => {
+            eprintln!(
+                "logfilter: cannot read config at {} ({e}); using defaults for this run",
+                path.display()
+            );
+            return ConfigFile::Unreadable;
+        }
+    };
+    match toml::from_str::<Config>(&text) {
+        Ok(cfg) => ConfigFile::Loaded(cfg),
+        Err(e) => {
+            let cfg = recover_config(&text);
+            let backup = backup_path(path);
+            let kept = std::fs::rename(path, &backup);
+            eprintln!(
+                "logfilter: failed to parse config at {} ({e}); kept the readable sections{}",
+                path.display(),
+                match &kept {
+                    Ok(()) => format!(" and saved the original to {}", backup.display()),
+                    Err(rename_error) => format!(" (could not back it up: {rename_error})"),
+                }
+            );
+            ConfigFile::Recovered(cfg)
+        }
+    }
+}
+
+/// A timestamped backup path, so a second failure cannot destroy the only copy of
+/// the user's original settings.
+///
+/// The name is made unique against the filesystem rather than assumed unique from
+/// the clock: two failures inside the same second would otherwise pick the same
+/// name and the second rename would overwrite the first backup.
+fn backup_path(path: &std::path::Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let mut candidate = path.with_file_name(format!("{name}.{stamp}.bak"));
+    let mut sequence = 1;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("{name}.{stamp}.{sequence}.bak"));
+        sequence += 1;
+    }
+    candidate
+}
+
+/// Build a config from whatever part of a corrupt file still parses.
+///
+/// Every section is read independently and falls back to its own default, so one
+/// bad field (a mistyped number, an array whose length changed between versions)
+/// no longer resets the theme, fonts, filters, colors and recent files with it.
+fn recover_config(text: &str) -> Config {
+    let mut cfg = Config::default();
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return cfg;
+    };
+    let Ok(table) = value.try_into::<toml::Table>() else {
+        return cfg;
+    };
+    macro_rules! section {
+        ($name:literal, $field:ident) => {
+            if let Some(section) = table.get($name) {
+                if let Ok(parsed) = section.clone().try_into() {
+                    cfg.$field = parsed;
+                }
+            }
+        };
+    }
+    section!("window", window);
+    section!("view", view);
+    section!("filters", filters);
+    section!("colors", colors);
+    section!("device", device);
+    section!("recent", recent);
+    section!("recording", recording);
+    cfg
 }
 
 /// Reconcile an older saved config with the built-in command set introduced in
@@ -286,27 +402,6 @@ fn ensure_builtin_commands(cfg: &mut Config) {
     if let Some(pos) = cfg.device.adb_commands.iter().position(|c| c == KMSG) {
         let kmsg = cfg.device.adb_commands.remove(pos);
         cfg.device.adb_commands.push(kmsg);
-    }
-}
-
-/// Read and parse a config file. Returns `None` if it's missing or unparseable.
-/// On a parse error the bad file is preserved as `.bak` instead of being left to
-/// be silently overwritten with defaults — otherwise a single bad value (or a
-/// truncated write) would lose every setting for good.
-fn read_config(path: &std::path::Path) -> Option<Config> {
-    let text = std::fs::read_to_string(path).ok()?;
-    match toml::from_str(&text) {
-        Ok(cfg) => Some(cfg),
-        Err(e) => {
-            let bak = path.with_extension("toml.bak");
-            let _ = std::fs::rename(path, &bak);
-            eprintln!(
-                "logfilter: failed to parse config at {} ({e}); backed up to {} and reset to defaults",
-                path.display(),
-                bak.display()
-            );
-            None
-        }
     }
 }
 
@@ -565,11 +660,98 @@ pub fn prune_missing_recent(cfg: &mut Config) -> bool {
 mod tests {
     use super::*;
 
+    fn temp_config(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lf_cfg_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    fn backups(path: &std::path::Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.(", path.file_name().unwrap().to_string_lossy());
+        let _ = prefix;
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                let file = candidate
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                file.starts_with(&format!("{name}.")) && file.ends_with(".bak")
+            })
+            .collect()
+    }
+
     #[test]
-    fn recordings_default_to_logs_under_the_current_directory() {
+    fn a_corrupt_field_only_resets_its_own_section() {
+        // One unusable value (here a string where a number belongs) used to reset
+        // the theme, fonts, filters, colors and recent files along with it.
+        let path = temp_config("section");
+        std::fs::write(
+            &path,
+            "view = { font_size = 13.0, theme = \"dark\" }\nrecording = { cache_mib = \"nope\" }\n",
+        )
+        .unwrap();
+
+        let ConfigFile::Recovered(cfg) = load_config_file(&path) else {
+            panic!("a partially corrupt config must be recovered, not discarded");
+        };
+        assert_eq!(cfg.view.font_size, 13.0);
+        assert_eq!(cfg.view.theme, "dark");
+        // The broken section falls back to its default.
+        assert_eq!(cfg.recording.cache_mib, 0);
+        assert_eq!(cfg.recording.min_free_mib, 1024);
+        assert_eq!(backups(&path).len(), 1, "the bad file must be backed up");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn repeated_corruption_never_overwrites_the_first_backup() {
+        let path = temp_config("twice");
+        for attempt in 0..2 {
+            std::fs::write(
+                &path,
+                format!("view = {{ font_size = \"bad{attempt}\" }}\n"),
+            )
+            .unwrap();
+            assert!(matches!(load_config_file(&path), ConfigFile::Recovered(_)));
+        }
         assert_eq!(
-            recordings_dir().unwrap(),
-            std::env::current_dir().unwrap().join("logs")
+            backups(&path).len(),
+            2,
+            "each failed load must keep its own backup"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_missing_config_is_distinct_from_an_unreadable_one() {
+        let path = temp_config("missing");
+        assert!(matches!(load_config_file(&path), ConfigFile::Missing));
+        // A directory where the file belongs cannot be read; that must not look
+        // like a fresh install (which would trigger the legacy INI migration).
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(matches!(load_config_file(&path), ConfigFile::Unreadable));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn recordings_default_to_the_user_data_directory() {
+        // Not the process CWD: a desktop-shortcut launch has a CWD that may not
+        // be writable, and recordings must not scatter across directories.
+        let dir = recordings_dir().unwrap();
+        assert_eq!(dir.file_name().unwrap(), "logs");
+        assert_ne!(dir.parent().unwrap(), std::env::current_dir().unwrap());
+        assert_eq!(
+            dir,
+            ProjectDirs::from("", "", "logfilter")
+                .unwrap()
+                .data_local_dir()
+                .join("logs")
         );
     }
 
@@ -728,7 +910,10 @@ mod tests {
             !path.with_extension("toml.tmp").exists(),
             "temp file should be renamed away, not left behind"
         );
-        let back = read_config(&path).expect("written config parses");
+        let back = match load_config_file(&path) {
+            ConfigFile::Loaded(cfg) => cfg,
+            _ => panic!("a written config must parse cleanly"),
+        };
         assert_eq!(back.device.selected_device, "dev1");
         assert!(back.view.columns_visible[6]);
 
@@ -736,20 +921,25 @@ mod tests {
     }
 
     #[test]
-    fn read_config_backs_up_corrupt_file() {
+    fn a_corrupt_config_file_is_backed_up_not_lost() {
         let dir = tempdir_new();
         let path = dir.join("bad_config.toml");
         std::fs::write(&path, "this is = not valid toml ][").unwrap();
 
-        let result = read_config(&path);
-        assert!(result.is_none(), "corrupt config should not parse");
-        assert!(
-            path.with_extension("toml.bak").exists(),
-            "corrupt config must be preserved as .bak, not lost"
+        // Nothing is recoverable from this one, so it becomes defaults — but the
+        // original must survive in a timestamped backup.
+        assert!(matches!(load_config_file(&path), ConfigFile::Recovered(_)));
+        let saved = backups(&path);
+        assert_eq!(
+            saved.len(),
+            1,
+            "corrupt config must be preserved: {saved:?}"
         );
+        assert!(std::fs::read_to_string(&saved[0])
+            .unwrap()
+            .contains("not valid toml"));
         assert!(!path.exists(), "the bad file is moved aside");
-
-        let _ = std::fs::remove_file(path.with_extension("toml.bak"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

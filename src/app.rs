@@ -62,6 +62,12 @@ struct PagedView {
     /// [`App::sync_paged_bookmarks`]). Otherwise navigating away from a page
     /// silently discarded its bookmarks.
     bookmarks: std::collections::HashSet<u64>,
+    /// Set when this index was built by [`App::recover_paged_after_file_change`].
+    ///
+    /// Paged browsing cannot follow a file that keeps changing, so a second
+    /// change in a row switches to the streaming loader instead of rebuilding
+    /// the whole index again.
+    reload_attempted: bool,
 }
 
 pub struct App {
@@ -692,6 +698,7 @@ impl App {
             filter: None,
             goto_line: None,
             bookmarks: std::collections::HashSet::new(),
+            reload_attempted: false,
         });
         self.status = tr!("status_paged_indexing");
         self.notify_filter();
@@ -782,7 +789,11 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    self.status = tr!("status_page_failed", { e: &e.to_string() });
+                    if page_load_saw_a_changed_file(&e) {
+                        self.recover_paged_after_file_change(&e.to_string());
+                    } else {
+                        self.status = tr!("status_page_failed", { e: &e.to_string() });
+                    }
                 }
             }
         }
@@ -830,6 +841,45 @@ impl App {
             Err(e) => {
                 self.status = tr!("status_failed_open", { e: &e.to_string() });
             }
+        }
+    }
+
+    /// A page load failed because the file on disk no longer matches the index
+    /// (it was appended to, rotated or replaced).
+    ///
+    /// Paged browsing cannot follow a changing file: the sparse index and every
+    /// page offset are bound to one snapshot. Rebuild the index once, and if the
+    /// file changes again switch to the streaming loader, which reads whatever
+    /// the file currently contains.
+    fn recover_paged_after_file_change(&mut self, reason: &str) {
+        let Some((path, already_retried)) = self
+            .paged
+            .as_ref()
+            .map(|paged| (paged.source.base.path.clone(), paged.reload_attempted))
+        else {
+            return;
+        };
+        if already_retried {
+            self.fallback_from_paged(&path, reason);
+            return;
+        }
+        // Rebuild the sparse index (paging is UTF-8 only). Re-evaluating the
+        // memory estimate would be pointless: the view is already paged, and the
+        // file is exactly as large as it was a moment ago.
+        if self.encoding_choice() != EncodingChoice::Utf8 {
+            self.fallback_from_paged(&path, reason);
+            return;
+        }
+        match self.open_paged_file(&path) {
+            Ok(()) => {
+                if let Some(paged) = self.paged.as_mut() {
+                    paged.reload_attempted = true;
+                }
+                self.status = tr!("status_paged_reloading", { e: reason });
+            }
+            // The rebuild failed as well (the file changed during the scan, or a
+            // row outgrew the page budget): stream it instead.
+            Err(_) => self.fallback_from_paged(&path, reason),
         }
     }
 
@@ -2940,6 +2990,13 @@ fn level_mask_from_selection(selected: &HashSet<String>) -> Option<LevelMask> {
         }
     }
     (!mask.is_empty()).then_some(mask)
+}
+
+/// Whether a page load failed because the file's content changed under the index.
+fn page_load_saw_a_changed_file(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<paged_file::FileChangedError>())
 }
 
 fn clamp_filtered_row(row: usize, len: usize) -> Option<usize> {
@@ -5186,6 +5243,64 @@ mod tests {
         app.toggle_bookmark(0);
         assert!(app.model.read_recover().bookmarks.is_empty());
         assert!(app.paged.as_ref().unwrap().bookmarks.is_empty());
+        app.clear();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_after_indexing_rebuilds_then_falls_back_to_streaming() {
+        // Paged offsets belong to one snapshot, so a file that grows after the
+        // index was built fails every page load. The view must rebuild once, and
+        // if the file changes again (it is still being written) switch to the
+        // streaming loader instead of dying on "file changed".
+        use std::io::Write;
+        let path = tmp_txt("paged_rebuild");
+        let total = paged_file::CHECKPOINT_ROWS * 2 + 17;
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..total {
+            writeln!(file, "01-01 00:00:00.000  1  2 I Tag: row {i}").unwrap();
+        }
+        drop(file);
+
+        let mut app = App::new_for_test(&egui::Context::default());
+        app.paged_file_budget = 6 * 1024 * 1024;
+        app.open_paged_file(&path).unwrap();
+        wait_paged_page(&mut app);
+
+        // First change: the next page load fails its stamp check.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"01-01 00:00:00.000  1  2 I Tag: appended once\n")
+            .unwrap();
+        app.request_paged_page(1).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.paged
+                .as_ref()
+                .is_some_and(|paged| paged.reload_attempted)
+        });
+        // The rebuilt index serves pages again.
+        wait_until(|| {
+            app.poll_paged();
+            app.paged.is_some()
+                && app.model.read_recover().entries.len() == paged_file::CHECKPOINT_ROWS as usize
+        });
+
+        // Second change: the file is still being written, so paging gives up.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"01-01 00:00:00.000  1  2 I Tag: appended twice\n")
+            .unwrap();
+        app.request_paged_page(1).unwrap();
+        wait_until(|| {
+            app.poll_paged();
+            app.paged.is_none()
+        });
+        wait_until(|| app.model.read_recover().entries.len() == total as usize + 2);
         app.clear();
         std::fs::remove_file(path).unwrap();
     }

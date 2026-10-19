@@ -648,7 +648,12 @@ fn read_appended_with_budget(
     }
     let complete = &raw[..end];
     for chunk in complete.split_inclusive(|&b| b == b'\n') {
-        let (cow, _, _) = enc.decode(chunk);
+        // `decode` sniffs a BOM at the start of *each* slice and would decode this
+        // one line with whatever encoding that BOM names: a windows-1252/GBK row
+        // starting with FF FE would be read as UTF-16, and a UTF-8 row starting
+        // with EF BB BF would silently lose its U+FEFF. The file-level BOM was
+        // already resolved for the initial load; here the bytes are content.
+        let (cow, _) = enc.decode_without_bom_handling(chunk);
         let line = cow.trim_end_matches(['\r', '\n']).to_string();
         if !send_throttled(tx, epoch, line) {
             return Ok(Appended {
@@ -1582,6 +1587,41 @@ mod tests {
             "a plain append must not look like a rewrite"
         );
         assert_eq!(after.offset, 13);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tail_lines_are_not_bom_sniffed() {
+        // Each appended line is a slice, not a stream start: decoding it with the
+        // BOM-sniffing API would switch encodings (or drop a U+FEFF) depending on
+        // the line's first bytes.
+        let tmp = unique_tmp("tail_bom");
+        std::fs::write(&tmp, b"start\n").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        // windows-1252 (the "Local" fallback): FF FE are ordinary characters here,
+        // not a UTF-16LE BOM.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .unwrap()
+            .write_all(b"\xff\xfeA\n")
+            .unwrap();
+        let appended = read_appended(&tmp, 6, encoding_rs::WINDOWS_1252, &tx, 1).unwrap();
+        assert_eq!(appended.offset, 10);
+        assert_eq!(rx.recv().unwrap().1, "\u{ff}\u{fe}A");
+
+        // UTF-8: a line that legitimately starts with the BOM bytes keeps its
+        // U+FEFF instead of having it stripped.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .unwrap()
+            .write_all(b"\xef\xbb\xbfHi\n")
+            .unwrap();
+        let appended = read_appended(&tmp, 10, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert_eq!(appended.offset, 16);
+        assert_eq!(rx.recv().unwrap().1, "\u{feff}Hi");
         let _ = std::fs::remove_file(&tmp);
     }
 

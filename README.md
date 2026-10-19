@@ -26,9 +26,10 @@ LogFilter is a desktop viewer and filter for Android (logcat via adb) and Harmon
 ## Device recording and exports
 
 Each Run/Restart creates a persistent, timestamped `.log` file in `logs/` under
-the current working directory. Files are not temporary and are not deleted on
-Clear or application exit. The GUI shows both the directory and current full
-file path.
+the app's per-user data directory (for example `~/.local/share/logfilter/logs` on
+Linux, `%LOCALAPPDATA%\logfilter\logs` on Windows). Files are not temporary and
+are not deleted on Clear or application exit. The GUI shows both the directory
+and current full file path.
 
 The reader writes original stdout bytes to disk before the preview reads them.
 Rendering and filtering do not hold up the writer. Pause keeps draining the
