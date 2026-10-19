@@ -121,7 +121,7 @@ const MAX_TAIL_READ: u64 = 64 * 1024 * 1024;
 /// Maximum decoded UTF-8 bytes in one line during initial loading (excluding
 /// its newline). A missing newline or binary input must not grow a buffer until
 /// allocation aborts. Stop with an error and retain previously emitted lines.
-const MAX_INITIAL_LINE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_INITIAL_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 // Compile-time guard: a larger budget re-opens the unbounded-peak issue the
 // chunked read fixes, so raising it has to be a deliberate, reviewed change
@@ -131,6 +131,32 @@ const _: () = assert!(
     MAX_TAIL_READ <= 64 * 1024 * 1024,
     "raising MAX_TAIL_READ re-opens the tail read memory peak"
 );
+
+/// Bytes kept immediately before the tail offset to detect an in-place rewrite.
+///
+/// Size alone cannot see `copytruncate` rotation (same inode, and it can regrow
+/// past the old offset within one poll) or a replacement of exactly the same
+/// length — both would splice the new file's content onto the old offset.
+pub(crate) const TAIL_ANCHOR_BYTES: u64 = 64;
+
+/// The bytes immediately before `offset`, for [`read_appended_checked`].
+///
+/// Empty when `offset` is 0 (nothing consumed yet) or the file cannot be read;
+/// an empty anchor disables the rewrite check rather than failing the poll.
+pub(crate) fn tail_anchor(path: &Path, offset: u64) -> Vec<u8> {
+    File::open(path)
+        .and_then(|mut file| {
+            let len = TAIL_ANCHOR_BYTES.min(offset);
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+            let mut buf = vec![0u8; len as usize];
+            file.seek(SeekFrom::Start(offset - len))?;
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        })
+        .unwrap_or_default()
+}
 
 /// Result of reading data appended since a previous tail offset.
 pub struct Appended {
@@ -422,7 +448,15 @@ pub fn read_appended(
     tx: &Sender<(u64, String)>,
     epoch: u64,
 ) -> std::io::Result<Appended> {
-    read_appended_checked(path, offset, enc, tx, epoch, None)
+    read_appended_checked(
+        path,
+        offset,
+        enc,
+        tx,
+        epoch,
+        None,
+        &tail_anchor(path, offset),
+    )
 }
 
 pub(crate) fn read_appended_checked(
@@ -432,6 +466,7 @@ pub(crate) fn read_appended_checked(
     tx: &Sender<(u64, String)>,
     epoch: u64,
     expected_identity: Option<FileIdentity>,
+    anchor: &[u8],
 ) -> std::io::Result<Appended> {
     read_appended_with_budget(
         path,
@@ -440,6 +475,7 @@ pub(crate) fn read_appended_checked(
         tx,
         epoch,
         expected_identity,
+        anchor,
         MAX_TAIL_READ,
     )
 }
@@ -448,6 +484,7 @@ pub(crate) fn read_appended_checked(
 ///
 /// Split out so tests can drive chunking, the `more` backlog, and over-long
 /// lines with small inputs instead of multi-megabyte files.
+#[allow(clippy::too_many_arguments)]
 fn read_appended_with_budget(
     path: &Path,
     offset: u64,
@@ -455,6 +492,7 @@ fn read_appended_with_budget(
     tx: &Sender<(u64, String)>,
     epoch: u64,
     expected_identity: Option<FileIdentity>,
+    anchor: &[u8],
     max_read: u64,
 ) -> std::io::Result<Appended> {
     let mut file = File::open(path)?;
@@ -472,6 +510,28 @@ fn read_appended_with_budget(
             truncated: true,
             more: false,
         });
+    }
+    // The already-consumed prefix must still be the content we consumed. An
+    // in-place rewrite keeps the inode and may even restore the same length, so
+    // neither the identity nor the size check catches `copytruncate` rotation or
+    // `cat new > log`; without this the head of the new file is skipped and the
+    // first appended row is a mid-line splice.
+    if !anchor.is_empty() {
+        let start = offset.checked_sub(anchor.len() as u64);
+        let mut seen = vec![0u8; anchor.len()];
+        let unchanged = start.is_some_and(|start| {
+            file.seek(SeekFrom::Start(start))
+                .and_then(|_| file.read_exact(&mut seen))
+                .is_ok()
+                && seen == anchor
+        });
+        if !unchanged {
+            return Ok(Appended {
+                offset,
+                truncated: true,
+                more: false,
+            });
+        }
     }
     if len == offset {
         return Ok(Appended {
@@ -701,46 +761,60 @@ fn decode_chunk(
     }
 }
 
-/// Visit a UTF-8 stream with the same bounded decoder used for initial loading.
-/// Used by disk-backed exports: the caller can limit the reader to a snapshot.
-pub(crate) fn visit_utf8_lines(
-    mut reader: impl Read,
-    mut visit: impl FnMut(String) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut lines = InitialLines::new(MAX_INITIAL_LINE_BYTES);
-    let mut raw = [0u8; 8192];
+/// Read one `\n`-terminated line into `out`, refusing to grow past `max_bytes`.
+///
+/// Returns the number of bytes read (`0` at end of input). Bytes are accumulated
+/// in `out` so a caller can keep the original bytes instead of a decoded string —
+/// the recording export writes them back verbatim. `cancelled` is polled between
+/// buffer fills so a superseded request stops promptly, and `too_long` is the
+/// error message for a line over the cap.
+pub(crate) fn read_line_bounded(
+    reader: &mut impl BufRead,
+    out: &mut Vec<u8>,
+    max_bytes: usize,
+    cancelled: &impl Fn() -> bool,
+    too_long: &str,
+) -> std::io::Result<usize> {
+    out.clear();
+    let mut total = 0usize;
     loop {
-        let n = match reader.read(&mut raw) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        let mut failure = None;
-        let complete =
-            decode_chunk(
-                &mut decoder,
-                &raw[..n],
-                n == 0,
-                &mut lines,
-                &mut |line| match visit(line) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        failure = Some(e);
-                        false
-                    }
-                },
-            )?;
-        if !complete {
-            return Err(failure.expect("visitor stopped after error"));
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "paged request cancelled",
+            ));
         }
-        if n == 0 {
-            break;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        if total.saturating_add(take) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                too_long.to_string(),
+            ));
+        }
+        if total + take > out.capacity() {
+            let capacity = out
+                .capacity()
+                .saturating_mul(2)
+                .max(total + take)
+                .min(max_bytes);
+            out.try_reserve_exact(capacity - out.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "cannot allocate log line")
+            })?;
+        }
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        total += take;
+        if out.last() == Some(&b'\n') {
+            return Ok(total);
         }
     }
-    if !lines.pending.is_empty() {
-        visit(lines.take_line())?;
-    }
-    Ok(())
 }
 
 pub(crate) fn same_file(a: &File, b: &File) -> std::io::Result<bool> {
@@ -1402,12 +1476,113 @@ mod tests {
         assert!(replacement.len() as u64 >= offset);
         std::fs::write(&tmp, replacement).unwrap();
 
-        let result =
-            read_appended_checked(&tmp, offset, encoding_rs::UTF_8, &tx, 1, Some(identity))
-                .unwrap();
+        let result = read_appended_checked(
+            &tmp,
+            offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            Some(identity),
+            &tail_anchor(&tmp, offset),
+        )
+        .unwrap();
         assert!(result.truncated, "replacement must trigger a full reload");
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn copytruncate_rotation_is_detected_even_when_the_file_regrows() {
+        // `copytruncate` keeps the inode and a fast writer can regrow past the old
+        // offset within one poll, so neither the identity nor the length check
+        // sees it. Without the anchor the head of the new file would be skipped
+        // and the next appended row would be a mid-line splice.
+        let tmp = unique_tmp("anchor_regrow");
+        std::fs::write(&tmp, b"one\ntwo\nthree\n").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let first = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+        assert!(!first.truncated);
+        assert_eq!(first.offset, 14);
+        let anchor = tail_anchor(&tmp, first.offset);
+        assert_eq!(anchor.len(), first.offset as usize);
+
+        // Same inode, rewritten from the start and regrown well past the offset.
+        let regrown = format!("new header\n{}\n", "z".repeat(first.offset as usize + 16));
+        std::fs::write(&tmp, regrown).unwrap();
+        let after = read_appended_with_budget(
+            &tmp,
+            first.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &anchor,
+            4096,
+        )
+        .unwrap();
+        assert!(
+            after.truncated,
+            "an in-place rewrite must ask for a reload, not append"
+        );
+        assert_eq!(after.offset, first.offset, "the offset must not move");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn a_same_length_rewrite_is_detected() {
+        // `cat new > log` can produce exactly the same length; only the anchor
+        // content proves the prefix changed.
+        let tmp = unique_tmp("anchor_same_len");
+        std::fs::write(&tmp, b"alpha\nbeta\n").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let first = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+        let anchor = tail_anchor(&tmp, first.offset);
+
+        std::fs::write(&tmp, vec![b'X'; first.offset as usize]).unwrap();
+        let after = read_appended_with_budget(
+            &tmp,
+            first.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &anchor,
+            4096,
+        )
+        .unwrap();
+        assert!(
+            after.truncated,
+            "a same-length rewrite must trigger a reload"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn appended_data_keeps_the_anchor_check_quiet() {
+        let tmp = unique_tmp("anchor_append");
+        std::fs::write(&tmp, b"first\n").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let first = read_appended(&tmp, 0, encoding_rs::UTF_8, &tx, 1).unwrap();
+        let anchor = tail_anchor(&tmp, first.offset);
+
+        std::fs::write(&tmp, b"first\nsecond\n").unwrap();
+        let after = read_appended_with_budget(
+            &tmp,
+            first.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &anchor,
+            4096,
+        )
+        .unwrap();
+        assert!(
+            !after.truncated,
+            "a plain append must not look like a rewrite"
+        );
+        assert_eq!(after.offset, 13);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -1530,8 +1705,9 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0;
         loop {
-            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 64)
-                .unwrap();
+            let a =
+                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 64)
+                    .unwrap();
             calls += 1;
             assert!(a.offset > offset, "every call must make progress");
             assert!(
@@ -1570,8 +1746,9 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0;
         loop {
-            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 100)
-                .unwrap();
+            let a =
+                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 100)
+                    .unwrap();
             calls += 1;
             offset = a.offset;
             if !a.more {
@@ -1592,8 +1769,8 @@ mod tests {
             let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
             f.write_all(b"\n").unwrap();
         }
-        let a =
-            read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 100).unwrap();
+        let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 100)
+            .unwrap();
         assert_eq!(
             a.offset,
             original.len() as u64 + 1,
@@ -1627,8 +1804,9 @@ mod tests {
         let mut offset = 0u64;
         let mut guard = 0;
         loop {
-            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 10)
-                .unwrap();
+            let a =
+                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 10)
+                    .unwrap();
             guard += 1;
             assert!(a.offset > offset, "a force-split must still advance");
             offset = a.offset;
@@ -1669,8 +1847,9 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0usize;
         loop {
-            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, 1)
-                .unwrap();
+            let a =
+                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 1)
+                    .unwrap();
             calls += 1;
             assert!(
                 a.offset > offset || !a.more,
@@ -1710,8 +1889,17 @@ mod tests {
         let mut offset = 0u64;
         let mut guard = 0;
         loop {
-            let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_16LE, &tx, 1, None, 6)
-                .unwrap();
+            let a = read_appended_with_budget(
+                &tmp,
+                offset,
+                encoding_rs::UTF_16LE,
+                &tx,
+                1,
+                None,
+                &[],
+                6,
+            )
+            .unwrap();
             guard += 1;
             assert!(a.offset > offset, "a force-split must still advance");
             offset = a.offset;
@@ -1764,7 +1952,7 @@ mod tests {
         // Consume one budget-sized chunk: the offset is now mid-file and a
         // backlog is still pending.
         let first =
-            read_appended_with_budget(&tmp, 0, encoding_rs::UTF_8, &tx, 1, Some(identity), 64)
+            read_appended_with_budget(&tmp, 0, encoding_rs::UTF_8, &tx, 1, Some(identity), &[], 64)
                 .unwrap();
         assert!(first.more, "a backlog must still be pending");
         assert!(first.offset > 0 && first.offset < content.len() as u64);
@@ -1779,6 +1967,7 @@ mod tests {
             &tx,
             1,
             Some(identity),
+            &tail_anchor(&tmp, first.offset),
             64,
         )
         .unwrap();
@@ -1797,6 +1986,7 @@ mod tests {
             &tx,
             1,
             Some(identity),
+            &[],
             64,
         )
         .unwrap();
