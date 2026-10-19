@@ -552,11 +552,23 @@ pub fn export_filtered(
     spec: &FilterSpec,
 ) -> io::Result<u64> {
     let file = index.open_snapshot()?;
-    // create_new also rejects aliases/hardlinks to the source, without truncating.
+    // Never write over the file being exported from, through any path or link to
+    // it. (The save dialog already asked the user before offering an existing
+    // name, so other existing destinations are replaced.)
+    if let Ok(existing) = File::open(destination) {
+        if crate::io::same_file(&file, &existing)? {
+            return Err(io::Error::other("cannot overwrite the file being exported"));
+        }
+    }
+    // Stream into a sibling temp file and rename it into place only on success:
+    // a failed export must leave an existing destination intact, and a crash must
+    // not expose a half-written export under the user's chosen name.
+    let tmp = crate::config::temp_sibling(destination);
     let output = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
-        .open(destination)?;
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
     let mut writer = std::io::BufWriter::new(output);
     let result = export_to(index, file, &mut writer, spec);
     let result = result.and_then(|rows| {
@@ -564,10 +576,17 @@ pub fn export_filtered(
         Ok(rows)
     });
     drop(writer);
-    if result.is_err() {
-        let _ = std::fs::remove_file(destination);
+    match result {
+        Ok(rows) => {
+            std::fs::rename(&tmp, destination)?;
+            crate::config::sync_parent_dir(destination);
+            Ok(rows)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    result
 }
 
 fn export_to(
@@ -1005,6 +1024,41 @@ mod tests {
         drop(held);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(old).unwrap();
+    }
+
+    #[test]
+    fn export_replaces_an_existing_destination() {
+        // The save dialog already asked the user to confirm the replacement; the
+        // export must then actually replace it (and leave no temp file behind).
+        let path = file(3);
+        let index = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
+        wait(&index);
+        let destination = path.with_extension("export");
+        std::fs::write(&destination, b"stale content\n").unwrap();
+
+        assert_eq!(
+            export_filtered(&index, &destination, &FilterSpec::default()).unwrap(),
+            3
+        );
+        let text = std::fs::read_to_string(&destination).unwrap();
+        assert!(
+            text.contains("message 0"),
+            "the export must be written: {text:?}"
+        );
+        assert!(!text.contains("stale"), "the old content must be gone");
+        let prefix = format!("{}.", destination.file_name().unwrap().to_string_lossy());
+        let leftovers: Vec<String> = std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp export left behind: {leftovers:?}"
+        );
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
