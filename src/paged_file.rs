@@ -21,7 +21,16 @@ pub const ESTIMATE_FROM_BYTES: u64 = 256 * 1024 * 1024;
 pub const FORCE_PAGING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAGE_ROWS: u64 = 5_000_000;
-const SAMPLE_BYTES: u64 = 8 * 1024 * 1024;
+/// How much of a file to read when estimating its mean line length.
+///
+/// This read happens on the UI thread (the open path validates access and makes
+/// the paged/in-memory decision before handing off to a worker), so it is kept
+/// small: a few thousand lines already pin the mean, and on slow or spun-down
+/// media every extra megabyte is a visible freeze. Neither consumer needs
+/// precision — `should_page` only picks a strategy that `poll_paged` can fall
+/// back out of, and `sample_page_rows` only picks a page size that `fits_page`
+/// re-checks against the real byte budget while scanning.
+const SAMPLE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct Checkpoint {
@@ -211,7 +220,7 @@ fn sample_page_rows(path: &Path, page_budget: u64) -> io::Result<u64> {
 
 fn sample_lines(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = File::open(path)?;
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = [0u8; 64 * 1024];
     let mut bytes = 0u64;
     let mut lines = 0u64;
     while bytes < SAMPLE_BYTES {
