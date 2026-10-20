@@ -145,6 +145,7 @@ paged_utf8_only = Large-file paging currently supports UTF-8 only
 status_goto_paged_filtered = Clear global filters before jumping to a source line
 recording_no_overwrite = Cannot overwrite the raw recording with a filtered export
 view_no_overwrite = Cannot overwrite the log file currently open in the viewer
+view_overwrite_unverifiable = Cannot verify whether this is the log file open in the viewer; choose another name
 recording_force_exit = Close now
 recording_cancel_exit = Cancel exit
 cached_rows = cached

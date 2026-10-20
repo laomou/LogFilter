@@ -107,7 +107,18 @@ pub struct App {
     pub session: Option<transport::Session>,
     recording: Option<Arc<Recording>>,
     last_recording: Option<Arc<Recording>>,
+    /// Recordings that are still being polled: either unfinished, or finished
+    /// with a final error not yet shown. Entries leave once there is nothing
+    /// left to report, so this stays short (normally empty or one).
     previous_recordings: Vec<Arc<Recording>>,
+    /// Canonical paths of raw recordings that have left `previous_recordings`.
+    ///
+    /// Their `Recording` state is only needed until the last error is reported,
+    /// but the overwrite guard must keep protecting the files forever: they hold
+    /// captured data the user cannot re-obtain. Canonicalised on insert so the
+    /// guard is a hash lookup rather than two `canonicalize` syscalls per
+    /// retired recording per save attempt.
+    retired_recording_paths: std::collections::HashSet<PathBuf>,
     recording_error_reported: bool,
     preview_rx: Option<Receiver<PreviewBatch>>,
     preview_offset: u64,
@@ -117,6 +128,9 @@ pub struct App {
     exit_recording_error: Option<String>,
     recording_directory: Option<recording::RecordingDirectory>,
     recording_directory_override: Option<PathBuf>,
+    /// Whether the Recent submenu was open on the previous frame, so the dead-link
+    /// prune runs on the rising edge instead of on every repaint.
+    recent_menu_open: bool,
     disk_budget: Arc<recording::DiskBudget>,
     pub devices: Vec<String>,
     /// Whether a device probe already reported to the status bar. The startup
@@ -243,6 +257,30 @@ pub enum PickerCol {
     Pid,
     Tid,
     Tag,
+}
+
+/// Result of checking an export destination against the file in the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestCheck {
+    /// Provably a different file, or nothing there at all.
+    Distinct,
+    /// Provably the same file as the one on screen.
+    SameAsViewed,
+    /// Could not be determined. Treated as a refusal, but with its own message
+    /// so the user is not told the destination is the viewed file when what
+    /// actually happened is that it could not be inspected.
+    Unverifiable,
+}
+
+impl DestCheck {
+    /// The message to show when the export must not proceed, or `None` to allow it.
+    fn refusal(self) -> Option<String> {
+        match self {
+            DestCheck::Distinct => None,
+            DestCheck::SameAsViewed => Some(tr!("view_no_overwrite")),
+            DestCheck::Unverifiable => Some(tr!("view_overwrite_unverifiable")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +500,7 @@ impl App {
             recording: None,
             last_recording: None,
             previous_recordings: Vec::new(),
+            retired_recording_paths: std::collections::HashSet::new(),
             recording_error_reported: false,
             preview_rx: None,
             preview_offset: 0,
@@ -471,6 +510,7 @@ impl App {
             exit_recording_error: None,
             recording_directory: None,
             recording_directory_override: None,
+            recent_menu_open: false,
             disk_budget,
             devices: Vec::new(),
             devices_probed: false,
@@ -589,9 +629,7 @@ impl App {
             epoch
         };
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         if source_changed {
             self.reset_column_filters();
         }
@@ -673,12 +711,10 @@ impl App {
             model.clear();
             model.file_path = Some(path.to_path_buf());
         }
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
-        self.pending_scroll = None;
+        self.reset_row_view();
+        // Unlike the in-memory and recording views, the paged view does not
+        // follow appends, so tailing has nothing to do here.
         self.auto_scroll = false;
-        self.cached_picker_col = None;
         self.record_full_reported = false;
         *self.load_error.lock_recover() = None;
         *self.reload_request.lock_recover() = None;
@@ -765,11 +801,7 @@ impl App {
                     // `replace_page` clears row-index bookmarks with the rest of the
                     // cache; restore the ones that belong to this page.
                     self.sync_paged_bookmarks();
-                    self.selected_rows.clear();
-                    self.selection_anchor = None;
-                    self.selection_cursor = None;
-                    self.pending_scroll = None;
-                    self.cached_picker_col = None;
+                    self.reset_row_view();
                     self.refilter();
                     if let Some(line) = goto {
                         let selected = {
@@ -1438,10 +1470,10 @@ impl App {
             return;
         }
         self.exit_recording_error = None;
+        // Replacing the session is the point of Run/Restart, so the old one goes
+        // regardless. Everything that destroys the *view* waits until every
+        // failable step below has succeeded — see the comment at the handover.
         self.stop_session();
-        self.paged = None;
-        self.retire_recording();
-        self.poll_recording();
         self.disk_budget.min_free.store(
             self.cfg
                 .recording
@@ -1473,6 +1505,38 @@ impl App {
         };
         let recorded = writer.state.clone();
         self.last_recording = Some(recorded.clone());
+
+        let device = if self.selected_device.is_empty() {
+            None
+        } else {
+            // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
+            Some(transport::device_serial(&self.selected_device))
+        };
+        // Spawn before touching the view. This is the step that actually fails in
+        // practice — device unauthorized, serial gone stale, adb missing, a typo
+        // in the command — and it used to fail *after* the view had been cleared
+        // and the paged index dropped, so a 4 GiB file that took minutes to index
+        // was gone with nothing but a status line to explain it. The session only
+        // writes bytes to the recording file, and the preview below reads that
+        // file from offset 0, so starting it first loses nothing.
+        let session = match transport::Session::start_recording(
+            self.transport,
+            self.transport_override().as_deref(),
+            device,
+            &self.selected_cmd,
+            writer,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
+                return;
+            }
+        };
+
+        // Handover: past this point the previous source is gone.
+        self.paged = None;
+        self.retire_recording();
+        self.poll_recording();
         // Install the source and empty dataset atomically with respect to ingest.
         let epoch = {
             let mut model = self.model.write_recover();
@@ -1483,20 +1547,16 @@ impl App {
             epoch
         };
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         // Keep the column-picker filters (level/PID/TID/tag): Run/Restart
         // re-monitor the same device/app, so the values stay relevant — unlike a
         // file open, which switches to an unrelated source.
         self.notify_filter();
 
-        let device = if self.selected_device.is_empty() {
-            None
-        } else {
-            // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
-            Some(transport::device_serial(&self.selected_device))
-        };
+        // Opening a file that was just created and spawning one thread; unlike
+        // the session start there is no external cause to fail on, so the view is
+        // already committed here. Don't leave the session running without a
+        // reader if it does.
         let preview = match recording::preview(
             recorded.clone(),
             0,
@@ -1506,30 +1566,20 @@ impl App {
         ) {
             Ok(rx) => rx,
             Err(e) => {
+                let mut session = session;
+                session.stop();
                 self.status = tr!("status_recording_failed", { e: &e.to_string() });
                 return;
             }
         };
-        match transport::Session::start_recording(
-            self.transport,
-            self.transport_override().as_deref(),
-            device,
-            &self.selected_cmd,
-            writer,
-        ) {
-            Ok(s) => {
-                self.session = Some(s);
-                self.preview_rx = Some(preview);
-                self.recording = Some(recorded);
-                self.recording_error_reported = false;
-                self.preview_offset = 0;
-                self.preview_omitted = 0;
-                self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
-            }
-            Err(e) => {
-                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
-            }
-        }
+        self.session = Some(session);
+        self.preview_rx = Some(preview);
+        self.recording = Some(recorded);
+        self.recording_error_reported = false;
+        self.preview_offset = 0;
+        self.preview_omitted = 0;
+        self.status =
+            tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
     }
 
     fn stop_session(&mut self) {
@@ -1591,9 +1641,7 @@ impl App {
             }
         }
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         self.notify_filter();
     }
 
@@ -1642,11 +1690,7 @@ impl App {
             }
         }
         if evicted {
-            self.selected_rows.clear();
-            self.selection_anchor = None;
-            self.selection_cursor = None;
-            self.pending_scroll = None;
-            self.cached_picker_col = None;
+            self.reset_row_view();
             self.refilter();
         } else if appended {
             let (lock, wake) = &*self.wake;
@@ -1683,7 +1727,16 @@ impl App {
                     self.status = tr!("status_recording_failed", { e: &e });
                 }
             }
-            true
+            // Finished and reported: nothing is ever polled from it again. Both
+            // arms used to return `true`, making this a `for_each` in the shape
+            // of a `retain` — one entry accumulated per Run/Restart for the life
+            // of the process, and every save attempt scanned the whole list with
+            // two `canonicalize` syscalls per entry. Keep only the path, which
+            // the overwrite guard still needs.
+            self.retired_recording_paths.insert(
+                std::fs::canonicalize(&recorded.path).unwrap_or_else(|_| recorded.path.clone()),
+            );
+            false
         });
     }
 
@@ -1702,6 +1755,28 @@ impl App {
         self.ui.allowed_tags = None;
         self.ui.disallowed_tags.clear();
         self.ui.allowed_levels = None;
+    }
+
+    /// Drop everything that refers to a row by its index.
+    ///
+    /// Every caller is about to invalidate those indices — by clearing the
+    /// model, replacing the paged window, or evicting from the front of the
+    /// cache — and a surviving index does not fail, it silently points at an
+    /// unrelated row: a selection the user never made, or a scroll to an
+    /// arbitrary position.
+    ///
+    /// This deliberately excludes the source-level state (epoch, format hint,
+    /// `recording_full`) and `auto_scroll`, which the paged view turns off
+    /// because it does not tail while the in-memory and recording views keep
+    /// following appends. The column-picker cache is keyed on
+    /// `(column, entry count)` and so usually self-invalidates, but two
+    /// datasets can share a count; dropping it here closes that window.
+    fn reset_row_view(&mut self) {
+        self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.pending_scroll = None;
+        self.cached_picker_col = None;
     }
 
     /// Tab-separated text of an entry's *visible* columns, in display order, so a
@@ -1810,18 +1885,32 @@ impl App {
     ///
     /// Identity (device/inode, or volume/file index on Windows) is compared
     /// rather than the path text, so a symlink, a hardlink or a differently
-    /// spelled path to the same file is still recognised. A missing destination
-    /// is never the viewed file; nothing would be overwritten.
-    fn view_file_is(&self, dest: &Path) -> bool {
+    /// spelled path to the same file is still recognised.
+    ///
+    /// The undecidable cases return [`DestCheck::Unverifiable`] rather than
+    /// "distinct". The entire point of the check is that the viewed file is the
+    /// user's only copy of the source log, so an error must not be read as
+    /// permission to overwrite it — a `stat` failure on a network mount used to
+    /// be enough to disable the guard. A missing destination is the exception
+    /// and is genuinely distinct: it is the normal "save under a new name" case,
+    /// and there is nothing there to overwrite.
+    fn view_file_is(&self, dest: &Path) -> DestCheck {
         let Some(viewed) = self.model.read_recover().file_path.clone() else {
-            return false;
+            return DestCheck::Distinct;
         };
-        let (Ok(dest_file), Ok(viewed_file)) =
-            (std::fs::File::open(dest), std::fs::File::open(&viewed))
-        else {
-            return false;
+        let dest_file = match std::fs::File::open(dest) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DestCheck::Distinct,
+            Err(_) => return DestCheck::Unverifiable,
         };
-        crate::io::same_file(&dest_file, &viewed_file).unwrap_or(false)
+        let Ok(viewed_file) = std::fs::File::open(&viewed) else {
+            return DestCheck::Unverifiable;
+        };
+        match crate::io::same_file(&dest_file, &viewed_file) {
+            Ok(true) => DestCheck::SameAsViewed,
+            Ok(false) => DestCheck::Distinct,
+            Err(_) => DestCheck::Unverifiable,
+        }
     }
 
     fn save_filtered(&mut self) {
@@ -1844,8 +1933,8 @@ impl App {
                 else {
                     return;
                 };
-                if self.view_file_is(&destination) {
-                    self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+                if let Some(reason) = self.view_file_is(&destination).refusal() {
+                    self.status = tr!("status_save_failed", { e: &reason });
                     return;
                 }
                 let (tx, rx) = bounded(1);
@@ -1940,17 +2029,22 @@ impl App {
             .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
+        let dest_canonical = std::fs::canonicalize(&dest).ok();
+        let is_dest = |recorded: &Arc<Recording>| {
+            recorded.path == dest
+                || dest_canonical
+                    .as_deref()
+                    .zip(std::fs::canonicalize(&recorded.path).ok())
+                    .is_some_and(|(a, b)| a == b)
+        };
         if self
             .recording
             .iter()
-            .chain(self.previous_recordings.iter())
-            .any(|recorded| {
-                recorded.path == dest
-                    || std::fs::canonicalize(&dest)
-                        .ok()
-                        .zip(std::fs::canonicalize(&recorded.path).ok())
-                        .is_some_and(|(a, b)| a == b)
-            })
+            .chain(&self.previous_recordings)
+            .any(is_dest)
+            || dest_canonical
+                .as_ref()
+                .is_some_and(|c| self.retired_recording_paths.contains(c))
         {
             self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
             return;
@@ -1960,8 +2054,8 @@ impl App {
         // and the save dialog opens in its directory with a name that invites
         // picking it. The recording paths protect themselves the same way (see
         // `recording::export`); this is the local-file equivalent.
-        if self.view_file_is(&dest) {
-            self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+        if let Some(reason) = self.view_file_is(&dest).refusal() {
+            self.status = tr!("status_save_failed", { e: &reason });
             return;
         }
 
@@ -3016,7 +3110,7 @@ fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
 }
 
 fn adjusted_table_font_size(current: f32, delta: f32) -> f32 {
-    (current + delta).clamp(13.0, 18.0)
+    (current + delta).clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE)
 }
 
 /// The level filter for a picker selection.
@@ -3487,21 +3581,36 @@ impl App {
                         }
                         ui.close();
                     }
+                    let mut recent_open_now = false;
                     ui.menu_button(tr!("recent"), |ui| {
+                        recent_open_now = true;
                         // Prune entries whose file no longer exists so the list
                         // doesn't accumulate dead links.
-                        config::prune_missing_recent(&mut self.cfg);
-                        let recent = self.cfg.recent.files.clone();
-                        if recent.is_empty() {
+                        //
+                        // Only when the submenu opens. This is one `exists()`
+                        // per entry, and it ran on every repaint while the menu
+                        // was on screen — around 600 `stat` calls a second at
+                        // 60 fps. On a path into an unmounted network share or
+                        // an unplugged drive, `exists()` blocks until the kernel
+                        // gives up, so the window froze for as long as the
+                        // pointer rested on the one menu whose whole purpose is
+                        // to list such paths.
+                        if !self.recent_menu_open {
+                            config::prune_missing_recent(&mut self.cfg);
+                        }
+                        if self.cfg.recent.files.is_empty() {
                             ui.label(tr!("recent_empty"));
                         }
-                        for p in recent {
+                        // Borrowed, not cloned: this used to copy up to ten
+                        // PathBufs per frame.
+                        for p in &self.cfg.recent.files {
                             if ui.button(p.display().to_string()).clicked() {
-                                recent_open = Some(p);
+                                recent_open = Some(p.clone());
                                 ui.close();
                             }
                         }
                     });
+                    self.recent_menu_open = recent_open_now;
                     ui.separator();
                     if ui.button(tr!("save_filtered")).clicked() {
                         self.save_filtered();
@@ -6005,22 +6114,40 @@ mod tests {
         std::fs::write(&path, b"x\n").unwrap();
         let app = App::new_for_test(&egui::Context::default());
         app.model.write_recover().file_path = Some(path.clone());
-        assert!(app.view_file_is(&path), "the viewed file must be refused");
-        assert!(!app.view_file_is(&tmp_txt("view_guard_other")));
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::SameAsViewed,
+            "the viewed file must be refused"
+        );
+        assert_eq!(
+            app.view_file_is(&tmp_txt("view_guard_other")),
+            DestCheck::Distinct,
+            "a destination that does not exist is the normal save-as case"
+        );
         #[cfg(unix)]
         {
             let link = tmp_txt("view_guard_link");
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(
+            assert_eq!(
                 app.view_file_is(&link),
+                DestCheck::SameAsViewed,
                 "a symlink to the viewed file must be refused too"
             );
             std::fs::remove_file(&link).unwrap();
         }
+        // The guard must fail closed: when the viewed file can no longer be
+        // inspected, "can't tell" must not be reported as "safe to overwrite".
+        app.model.write_recover().file_path = Some(tmp_txt("view_guard_vanished"));
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::Unverifiable,
+            "an uninspectable viewed file must not disable the guard"
+        );
         app.model.write_recover().file_path = None;
-        assert!(
-            !app.view_file_is(&path),
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::Distinct,
             "no viewed file → nothing to protect"
         );
         std::fs::remove_file(path).unwrap();
@@ -6559,6 +6686,54 @@ mod ui_tests {
         h.state_mut().stop_session();
     }
 
+    /// A device session that fails to start must not take the loaded log with
+    /// it. The destructive steps (dropping the paged index, bumping the source
+    /// epoch, clearing the model) used to run *before* the spawn, so the most
+    /// common failure there — device unauthorized, stale serial, adb missing, a
+    /// typo in the command — left an empty table and a one-line status, with a
+    /// large file's index gone and nothing to do but open it again.
+    #[test]
+    fn a_failed_session_start_keeps_the_loaded_log() {
+        let mut h = harness();
+        h.step();
+        inject(h.state_mut(), 20);
+        let viewed = std::env::temp_dir().join("lf_failed_run_source.log");
+        h.state_mut().model.write_recover().file_path = Some(viewed.clone());
+        h.state_mut().refilter();
+
+        // An override that cannot be spawned, so the failure is deterministic
+        // and needs no device.
+        h.state_mut().cfg.device.adb_path = Some("/nonexistent/path/to/adb".into());
+        h.state_mut().transport = Transport::Adb;
+        h.state_mut().selected_cmd = "logcat".into();
+        let epoch_before = h.state().source_epoch.load(Ordering::Acquire);
+
+        h.state_mut().run_session();
+
+        let app = h.state();
+        assert!(app.session.is_none(), "no session should be installed");
+        assert!(!app.status.is_empty(), "the failure must be reported");
+        assert_eq!(
+            app.model.read_recover().entries.len(),
+            20,
+            "the loaded log must survive a failed session start"
+        );
+        assert_eq!(
+            app.model.read_recover().file_path.as_deref(),
+            Some(viewed.as_path()),
+            "the source must still be the file the user had open"
+        );
+        assert_eq!(
+            app.source_epoch.load(Ordering::Acquire),
+            epoch_before,
+            "nothing was replaced, so the epoch must not advance"
+        );
+        assert!(
+            app.recording.is_none(),
+            "no recording should be installed either"
+        );
+    }
+
     // ─── FilterSpec sync ─────────────────────────────────────────────────
 
     #[test]
@@ -6878,11 +7053,34 @@ mod ui_tests {
         assert!(!h.state().model.read().unwrap().entries.is_empty());
         assert!(!h.state().selected_rows.is_empty());
 
+        // The view is replaced when the session actually starts, and not before:
+        // a failed start now keeps the loaded log (see
+        // `a_failed_session_start_keeps_the_loaded_log`). Point the transport at
+        // a stand-in that is certain to spawn, so the clearing path is exercised
+        // without depending on adb being installed — this assertion used to pass
+        // on a developer machine with adb on PATH and fail on CI without it.
+        #[cfg(unix)]
+        {
+            h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
+            h.state_mut().transport = Transport::Adb;
+            h.state_mut().selected_cmd = "-c 'exec sleep 30'".into();
+        }
+
         h.state_mut().run_session();
-        // Regardless of whether adb spawned, model and selection must be cleared
-        assert!(h.state().model.read().unwrap().entries.is_empty());
-        assert!(h.state().selected_rows.is_empty());
-        assert_eq!(h.state().selection_anchor, None);
+
+        let started = h.state().session.is_some();
+        let cleared = h.state().model.read().unwrap().entries.is_empty();
+        assert_eq!(
+            started, cleared,
+            "the view must be replaced exactly when the session starts"
+        );
+        #[cfg(unix)]
+        assert!(started, "the stand-in binary must have spawned");
+        if started {
+            assert!(h.state().selected_rows.is_empty());
+            assert_eq!(h.state().selection_anchor, None);
+        }
+        h.state_mut().stop_session();
     }
 
     #[test]
@@ -7131,6 +7329,48 @@ mod ui_tests {
         assert!(h.state().detected_encoding.lock_recover().is_none());
         h.state_mut().clear();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Switching source must not leave the view pointing at rows that no longer
+    /// exist. The selection, the scroll request and the column-picker cache are
+    /// all keyed on a row index or an entry count, and every one of them used to
+    /// be cleared at some reset sites but not others; see `reset_row_view`.
+    #[test]
+    fn opening_a_file_drops_a_selection_and_scroll_from_the_previous_source() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+
+        // Establish a selection, a cursor, an anchor and a pending scroll.
+        h.state_mut().goto_line(7);
+        h.state_mut().selection_anchor = Some(7);
+        h.state_mut().cached_picker_col = Some(PickerCol::Tag);
+        assert!(h.state().selected_rows.contains(&7));
+        assert_eq!(h.state().pending_scroll, Some(7));
+
+        let tmp =
+            std::env::temp_dir().join(format!("lf_reset_row_view_{}.log", std::process::id()));
+        std::fs::write(&tmp, "01-01 10:00:00.000  100  200 I Other: only line\n").unwrap();
+        h.state_mut().open_file(&tmp).unwrap();
+
+        let app = h.state();
+        assert!(
+            app.selected_rows.is_empty(),
+            "a selection from the previous source must not survive"
+        );
+        assert_eq!(app.selection_anchor, None, "anchor must not survive");
+        assert_eq!(app.selection_cursor, None, "cursor must not survive");
+        assert_eq!(
+            app.pending_scroll, None,
+            "a scroll to a row of the previous source must not survive"
+        );
+        assert_eq!(
+            app.cached_picker_col, None,
+            "the picker cache is keyed on entry count, which two sources can share"
+        );
+
+        std::fs::remove_file(tmp).unwrap();
     }
 
     #[test]

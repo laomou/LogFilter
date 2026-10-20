@@ -140,27 +140,40 @@ pub fn default_commands(transport: Transport) -> Vec<String> {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Build a Command for the transport's binary, suppressing console popups on Windows.
-fn transport_command(transport: Transport, override_path: Option<&str>) -> Command {
+fn transport_command(transport: Transport, override_path: Option<&str>) -> Result<Command> {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(binary_path(transport, override_path));
+    let mut cmd = Command::new(binary_path(transport, override_path)?);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd
+    Ok(cmd)
 }
 
 /// Locate the transport's executable (adb / hdc). If the user set an explicit
 /// path in config, use that. Otherwise return the bare name and let
 /// `std::process::Command` resolve it against PATH (Rust searches PATHEXT on
 /// Windows). Windows-only fallback for adb: the Android Studio install location.
-pub fn binary_path(transport: Transport, override_path: Option<&str>) -> PathBuf {
+///
+/// An override that does not name a runnable file is an error rather than a
+/// fallback. Silently dropping back to PATH would run a *different* adb, with
+/// its own server and its own set of visible devices, which is the one outcome
+/// the override exists to prevent; a typo would look like "no devices found".
+pub fn binary_path(transport: Transport, override_path: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
+        // `is_file` rather than `exists`: a directory satisfies `exists`, then
+        // fails to spawn with EACCES, which the caller reports as "is it on
+        // PATH?" — pointing the user away from the actual mistake.
+        if !pb.is_file() {
+            return Err(anyhow!(
+                "configured {} path is not a runnable file: {}",
+                transport.binary(),
+                pb.display()
+            ));
         }
+        return Ok(pb);
     }
     #[cfg(target_os = "windows")]
     {
@@ -168,17 +181,17 @@ pub fn binary_path(transport: Transport, override_path: Option<&str>) -> PathBuf
             if let Ok(local) = std::env::var("LOCALAPPDATA") {
                 let candidate = PathBuf::from(local).join("Android/Sdk/platform-tools/adb.exe");
                 if candidate.exists() {
-                    return candidate;
+                    return Ok(candidate);
                 }
             }
         }
     }
-    PathBuf::from(transport.binary())
+    Ok(PathBuf::from(transport.binary()))
 }
 
 pub fn list_devices(transport: Transport, override_path: Option<&str>) -> Result<Vec<String>> {
     let bin = transport.binary();
-    let out = transport_command(transport, override_path)
+    let out = transport_command(transport, override_path)?
         .args(transport.list_args())
         .output()
         .map_err(|e| anyhow!("failed to spawn `{bin}`: {e} (is {bin} on PATH?)"))?;
@@ -298,7 +311,17 @@ pub struct Session {
     /// a finished one look identical from outside (stdout just stops being
     /// readable), so without this the UI can only say "ended".
     read_error: Arc<Mutex<Option<String>>>,
+    /// When the child was first observed exited, used to bound how long
+    /// completion waits on the stderr worker. `None` until then, and reset if a
+    /// later `try_wait` shows the child still running.
+    exited_at: Option<std::time::Instant>,
 }
+
+/// How long completion waits for the stderr worker to reach EOF after the child
+/// has exited and stdout has ended. Long enough for the ordinary case where the
+/// pipe closes a moment after the process, short enough not to strand a session
+/// whose descendant never closes it.
+const STDERR_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 enum Output {
     Recording(recording::Writer),
@@ -355,14 +378,21 @@ impl Session {
         output: Output,
         epoch: u64,
     ) -> Result<Self> {
-        let mut command = transport_command(transport, override_path);
+        let mut command = transport_command(transport, override_path)?;
         if let Some(d) = device {
             command.arg(transport.device_flag()).arg(d);
         }
         // Split the command string respecting shell quoting (e.g. `logcat -s "My Tag"`).
-        // Falls back to simple whitespace split if the string is not valid shell syntax.
+        //
+        // `shlex::split` returns None precisely when the string is not valid
+        // shell syntax — an unbalanced quote or a trailing backslash. Falling
+        // back to a whitespace split would pass the literal quote through as
+        // argv (`-s "My Tag` becomes `-s`, `"My`, `Tag`), so the device filters
+        // on the tag `"My` plus a stray operand and the user sees nothing but
+        // "session ended". There is no injection risk either way — no shell is
+        // involved — but a refusal is the only honest answer.
         let args = shlex::split(cmd)
-            .unwrap_or_else(|| cmd.split_whitespace().map(str::to_string).collect());
+            .ok_or_else(|| anyhow!("unbalanced quotes or trailing backslash in command: {cmd}"))?;
         for tok in args {
             command.arg(tok);
         }
@@ -469,14 +499,23 @@ impl Session {
                                 Ok(n) => {
                                     let keep =
                                         n.min((256 * 1024usize).saturating_sub(retained.len()));
+                                    if keep == 0 {
+                                        continue;
+                                    }
                                     retained.extend_from_slice(&block[..keep]);
+                                    // Publish as it arrives, not at EOF: a
+                                    // descendant can hold this pipe open for the
+                                    // whole life of the session, and the reason a
+                                    // capture is failing (device offline, unknown
+                                    // command) is needed while it is still running.
+                                    *buf.lock_recover() =
+                                        String::from_utf8_lossy(&retained).into_owned();
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(_) => break,
                             }
                         }
-                        *buf.lock().unwrap_or_else(|e| e.into_inner()) =
-                            String::from_utf8_lossy(&retained).into_owned();
+                        *buf.lock_recover() = String::from_utf8_lossy(&retained).into_owned();
                     })?,
             )
         } else {
@@ -493,6 +532,7 @@ impl Session {
             stop_requested,
             stderr: stderr_buf,
             read_error,
+            exited_at: None,
         })
     }
 
@@ -516,10 +556,7 @@ impl Session {
 
     /// Snapshot of any stderr captured from the adb child so far.
     pub fn stderr_text(&self) -> String {
-        self.stderr
-            .lock()
-            .map(|g| g.trim().to_string())
-            .unwrap_or_default()
+        self.stderr.lock_recover().trim().to_string()
     }
 
     pub fn set_paused(&self, p: bool) {
@@ -567,6 +604,13 @@ impl Session {
     /// Non-blocking natural completion check, safe to call from the UI. Keep
     /// the session stoppable until both the process and its pipe workers end.
     /// Completed workers are joined before the UI reads their final diagnostics.
+    ///
+    /// The stderr worker only gets a short grace period, not a veto: a surviving
+    /// descendant can hold that pipe open indefinitely (see
+    /// `inherited_stderr_does_not_block_completion`), and waiting for its EOF
+    /// would keep every exited session "running" forever — no end-of-capture in
+    /// the UI, and the worker and its buffer never released. Since stderr is now
+    /// published as it arrives, giving up on the EOF costs no diagnostics.
     pub fn try_reap(&mut self) -> std::io::Result<bool> {
         if self.stop_requested.load(Ordering::Acquire) {
             self.stop();
@@ -576,30 +620,51 @@ impl Session {
             return Ok(true);
         };
         if child.try_wait()?.is_none() {
+            self.exited_at = None;
             return Ok(false);
         }
-        if !self.stdout_ended()
-            || self
-                .stderr_handle
-                .as_ref()
-                .is_some_and(|h| !h.is_finished())
-        {
+        if !self.stdout_ended() {
             return Ok(false);
         }
-        self.join_workers();
+        let stderr_pending = self
+            .stderr_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished());
+        if stderr_pending {
+            let waited = self
+                .exited_at
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed();
+            if waited < STDERR_GRACE {
+                return Ok(false);
+            }
+        }
+        self.release_workers();
         self.child = None;
+        self.exited_at = None;
         Ok(true)
     }
 
-    /// Called only after is_finished() succeeded for every worker.
-    fn join_workers(&mut self) {
+    /// Join the workers that have finished and hand any straggler to a detached
+    /// thread, so this never blocks the UI.
+    fn release_workers(&mut self) {
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.stderr_handle.take() {
-            let _ = handle.join();
-        }
         self.reader_thread = None;
+        let Some(stderr) = self.stderr_handle.take() else {
+            return;
+        };
+        if stderr.is_finished() {
+            let _ = stderr.join();
+        } else if let Err(e) = thread::Builder::new()
+            .name("device-stderr-reap".into())
+            .spawn(move || {
+                let _ = stderr.join();
+            })
+        {
+            tracing::warn!("failed to spawn stderr cleanup worker: {e}");
+        }
     }
 }
 
@@ -802,6 +867,58 @@ mod tests {
         assert_eq!(Transport::Hdc.list_args(), ["list", "targets"]);
     }
 
+    /// A configured binary path must be honoured or reported, never silently
+    /// replaced by whatever `adb` happens to be on PATH: that would be a
+    /// different server with a different set of visible devices, and a typo
+    /// would present as "no devices found".
+    #[test]
+    fn a_bad_binary_override_is_reported_instead_of_falling_back_to_path() {
+        // No override: the bare name, resolved against PATH by Command.
+        assert_eq!(
+            binary_path(Transport::Adb, None).unwrap(),
+            PathBuf::from("adb")
+        );
+
+        // A real file is used as given.
+        assert_eq!(
+            binary_path(Transport::Adb, Some("/bin/sh")).unwrap(),
+            PathBuf::from("/bin/sh")
+        );
+
+        for bad in ["/nonexistent/path/to/adb", "", "/tmp"] {
+            let err = binary_path(Transport::Adb, Some(bad))
+                .expect_err("a non-file override must be an error");
+            assert!(
+                err.to_string().contains("not a runnable file"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    /// `shlex::split` returns None exactly when the command is not valid shell
+    /// syntax. The old whitespace-split fallback passed the literal quote
+    /// through as argv, so `-s "My Tag` filtered on the tag `"My` and the user
+    /// saw only "session ended".
+    #[test]
+    fn an_unbalanced_quote_in_the_command_is_refused() {
+        let (tx, _rx) = log_channel();
+        let result = Session::start(
+            Transport::Adb,
+            Some("/bin/sh"),
+            None,
+            "-c 'logcat -s \"My Tag",
+            tx,
+            1,
+        );
+        match result {
+            Ok(_) => panic!("an unbalanced quote must not be split on whitespace"),
+            Err(e) => assert!(
+                e.to_string().contains("unbalanced quotes"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
     #[test]
     fn default_commands_split_by_backend() {
         let adb = default_commands(Transport::Adb);
@@ -990,6 +1107,61 @@ mod tests {
             wait_until(|| stderr.lock().unwrap().as_str() == "descendant error");
             std::fs::remove_file(gate).unwrap();
         }
+    }
+
+    /// A descendant holding stderr open must not strand the session.
+    ///
+    /// Completion used to be gated on the stderr worker reaching EOF, so a
+    /// surviving descendant kept `try_reap` returning `false` forever: the UI
+    /// never saw the capture end, and the worker plus its 256 KiB buffer were
+    /// never released. Diagnostics written before the hang must also already be
+    /// readable, since they used to be published only at EOF.
+    #[test]
+    fn a_descendant_holding_stderr_cannot_strand_a_finished_session() {
+        let gate = gate_path("stderr_grace");
+        let script = format!(
+            "exec 1>&-; printf 'early error' >&2; \
+             (while [ ! -e {} ]; do sleep 0.01; done) & exit 0",
+            shlex::try_quote(gate.to_str().unwrap()).unwrap()
+        );
+        let cmd = format!("-c {}", shlex::try_quote(&script).unwrap());
+        let (tx, _rx) = log_channel();
+        let mut session =
+            Session::start(Transport::Adb, Some("/bin/sh"), None, &cmd, tx, 1).unwrap();
+        wait_until(|| session.stdout_ended());
+        wait_until(|| {
+            session
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+        });
+
+        // Published while the pipe is still held open by the descendant.
+        wait_until(|| session.stderr_text() == "early error");
+        // The first check only starts the grace period.
+        assert!(
+            !session.try_reap().unwrap(),
+            "completion should not be declared before the grace period"
+        );
+        assert!(
+            session.stderr_handle.is_some(),
+            "the stderr worker is still draining the inherited pipe"
+        );
+
+        // And completion arrives anyway, without waiting on that pipe.
+        wait_for_reap(&mut session);
+        assert_eq!(
+            session.stderr_text(),
+            "early error",
+            "diagnostics survive the handoff"
+        );
+        assert!(session.child.is_none(), "session reports itself finished");
+
+        std::fs::write(&gate, b"").unwrap();
+        std::fs::remove_file(gate).unwrap();
     }
 
     /// A `Read` that replays scripted steps, so a mid-stream I/O error or a

@@ -72,6 +72,7 @@ recording_force_exit = 立即退出
 recording_cancel_exit = 取消退出
 recording_no_overwrite = 不能用过滤结果覆盖原始录制文件
 view_no_overwrite = 不能用过滤结果覆盖当前正在查看的日志文件
+view_overwrite_unverifiable = 无法确认目标是否就是当前正在查看的日志文件，请换一个名字
 cached_rows = 缓存行数
 preview_evicted = {n} 条较早日志已移出预览，仍保存在磁盘
 preview_omitted = {n} 条超长日志未显示在预览中，原始内容仍完整保留在文件中

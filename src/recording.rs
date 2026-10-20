@@ -13,6 +13,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const BLOCK: usize = 64 * 1024;
+
+/// How many bytes may be written between two free-space probes.
+///
+/// `check_space` reserves this much on top of the configured minimum, because
+/// a probe that passes is a promise about the *next* interval, not just the
+/// current instant. The two must move together: with the margin smaller than
+/// the interval, a probe passing at exactly the limit still allowed a further
+/// interval's worth of writes, deterministically eating into the reserve the
+/// user configured.
+const SPACE_CHECK_BYTES: u64 = 1024 * 1024;
 const PREVIEW_LINE: usize = 1024 * 1024;
 const BATCH_BYTES: usize = 256 * 1024;
 
@@ -44,11 +54,16 @@ impl DiskBudget {
             min_free: AtomicU64::new(min_free),
         })
     }
+    /// Whether a capture may keep writing for one more probe interval.
+    ///
+    /// The margin covers everything writable before the next probe: a full
+    /// interval plus the one block that can carry the counter past it.
     fn check_space(&self, available: u64) -> io::Result<()> {
         if available
             < self
                 .min_free
                 .load(Ordering::Relaxed)
+                .saturating_add(SPACE_CHECK_BYTES)
                 .saturating_add(BLOCK as u64)
         {
             Err(io::Error::other(
@@ -220,7 +235,12 @@ fn copy_raw<R: Read, W: Write>(
 ) -> io::Result<()> {
     let mut buf = [0u8; BLOCK];
     let mut last_sync = Instant::now();
-    let mut bytes_since_space_check = 1024 * 1024;
+    // Its own clock: `last_sync` is only reset by a successful sync, so sharing
+    // it made "probe at least once a second" mean "a second since the last
+    // successful sync" — which is a different thing whenever syncing is slow or
+    // failing, exactly when free space is worth watching.
+    let mut last_space_check = Instant::now();
+    let mut bytes_since_space_check = SPACE_CHECK_BYTES as usize;
     let read_result = (|| {
         loop {
             // A paused capture writes nothing, so a free-space failure it would
@@ -228,11 +248,12 @@ fn copy_raw<R: Read, W: Write>(
             // stop the recording over bytes it never needed to write.
             if state.budget.min_free.load(Ordering::Relaxed) > 0
                 && !state.paused.load(Ordering::Acquire)
-                && (bytes_since_space_check >= 1024 * 1024
-                    || last_sync.elapsed() >= Duration::from_secs(1))
+                && (bytes_since_space_check >= SPACE_CHECK_BYTES as usize
+                    || last_space_check.elapsed() >= Duration::from_secs(1))
             {
                 state.budget.check_space(free_space(writer)?)?;
                 bytes_since_space_check = 0;
+                last_space_check = Instant::now();
             }
             let n = match reader.read(&mut buf) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -569,10 +590,20 @@ mod tests {
 
     #[test]
     fn free_space_guard_has_a_safety_margin() {
-        let budget = DiskBudget::new(1024 * 1024);
-        assert!(budget.check_space(1024 * 1024).is_err());
-        assert!(budget.check_space(1024 * 1024 + BLOCK as u64 - 1).is_err());
-        assert!(budget.check_space(1024 * 1024 + BLOCK as u64).is_ok());
+        let min_free = 1024 * 1024;
+        let budget = DiskBudget::new(min_free);
+        // The margin must cover a whole probe interval, not just one block:
+        // after a probe passes, the loop may write SPACE_CHECK_BYTES plus the
+        // block that carries the counter past the threshold before probing
+        // again, and all of that has to fit above `min_free`.
+        let margin = SPACE_CHECK_BYTES + BLOCK as u64;
+        assert!(budget.check_space(min_free).is_err());
+        assert!(budget.check_space(min_free + margin - 1).is_err());
+        assert!(budget.check_space(min_free + margin).is_ok());
+        assert!(
+            margin >= SPACE_CHECK_BYTES,
+            "a probe promises the next interval, so the margin cannot be smaller than it"
+        );
     }
 
     #[test]

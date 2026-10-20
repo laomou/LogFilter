@@ -21,7 +21,16 @@ pub const ESTIMATE_FROM_BYTES: u64 = 256 * 1024 * 1024;
 pub const FORCE_PAGING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAGE_ROWS: u64 = 5_000_000;
-const SAMPLE_BYTES: u64 = 8 * 1024 * 1024;
+/// How much of a file to read when estimating its mean line length.
+///
+/// This read happens on the UI thread (the open path validates access and makes
+/// the paged/in-memory decision before handing off to a worker), so it is kept
+/// small: a few thousand lines already pin the mean, and on slow or spun-down
+/// media every extra megabyte is a visible freeze. Neither consumer needs
+/// precision — `should_page` only picks a strategy that `poll_paged` can fall
+/// back out of, and `sample_page_rows` only picks a page size that `fits_page`
+/// re-checks against the real byte budget while scanning.
+const SAMPLE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct Checkpoint {
@@ -211,7 +220,7 @@ fn sample_page_rows(path: &Path, page_budget: u64) -> io::Result<u64> {
 
 fn sample_lines(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = File::open(path)?;
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = [0u8; 64 * 1024];
     let mut bytes = 0u64;
     let mut lines = 0u64;
     while bytes < SAMPLE_BYTES {
@@ -577,11 +586,20 @@ pub fn export_filtered(
     });
     drop(writer);
     match result {
-        Ok(rows) => {
-            std::fs::rename(&tmp, destination)?;
-            crate::config::sync_parent_dir(destination);
-            Ok(rows)
-        }
+        Ok(rows) => match std::fs::rename(&tmp, destination) {
+            Ok(()) => {
+                crate::config::sync_parent_dir(destination);
+                Ok(rows)
+            }
+            Err(e) => {
+                // The rows were written but could not be published: destination
+                // is a directory, not writable, on another device (EXDEV), or
+                // held open by another process on Windows. Don't leave the
+                // sibling temp behind for the user to find and wonder about.
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        },
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -620,8 +638,15 @@ fn export_to(
             hint = format;
         }
         if spec.matches(&entry, 0, &bookmarks) {
-            writer.write_all(entry.raw().as_bytes())?;
-            writer.write_all(b"\n")?;
+            // Match on the decoded text but write the *original bytes*, exactly
+            // as `recording::export` does: an export is a copy of the matching
+            // rows, so invalid UTF-8, CRLF endings and any BOM must survive it.
+            // `entry.raw()` is `decode_line` output, which would replace invalid
+            // bytes with U+FFFD, normalise CRLF to LF, drop the BOM and strip a
+            // trailing '\r' that belonged to the data. `raw` already carries its
+            // line terminator, and only the final line can lack one, so no rows
+            // can run together.
+            writer.write_all(&raw)?;
             rows += 1;
         }
     }
@@ -796,11 +821,56 @@ mod tests {
         std::fs::remove_file(destination).unwrap();
     }
 
+    /// An export is a copy of the matching rows, so it must be byte-faithful.
+    ///
+    /// This path used to write `entry.raw()`, the decoded text, which replaced
+    /// invalid UTF-8 with U+FFFD, normalised CRLF to LF, dropped the BOM and
+    /// stripped a trailing '\r' belonging to the data — while
+    /// `recording::export`, the other half of the same "export filtered
+    /// results" feature, deliberately wrote the original bytes. The lossy path
+    /// was the large-file one, where the user is least able to re-obtain the
+    /// source.
+    #[test]
+    fn export_preserves_the_original_bytes_of_every_matching_row() {
+        let path = file(0);
+        // BOM, then a CRLF row, an invalid-UTF-8 row, and a row whose data ends
+        // in a real '\r' before the LF.
+        let mut bytes = Vec::from(b"\xef\xbb\xbf");
+        bytes.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: crlf row\r\n");
+        bytes.extend_from_slice(b"01-01 00:00:00.000  1  2 I Drop: skipped\n");
+        bytes.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: bad \xff\xfe byte\n");
+        bytes.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: trailing cr\r\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let destination = path.with_extension("filtered");
+        let spec = FilterSpec {
+            allowed_tags: Some(["Keep".to_string()].into()),
+            ..Default::default()
+        };
+        let index = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
+        wait(&index);
+        assert_eq!(export_filtered(&index, &destination, &spec).unwrap(), 3);
+
+        let out = std::fs::read(&destination).unwrap();
+        let mut want = Vec::from(b"\xef\xbb\xbf");
+        want.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: crlf row\r\n");
+        want.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: bad \xff\xfe byte\n");
+        want.extend_from_slice(b"01-01 00:00:00.000  1  2 I Keep: trailing cr\r\r\n");
+        assert_eq!(
+            out, want,
+            "export must reproduce the source bytes of the matching rows"
+        );
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(destination).unwrap();
+    }
+
     #[test]
     fn long_rows_after_the_sample_obey_budget_and_keep_every_source_line() {
         let path = file(0);
         let mut output = io::BufWriter::new(File::create(&path).unwrap());
-        // Entire 8 MiB sample contains short rows; later pages contain long rows.
+        // The entire line-length sample contains short rows; later pages contain
+        // long rows, so the page budget has to hold against rows it never sampled.
         for _ in 0..280_000 {
             output
                 .write_all(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n")

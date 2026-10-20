@@ -702,4 +702,81 @@ mod tests {
         assert_eq!(f, LogFormat::Kernel);
         assert_eq!(e.level, LevelMask::D);
     }
+
+    /// Field extraction must not depend on the hint.
+    ///
+    /// The hint only reorders which regex is tried first, and the paged reader
+    /// relies on that being invisible: `scan_index` latches the hint from the
+    /// first line of the *file*, while `load_page_cancellable` latches it from
+    /// the first line of each *page*, so the two parse the same line with
+    /// different hints. If a hint ever changed an extracted field, a filtered
+    /// page would disagree with the row count the scan committed and rows would
+    /// be silently skipped or shown twice.
+    ///
+    /// This holds because every pattern is `^`-anchored and mutually exclusive
+    /// except hilog, whose matches are a subset of threadtime's that extract the
+    /// same spans (the tag keeps the `domain/tag` prefix either way). Only the
+    /// returned `LogFormat` label differs, and nothing outside this module's
+    /// own dispatch consults it — `FilterSpec::matches` keys on level, pid, tid,
+    /// tag and message.
+    #[test]
+    fn field_extraction_is_independent_of_the_hint() {
+        let samples = [
+            // ThreadTime, including -v usec / -v year / uid variants.
+            "01-01 12:34:56.789  1234  5678 I ActivityManager: Start proc",
+            "01-01 12:34:56.789123  1234  5678 I ActivityManager: Start proc",
+            "2024-01-01 12:34:56.789  1234  5678 I ActivityManager: Start proc",
+            "01-01 12:34:56.789  1234  5678 1000 I ActivityManager: Start proc",
+            // Time, long, epoch, brief, kernel.
+            "01-01 12:34:56.789123 I/ActivityManager( 1234): Start proc",
+            "2024-01-01 12:34:56.789 E/ActivityManager( 1234): boom",
+            "1704067200.123  1234  5678 W ActivityManager: Start proc",
+            "[ 08-07 12:02:47.453  1234:  5678 I/ActivityManager ] Start proc",
+            "[ 08-07 12:02:47.453  1234:  5678 E/MyTag ]",
+            "I/ActivityManager( 1234): brief line",
+            "<6>[12345.678901] kernel thing",
+            // HiLog: the one family that also matches threadtime.
+            "08-06 15:43:53.405  1234  5678 I A03D00/MyApp: key frame id: 0",
+            "08-06 15:43:53.405123  900  901 W C01719/HiSysEvent: warn body",
+            "08-07 13:33:33.641     0     0 I I00000/HiLog: ========Zeroth log",
+            "08-07 12:02:47.772 23643 23643 I A02F08/com.huawei.hmos.brid/Sec: ok",
+            "08-06 15:43:53.405  1234  5678 I ABCDEF/x: msg",
+            // A short hex word before the slash must stay a plain Android tag.
+            "08-06 15:43:53.405  1234  5678 I DB/query: short hex then slash",
+            "not a log line at all",
+            "",
+        ];
+        let hints = [
+            LogFormat::Unknown,
+            LogFormat::ThreadTime,
+            LogFormat::HiLog,
+            LogFormat::Time,
+            LogFormat::Brief,
+            LogFormat::Kernel,
+        ];
+        // Everything `FilterSpec::matches` and the table can observe.
+        let fields = |hint: LogFormat, line: &str| {
+            let (e, _) = parse_line_hinted(line.to_string(), hint);
+            (
+                e.date().to_string(),
+                e.time().to_string(),
+                e.pid().to_string(),
+                e.tid().to_string(),
+                e.uid().to_string(),
+                e.tag().to_string(),
+                e.message().to_string(),
+                e.level,
+            )
+        };
+        for line in samples {
+            let expected = fields(LogFormat::Unknown, line);
+            for hint in hints {
+                assert_eq!(
+                    fields(hint, line),
+                    expected,
+                    "hint {hint:?} changed field extraction for {line:?}"
+                );
+            }
+        }
+    }
 }
