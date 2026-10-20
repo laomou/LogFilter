@@ -181,4 +181,4 @@ RUST_LOG=logfilter=debug cargo run
 
 ## 许可协议
 
-MIT
+Apache-2.0，详见 [LICENSE](LICENSE)。
