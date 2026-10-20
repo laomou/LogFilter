@@ -3016,7 +3016,7 @@ fn empty_shortcut_rows() -> Vec<EmptyShortcutRow> {
 }
 
 fn adjusted_table_font_size(current: f32, delta: f32) -> f32 {
-    (current + delta).clamp(13.0, 18.0)
+    (current + delta).clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE)
 }
 
 /// The level filter for a picker selection.

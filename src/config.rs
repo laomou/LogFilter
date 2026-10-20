@@ -259,6 +259,7 @@ pub fn fonts_dir() -> Option<PathBuf> {
 pub fn load() -> Config {
     let mut cfg = load_raw();
     ensure_builtin_commands(&mut cfg);
+    sanitize_view(&mut cfg.view);
     cfg
 }
 
@@ -315,12 +316,26 @@ fn load_config_file(path: &std::path::Path) -> ConfigFile {
             let cfg = recover_config(&text);
             let backup = backup_path(path);
             let kept = std::fs::rename(path, &backup);
+            // Write the recovered settings back immediately. The rename above
+            // moved the only config away, and the caller only saves when the
+            // serialized config *differs* from what it loaded — so without this
+            // a user who changes nothing is left with no config on disk, and
+            // the next launch sees `Missing` and runs the legacy INI import over
+            // the recovered settings. That is exactly what the `Unreadable`
+            // branch below exists to prevent.
+            let restored = write_config(path, &cfg);
             eprintln!(
-                "logfilter: failed to parse config at {} ({e}); kept the readable sections{}",
+                "logfilter: failed to parse config at {} ({e}); kept the readable sections{}{}",
                 path.display(),
                 match &kept {
                     Ok(()) => format!(" and saved the original to {}", backup.display()),
                     Err(rename_error) => format!(" (could not back it up: {rename_error})"),
+                },
+                match &restored {
+                    Ok(()) => String::new(),
+                    Err(write_error) => {
+                        format!(" (could not write the recovered config: {write_error})")
+                    }
                 }
             );
             ConfigFile::Recovered(cfg)
@@ -382,6 +397,44 @@ fn recover_config(text: &str) -> Config {
     section!("recent", recent);
     section!("recording", recording);
     cfg
+}
+
+/// Table font-size bounds. These are the *only* definition of a valid font
+/// size: the size submenu offers exactly this range, `adjusted_table_font_size`
+/// clamps keyboard changes to it, and `sanitize_view` clamps whatever is on
+/// disk to it. Keeping one range means a hand-edited value can never land
+/// somewhere the UI is unable to represent or change.
+pub const MIN_FONT_SIZE: f32 = 13.0;
+pub const MAX_FONT_SIZE: f32 = 18.0;
+
+/// Upper bound for a saved column width. Far beyond any usable layout, but
+/// finite: an absurd width otherwise propagates into the table layout.
+const MAX_COLUMN_WIDTH: f32 = 5000.0;
+
+/// Clamp view values that reach the renderer directly.
+///
+/// A hand-edited (or truncated, or merged-from-a-backup) config parses as valid
+/// TOML while still holding a value no code path can survive: `font_size` is
+/// passed straight to `FontId::monospace` and a large enough glyph trips
+/// epaint's texture-atlas assertion, i.e. a panic on *every* launch with no way
+/// to fix it from inside the app. The recovery path cannot help — the file
+/// parses fine, so it is never backed up. Non-finite values are equally fatal
+/// (NaN widths collapse the layout) and cannot be clamped, so they fall back to
+/// the default. Window size already gets this treatment in `main`.
+fn sanitize_view(view: &mut ViewConfig) {
+    let defaults = ViewConfig::default();
+    view.font_size = if view.font_size.is_finite() {
+        view.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    } else {
+        defaults.font_size
+    };
+    for (width, default) in view.columns.iter_mut().zip(defaults.columns) {
+        *width = if width.is_finite() {
+            width.clamp(0.0, MAX_COLUMN_WIDTH)
+        } else {
+            default
+        };
+    }
 }
 
 /// Reconcile an older saved config with the built-in command set introduced in
@@ -938,8 +991,102 @@ mod tests {
         assert!(std::fs::read_to_string(&saved[0])
             .unwrap()
             .contains("not valid toml"));
-        assert!(!path.exists(), "the bad file is moved aside");
+        // The bad content is moved aside, but a parseable config must take its
+        // place: leaving no config behind would make the next launch treat this
+        // as a fresh install and run the legacy INI import.
+        assert!(path.exists(), "the recovered config is written back");
+        assert!(
+            matches!(load_config_file(&path), ConfigFile::Loaded(_)),
+            "the written-back config must parse cleanly"
+        );
+        assert_eq!(
+            backups(&path).len(),
+            1,
+            "re-reading a valid config must not create another backup"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovered_config_keeps_readable_sections_on_disk() {
+        let dir = tempdir_new();
+        let path = dir.join("partial_config.toml");
+        // Syntactically valid TOML, but `adb_commands` has the wrong type, so
+        // only `[device]` is discarded. (A *syntax* error anywhere makes
+        // `recover_config` bail to defaults wholesale — see line 377.)
+        std::fs::write(
+            &path,
+            "[view]\nfont_size = 16.0\ntheme = \"dark\"\n\n[device]\nadb_commands = 42\n",
+        )
+        .unwrap();
+
+        let recovered = match load_config_file(&path) {
+            ConfigFile::Recovered(cfg) => cfg,
+            other => panic!(
+                "expected Recovered, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        assert_eq!(recovered.view.font_size, 16.0);
+        assert_eq!(recovered.view.theme, "dark");
+
+        // Those sections must survive a restart without any further save.
+        let reloaded = match load_config_file(&path) {
+            ConfigFile::Loaded(cfg) => cfg,
+            _ => panic!("the written-back config must parse cleanly"),
+        };
+        assert_eq!(reloaded.view.font_size, 16.0);
+        assert_eq!(reloaded.view.theme, "dark");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sanitize_view_clamps_values_that_reach_the_renderer() {
+        let defaults = ViewConfig::default();
+
+        // A font size large enough to trip epaint's texture-atlas assertion.
+        let mut view = ViewConfig {
+            font_size: 5000.0,
+            ..defaults.clone()
+        };
+        sanitize_view(&mut view);
+        assert_eq!(view.font_size, MAX_FONT_SIZE);
+
+        // Zero/negative would make the table unreadable with no way back.
+        for bad in [0.0, -12.0] {
+            let mut view = ViewConfig {
+                font_size: bad,
+                ..defaults.clone()
+            };
+            sanitize_view(&mut view);
+            assert_eq!(view.font_size, MIN_FONT_SIZE, "font_size {bad} clamped");
+        }
+
+        // Non-finite cannot be clamped, so it falls back to the default.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut view = ViewConfig {
+                font_size: bad,
+                ..defaults.clone()
+            };
+            sanitize_view(&mut view);
+            assert_eq!(view.font_size, defaults.font_size);
+        }
+
+        // Columns: clamped when finite, replaced per-column when not.
+        let mut view = defaults.clone();
+        view.columns[0] = -5.0;
+        view.columns[1] = 1.0e9;
+        view.columns[2] = f32::NAN;
+        sanitize_view(&mut view);
+        assert_eq!(view.columns[0], 0.0);
+        assert_eq!(view.columns[1], MAX_COLUMN_WIDTH);
+        assert_eq!(view.columns[2], defaults.columns[2]);
+
+        // A valid config must pass through untouched.
+        let mut view = defaults.clone();
+        sanitize_view(&mut view);
+        assert_eq!(view.font_size, defaults.font_size);
+        assert_eq!(view.columns, defaults.columns);
     }
 
     #[test]
