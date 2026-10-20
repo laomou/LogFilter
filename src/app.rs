@@ -107,7 +107,18 @@ pub struct App {
     pub session: Option<transport::Session>,
     recording: Option<Arc<Recording>>,
     last_recording: Option<Arc<Recording>>,
+    /// Recordings that are still being polled: either unfinished, or finished
+    /// with a final error not yet shown. Entries leave once there is nothing
+    /// left to report, so this stays short (normally empty or one).
     previous_recordings: Vec<Arc<Recording>>,
+    /// Canonical paths of raw recordings that have left `previous_recordings`.
+    ///
+    /// Their `Recording` state is only needed until the last error is reported,
+    /// but the overwrite guard must keep protecting the files forever: they hold
+    /// captured data the user cannot re-obtain. Canonicalised on insert so the
+    /// guard is a hash lookup rather than two `canonicalize` syscalls per
+    /// retired recording per save attempt.
+    retired_recording_paths: std::collections::HashSet<PathBuf>,
     recording_error_reported: bool,
     preview_rx: Option<Receiver<PreviewBatch>>,
     preview_offset: u64,
@@ -486,6 +497,7 @@ impl App {
             recording: None,
             last_recording: None,
             previous_recordings: Vec::new(),
+            retired_recording_paths: std::collections::HashSet::new(),
             recording_error_reported: false,
             preview_rx: None,
             preview_offset: 0,
@@ -1454,10 +1466,10 @@ impl App {
             return;
         }
         self.exit_recording_error = None;
+        // Replacing the session is the point of Run/Restart, so the old one goes
+        // regardless. Everything that destroys the *view* waits until every
+        // failable step below has succeeded — see the comment at the handover.
         self.stop_session();
-        self.paged = None;
-        self.retire_recording();
-        self.poll_recording();
         self.disk_budget.min_free.store(
             self.cfg
                 .recording
@@ -1489,6 +1501,38 @@ impl App {
         };
         let recorded = writer.state.clone();
         self.last_recording = Some(recorded.clone());
+
+        let device = if self.selected_device.is_empty() {
+            None
+        } else {
+            // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
+            Some(transport::device_serial(&self.selected_device))
+        };
+        // Spawn before touching the view. This is the step that actually fails in
+        // practice — device unauthorized, serial gone stale, adb missing, a typo
+        // in the command — and it used to fail *after* the view had been cleared
+        // and the paged index dropped, so a 4 GiB file that took minutes to index
+        // was gone with nothing but a status line to explain it. The session only
+        // writes bytes to the recording file, and the preview below reads that
+        // file from offset 0, so starting it first loses nothing.
+        let session = match transport::Session::start_recording(
+            self.transport,
+            self.transport_override().as_deref(),
+            device,
+            &self.selected_cmd,
+            writer,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
+                return;
+            }
+        };
+
+        // Handover: past this point the previous source is gone.
+        self.paged = None;
+        self.retire_recording();
+        self.poll_recording();
         // Install the source and empty dataset atomically with respect to ingest.
         let epoch = {
             let mut model = self.model.write_recover();
@@ -1505,12 +1549,10 @@ impl App {
         // file open, which switches to an unrelated source.
         self.notify_filter();
 
-        let device = if self.selected_device.is_empty() {
-            None
-        } else {
-            // The list may label a device "SERIAL (unauthorized)"; -s needs the serial.
-            Some(transport::device_serial(&self.selected_device))
-        };
+        // Opening a file that was just created and spawning one thread; unlike
+        // the session start there is no external cause to fail on, so the view is
+        // already committed here. Don't leave the session running without a
+        // reader if it does.
         let preview = match recording::preview(
             recorded.clone(),
             0,
@@ -1520,30 +1562,20 @@ impl App {
         ) {
             Ok(rx) => rx,
             Err(e) => {
+                let mut session = session;
+                session.stop();
                 self.status = tr!("status_recording_failed", { e: &e.to_string() });
                 return;
             }
         };
-        match transport::Session::start_recording(
-            self.transport,
-            self.transport_override().as_deref(),
-            device,
-            &self.selected_cmd,
-            writer,
-        ) {
-            Ok(s) => {
-                self.session = Some(s);
-                self.preview_rx = Some(preview);
-                self.recording = Some(recorded);
-                self.recording_error_reported = false;
-                self.preview_offset = 0;
-                self.preview_omitted = 0;
-                self.status = tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
-            }
-            Err(e) => {
-                self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
-            }
-        }
+        self.session = Some(session);
+        self.preview_rx = Some(preview);
+        self.recording = Some(recorded);
+        self.recording_error_reported = false;
+        self.preview_offset = 0;
+        self.preview_omitted = 0;
+        self.status =
+            tr!("status_dev_started", { tool: self.transport.binary(), cmd: &self.selected_cmd });
     }
 
     fn stop_session(&mut self) {
@@ -1691,7 +1723,16 @@ impl App {
                     self.status = tr!("status_recording_failed", { e: &e });
                 }
             }
-            true
+            // Finished and reported: nothing is ever polled from it again. Both
+            // arms used to return `true`, making this a `for_each` in the shape
+            // of a `retain` — one entry accumulated per Run/Restart for the life
+            // of the process, and every save attempt scanned the whole list with
+            // two `canonicalize` syscalls per entry. Keep only the path, which
+            // the overwrite guard still needs.
+            self.retired_recording_paths.insert(
+                std::fs::canonicalize(&recorded.path).unwrap_or_else(|_| recorded.path.clone()),
+            );
+            false
         });
     }
 
@@ -1984,17 +2025,22 @@ impl App {
             .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
+        let dest_canonical = std::fs::canonicalize(&dest).ok();
+        let is_dest = |recorded: &Arc<Recording>| {
+            recorded.path == dest
+                || dest_canonical
+                    .as_deref()
+                    .zip(std::fs::canonicalize(&recorded.path).ok())
+                    .is_some_and(|(a, b)| a == b)
+        };
         if self
             .recording
             .iter()
-            .chain(self.previous_recordings.iter())
-            .any(|recorded| {
-                recorded.path == dest
-                    || std::fs::canonicalize(&dest)
-                        .ok()
-                        .zip(std::fs::canonicalize(&recorded.path).ok())
-                        .is_some_and(|(a, b)| a == b)
-            })
+            .chain(&self.previous_recordings)
+            .any(is_dest)
+            || dest_canonical
+                .as_ref()
+                .is_some_and(|c| self.retired_recording_paths.contains(c))
         {
             self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
             return;
@@ -6619,6 +6665,54 @@ mod ui_tests {
             "clicking Run should update status (success or error)"
         );
         h.state_mut().stop_session();
+    }
+
+    /// A device session that fails to start must not take the loaded log with
+    /// it. The destructive steps (dropping the paged index, bumping the source
+    /// epoch, clearing the model) used to run *before* the spawn, so the most
+    /// common failure there — device unauthorized, stale serial, adb missing, a
+    /// typo in the command — left an empty table and a one-line status, with a
+    /// large file's index gone and nothing to do but open it again.
+    #[test]
+    fn a_failed_session_start_keeps_the_loaded_log() {
+        let mut h = harness();
+        h.step();
+        inject(h.state_mut(), 20);
+        let viewed = std::env::temp_dir().join("lf_failed_run_source.log");
+        h.state_mut().model.write_recover().file_path = Some(viewed.clone());
+        h.state_mut().refilter();
+
+        // An override that cannot be spawned, so the failure is deterministic
+        // and needs no device.
+        h.state_mut().cfg.device.adb_path = Some("/nonexistent/path/to/adb".into());
+        h.state_mut().transport = Transport::Adb;
+        h.state_mut().selected_cmd = "logcat".into();
+        let epoch_before = h.state().source_epoch.load(Ordering::Acquire);
+
+        h.state_mut().run_session();
+
+        let app = h.state();
+        assert!(app.session.is_none(), "no session should be installed");
+        assert!(!app.status.is_empty(), "the failure must be reported");
+        assert_eq!(
+            app.model.read_recover().entries.len(),
+            20,
+            "the loaded log must survive a failed session start"
+        );
+        assert_eq!(
+            app.model.read_recover().file_path.as_deref(),
+            Some(viewed.as_path()),
+            "the source must still be the file the user had open"
+        );
+        assert_eq!(
+            app.source_epoch.load(Ordering::Acquire),
+            epoch_before,
+            "nothing was replaced, so the epoch must not advance"
+        );
+        assert!(
+            app.recording.is_none(),
+            "no recording should be installed either"
+        );
     }
 
     // ─── FilterSpec sync ─────────────────────────────────────────────────
