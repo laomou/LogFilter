@@ -181,7 +181,7 @@ pub fn binary_path(transport: Transport, override_path: Option<&str>) -> Result<
             if let Ok(local) = std::env::var("LOCALAPPDATA") {
                 let candidate = PathBuf::from(local).join("Android/Sdk/platform-tools/adb.exe");
                 if candidate.exists() {
-                    return candidate;
+                    return Ok(candidate);
                 }
             }
         }
