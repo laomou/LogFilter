@@ -140,27 +140,40 @@ pub fn default_commands(transport: Transport) -> Vec<String> {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Build a Command for the transport's binary, suppressing console popups on Windows.
-fn transport_command(transport: Transport, override_path: Option<&str>) -> Command {
+fn transport_command(transport: Transport, override_path: Option<&str>) -> Result<Command> {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(binary_path(transport, override_path));
+    let mut cmd = Command::new(binary_path(transport, override_path)?);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd
+    Ok(cmd)
 }
 
 /// Locate the transport's executable (adb / hdc). If the user set an explicit
 /// path in config, use that. Otherwise return the bare name and let
 /// `std::process::Command` resolve it against PATH (Rust searches PATHEXT on
 /// Windows). Windows-only fallback for adb: the Android Studio install location.
-pub fn binary_path(transport: Transport, override_path: Option<&str>) -> PathBuf {
+///
+/// An override that does not name a runnable file is an error rather than a
+/// fallback. Silently dropping back to PATH would run a *different* adb, with
+/// its own server and its own set of visible devices, which is the one outcome
+/// the override exists to prevent; a typo would look like "no devices found".
+pub fn binary_path(transport: Transport, override_path: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
+        // `is_file` rather than `exists`: a directory satisfies `exists`, then
+        // fails to spawn with EACCES, which the caller reports as "is it on
+        // PATH?" — pointing the user away from the actual mistake.
+        if !pb.is_file() {
+            return Err(anyhow!(
+                "configured {} path is not a runnable file: {}",
+                transport.binary(),
+                pb.display()
+            ));
         }
+        return Ok(pb);
     }
     #[cfg(target_os = "windows")]
     {
@@ -173,12 +186,12 @@ pub fn binary_path(transport: Transport, override_path: Option<&str>) -> PathBuf
             }
         }
     }
-    PathBuf::from(transport.binary())
+    Ok(PathBuf::from(transport.binary()))
 }
 
 pub fn list_devices(transport: Transport, override_path: Option<&str>) -> Result<Vec<String>> {
     let bin = transport.binary();
-    let out = transport_command(transport, override_path)
+    let out = transport_command(transport, override_path)?
         .args(transport.list_args())
         .output()
         .map_err(|e| anyhow!("failed to spawn `{bin}`: {e} (is {bin} on PATH?)"))?;
@@ -365,14 +378,21 @@ impl Session {
         output: Output,
         epoch: u64,
     ) -> Result<Self> {
-        let mut command = transport_command(transport, override_path);
+        let mut command = transport_command(transport, override_path)?;
         if let Some(d) = device {
             command.arg(transport.device_flag()).arg(d);
         }
         // Split the command string respecting shell quoting (e.g. `logcat -s "My Tag"`).
-        // Falls back to simple whitespace split if the string is not valid shell syntax.
+        //
+        // `shlex::split` returns None precisely when the string is not valid
+        // shell syntax — an unbalanced quote or a trailing backslash. Falling
+        // back to a whitespace split would pass the literal quote through as
+        // argv (`-s "My Tag` becomes `-s`, `"My`, `Tag`), so the device filters
+        // on the tag `"My` plus a stray operand and the user sees nothing but
+        // "session ended". There is no injection risk either way — no shell is
+        // involved — but a refusal is the only honest answer.
         let args = shlex::split(cmd)
-            .unwrap_or_else(|| cmd.split_whitespace().map(str::to_string).collect());
+            .ok_or_else(|| anyhow!("unbalanced quotes or trailing backslash in command: {cmd}"))?;
         for tok in args {
             command.arg(tok);
         }
@@ -845,6 +865,58 @@ mod tests {
         assert_eq!(Transport::Hdc.device_flag(), "-t");
         assert_eq!(Transport::Adb.list_args(), ["devices"]);
         assert_eq!(Transport::Hdc.list_args(), ["list", "targets"]);
+    }
+
+    /// A configured binary path must be honoured or reported, never silently
+    /// replaced by whatever `adb` happens to be on PATH: that would be a
+    /// different server with a different set of visible devices, and a typo
+    /// would present as "no devices found".
+    #[test]
+    fn a_bad_binary_override_is_reported_instead_of_falling_back_to_path() {
+        // No override: the bare name, resolved against PATH by Command.
+        assert_eq!(
+            binary_path(Transport::Adb, None).unwrap(),
+            PathBuf::from("adb")
+        );
+
+        // A real file is used as given.
+        assert_eq!(
+            binary_path(Transport::Adb, Some("/bin/sh")).unwrap(),
+            PathBuf::from("/bin/sh")
+        );
+
+        for bad in ["/nonexistent/path/to/adb", "", "/tmp"] {
+            let err = binary_path(Transport::Adb, Some(bad))
+                .expect_err("a non-file override must be an error");
+            assert!(
+                err.to_string().contains("not a runnable file"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    /// `shlex::split` returns None exactly when the command is not valid shell
+    /// syntax. The old whitespace-split fallback passed the literal quote
+    /// through as argv, so `-s "My Tag` filtered on the tag `"My` and the user
+    /// saw only "session ended".
+    #[test]
+    fn an_unbalanced_quote_in_the_command_is_refused() {
+        let (tx, _rx) = log_channel();
+        let result = Session::start(
+            Transport::Adb,
+            Some("/bin/sh"),
+            None,
+            "-c 'logcat -s \"My Tag",
+            tx,
+            1,
+        );
+        match result {
+            Ok(_) => panic!("an unbalanced quote must not be split on whitespace"),
+            Err(e) => assert!(
+                e.to_string().contains("unbalanced quotes"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[test]

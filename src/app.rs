@@ -245,6 +245,30 @@ pub enum PickerCol {
     Tag,
 }
 
+/// Result of checking an export destination against the file in the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestCheck {
+    /// Provably a different file, or nothing there at all.
+    Distinct,
+    /// Provably the same file as the one on screen.
+    SameAsViewed,
+    /// Could not be determined. Treated as a refusal, but with its own message
+    /// so the user is not told the destination is the viewed file when what
+    /// actually happened is that it could not be inspected.
+    Unverifiable,
+}
+
+impl DestCheck {
+    /// The message to show when the export must not proceed, or `None` to allow it.
+    fn refusal(self) -> Option<String> {
+        match self {
+            DestCheck::Distinct => None,
+            DestCheck::SameAsViewed => Some(tr!("view_no_overwrite")),
+            DestCheck::Unverifiable => Some(tr!("view_overwrite_unverifiable")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PickerState {
     pub col: PickerCol,
@@ -1816,18 +1840,32 @@ impl App {
     ///
     /// Identity (device/inode, or volume/file index on Windows) is compared
     /// rather than the path text, so a symlink, a hardlink or a differently
-    /// spelled path to the same file is still recognised. A missing destination
-    /// is never the viewed file; nothing would be overwritten.
-    fn view_file_is(&self, dest: &Path) -> bool {
+    /// spelled path to the same file is still recognised.
+    ///
+    /// The undecidable cases return [`DestCheck::Unverifiable`] rather than
+    /// "distinct". The entire point of the check is that the viewed file is the
+    /// user's only copy of the source log, so an error must not be read as
+    /// permission to overwrite it — a `stat` failure on a network mount used to
+    /// be enough to disable the guard. A missing destination is the exception
+    /// and is genuinely distinct: it is the normal "save under a new name" case,
+    /// and there is nothing there to overwrite.
+    fn view_file_is(&self, dest: &Path) -> DestCheck {
         let Some(viewed) = self.model.read_recover().file_path.clone() else {
-            return false;
+            return DestCheck::Distinct;
         };
-        let (Ok(dest_file), Ok(viewed_file)) =
-            (std::fs::File::open(dest), std::fs::File::open(&viewed))
-        else {
-            return false;
+        let dest_file = match std::fs::File::open(dest) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DestCheck::Distinct,
+            Err(_) => return DestCheck::Unverifiable,
         };
-        crate::io::same_file(&dest_file, &viewed_file).unwrap_or(false)
+        let Ok(viewed_file) = std::fs::File::open(&viewed) else {
+            return DestCheck::Unverifiable;
+        };
+        match crate::io::same_file(&dest_file, &viewed_file) {
+            Ok(true) => DestCheck::SameAsViewed,
+            Ok(false) => DestCheck::Distinct,
+            Err(_) => DestCheck::Unverifiable,
+        }
     }
 
     fn save_filtered(&mut self) {
@@ -1850,8 +1888,8 @@ impl App {
                 else {
                     return;
                 };
-                if self.view_file_is(&destination) {
-                    self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+                if let Some(reason) = self.view_file_is(&destination).refusal() {
+                    self.status = tr!("status_save_failed", { e: &reason });
                     return;
                 }
                 let (tx, rx) = bounded(1);
@@ -1966,8 +2004,8 @@ impl App {
         // and the save dialog opens in its directory with a name that invites
         // picking it. The recording paths protect themselves the same way (see
         // `recording::export`); this is the local-file equivalent.
-        if self.view_file_is(&dest) {
-            self.status = tr!("status_save_failed", { e: &tr!("view_no_overwrite") });
+        if let Some(reason) = self.view_file_is(&dest).refusal() {
+            self.status = tr!("status_save_failed", { e: &reason });
             return;
         }
 
@@ -6011,22 +6049,40 @@ mod tests {
         std::fs::write(&path, b"x\n").unwrap();
         let app = App::new_for_test(&egui::Context::default());
         app.model.write_recover().file_path = Some(path.clone());
-        assert!(app.view_file_is(&path), "the viewed file must be refused");
-        assert!(!app.view_file_is(&tmp_txt("view_guard_other")));
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::SameAsViewed,
+            "the viewed file must be refused"
+        );
+        assert_eq!(
+            app.view_file_is(&tmp_txt("view_guard_other")),
+            DestCheck::Distinct,
+            "a destination that does not exist is the normal save-as case"
+        );
         #[cfg(unix)]
         {
             let link = tmp_txt("view_guard_link");
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(
+            assert_eq!(
                 app.view_file_is(&link),
+                DestCheck::SameAsViewed,
                 "a symlink to the viewed file must be refused too"
             );
             std::fs::remove_file(&link).unwrap();
         }
+        // The guard must fail closed: when the viewed file can no longer be
+        // inspected, "can't tell" must not be reported as "safe to overwrite".
+        app.model.write_recover().file_path = Some(tmp_txt("view_guard_vanished"));
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::Unverifiable,
+            "an uninspectable viewed file must not disable the guard"
+        );
         app.model.write_recover().file_path = None;
-        assert!(
-            !app.view_file_is(&path),
+        assert_eq!(
+            app.view_file_is(&path),
+            DestCheck::Distinct,
             "no viewed file → nothing to protect"
         );
         std::fs::remove_file(path).unwrap();
