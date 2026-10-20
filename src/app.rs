@@ -7053,11 +7053,34 @@ mod ui_tests {
         assert!(!h.state().model.read().unwrap().entries.is_empty());
         assert!(!h.state().selected_rows.is_empty());
 
+        // The view is replaced when the session actually starts, and not before:
+        // a failed start now keeps the loaded log (see
+        // `a_failed_session_start_keeps_the_loaded_log`). Point the transport at
+        // a stand-in that is certain to spawn, so the clearing path is exercised
+        // without depending on adb being installed — this assertion used to pass
+        // on a developer machine with adb on PATH and fail on CI without it.
+        #[cfg(unix)]
+        {
+            h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
+            h.state_mut().transport = Transport::Adb;
+            h.state_mut().selected_cmd = "-c 'exec sleep 30'".into();
+        }
+
         h.state_mut().run_session();
-        // Regardless of whether adb spawned, model and selection must be cleared
-        assert!(h.state().model.read().unwrap().entries.is_empty());
-        assert!(h.state().selected_rows.is_empty());
-        assert_eq!(h.state().selection_anchor, None);
+
+        let started = h.state().session.is_some();
+        let cleared = h.state().model.read().unwrap().entries.is_empty();
+        assert_eq!(
+            started, cleared,
+            "the view must be replaced exactly when the session starts"
+        );
+        #[cfg(unix)]
+        assert!(started, "the stand-in binary must have spawned");
+        if started {
+            assert!(h.state().selected_rows.is_empty());
+            assert_eq!(h.state().selection_anchor, None);
+        }
+        h.state_mut().stop_session();
     }
 
     #[test]
