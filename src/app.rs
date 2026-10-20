@@ -589,9 +589,7 @@ impl App {
             epoch
         };
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         if source_changed {
             self.reset_column_filters();
         }
@@ -673,12 +671,10 @@ impl App {
             model.clear();
             model.file_path = Some(path.to_path_buf());
         }
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
-        self.pending_scroll = None;
+        self.reset_row_view();
+        // Unlike the in-memory and recording views, the paged view does not
+        // follow appends, so tailing has nothing to do here.
         self.auto_scroll = false;
-        self.cached_picker_col = None;
         self.record_full_reported = false;
         *self.load_error.lock_recover() = None;
         *self.reload_request.lock_recover() = None;
@@ -765,11 +761,7 @@ impl App {
                     // `replace_page` clears row-index bookmarks with the rest of the
                     // cache; restore the ones that belong to this page.
                     self.sync_paged_bookmarks();
-                    self.selected_rows.clear();
-                    self.selection_anchor = None;
-                    self.selection_cursor = None;
-                    self.pending_scroll = None;
-                    self.cached_picker_col = None;
+                    self.reset_row_view();
                     self.refilter();
                     if let Some(line) = goto {
                         let selected = {
@@ -1483,9 +1475,7 @@ impl App {
             epoch
         };
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         // Keep the column-picker filters (level/PID/TID/tag): Run/Restart
         // re-monitor the same device/app, so the values stay relevant — unlike a
         // file open, which switches to an unrelated source.
@@ -1591,9 +1581,7 @@ impl App {
             }
         }
         self.record_full_reported = false;
-        self.selected_rows.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
+        self.reset_row_view();
         self.notify_filter();
     }
 
@@ -1642,11 +1630,7 @@ impl App {
             }
         }
         if evicted {
-            self.selected_rows.clear();
-            self.selection_anchor = None;
-            self.selection_cursor = None;
-            self.pending_scroll = None;
-            self.cached_picker_col = None;
+            self.reset_row_view();
             self.refilter();
         } else if appended {
             let (lock, wake) = &*self.wake;
@@ -1702,6 +1686,28 @@ impl App {
         self.ui.allowed_tags = None;
         self.ui.disallowed_tags.clear();
         self.ui.allowed_levels = None;
+    }
+
+    /// Drop everything that refers to a row by its index.
+    ///
+    /// Every caller is about to invalidate those indices — by clearing the
+    /// model, replacing the paged window, or evicting from the front of the
+    /// cache — and a surviving index does not fail, it silently points at an
+    /// unrelated row: a selection the user never made, or a scroll to an
+    /// arbitrary position.
+    ///
+    /// This deliberately excludes the source-level state (epoch, format hint,
+    /// `recording_full`) and `auto_scroll`, which the paged view turns off
+    /// because it does not tail while the in-memory and recording views keep
+    /// following appends. The column-picker cache is keyed on
+    /// `(column, entry count)` and so usually self-invalidates, but two
+    /// datasets can share a count; dropping it here closes that window.
+    fn reset_row_view(&mut self) {
+        self.selected_rows.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.pending_scroll = None;
+        self.cached_picker_col = None;
     }
 
     /// Tab-separated text of an entry's *visible* columns, in display order, so a
@@ -7131,6 +7137,48 @@ mod ui_tests {
         assert!(h.state().detected_encoding.lock_recover().is_none());
         h.state_mut().clear();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Switching source must not leave the view pointing at rows that no longer
+    /// exist. The selection, the scroll request and the column-picker cache are
+    /// all keyed on a row index or an entry count, and every one of them used to
+    /// be cleared at some reset sites but not others; see `reset_row_view`.
+    #[test]
+    fn opening_a_file_drops_a_selection_and_scroll_from_the_previous_source() {
+        let mut h = harness();
+        h.run();
+        inject(h.state_mut(), 20);
+        h.run();
+
+        // Establish a selection, a cursor, an anchor and a pending scroll.
+        h.state_mut().goto_line(7);
+        h.state_mut().selection_anchor = Some(7);
+        h.state_mut().cached_picker_col = Some(PickerCol::Tag);
+        assert!(h.state().selected_rows.contains(&7));
+        assert_eq!(h.state().pending_scroll, Some(7));
+
+        let tmp =
+            std::env::temp_dir().join(format!("lf_reset_row_view_{}.log", std::process::id()));
+        std::fs::write(&tmp, "01-01 10:00:00.000  100  200 I Other: only line\n").unwrap();
+        h.state_mut().open_file(&tmp).unwrap();
+
+        let app = h.state();
+        assert!(
+            app.selected_rows.is_empty(),
+            "a selection from the previous source must not survive"
+        );
+        assert_eq!(app.selection_anchor, None, "anchor must not survive");
+        assert_eq!(app.selection_cursor, None, "cursor must not survive");
+        assert_eq!(
+            app.pending_scroll, None,
+            "a scroll to a row of the previous source must not survive"
+        );
+        assert_eq!(
+            app.cached_picker_col, None,
+            "the picker cache is keyed on entry count, which two sources can share"
+        );
+
+        std::fs::remove_file(tmp).unwrap();
     }
 
     #[test]
