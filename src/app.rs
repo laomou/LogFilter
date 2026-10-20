@@ -1504,6 +1504,7 @@ impl App {
             }
         };
         let recorded = writer.state.clone();
+        let previous_last_recording = self.last_recording.clone();
         self.last_recording = Some(recorded.clone());
 
         let device = if self.selected_device.is_empty() {
@@ -1528,6 +1529,16 @@ impl App {
         ) {
             Ok(s) => s,
             Err(e) => {
+                // The writer was consumed by the spawn attempt and no session
+                // will ever write to its file, so the fragment it created can
+                // never receive a line: don't leave it in the recordings
+                // directory. In the rare stderr-worker spawn failure a still-
+                // draining reader can hold the file open; the removal then
+                // fails silently and the file stays, as before.
+                let _ = std::fs::remove_file(&recorded.path);
+                // A failed start destroys nothing (see the handover comment):
+                // a recording that never started is not the last one.
+                self.last_recording = previous_last_recording;
                 self.status = tr!("status_dev_start_failed", { tool: self.transport.binary(), e: &format!("{}", e) });
                 return;
             }
@@ -6731,6 +6742,46 @@ mod ui_tests {
         assert!(
             app.recording.is_none(),
             "no recording should be installed either"
+        );
+    }
+
+    /// A failed Run must not leave an empty fragment of the recording file it
+    /// created behind. The writer is created before the spawn — the step that
+    /// actually fails — so without cleanup every aborted Run littered the
+    /// recordings directory with a zero-byte file that looks like a capture.
+    #[test]
+    fn a_failed_session_start_leaves_no_recording_fragment() {
+        let mut h = harness();
+        h.step();
+        // An override that cannot be spawned, so the failure is deterministic
+        // and needs no device.
+        h.state_mut().cfg.device.adb_path = Some("/nonexistent/path/to/adb".into());
+        h.state_mut().transport = Transport::Adb;
+        h.state_mut().selected_cmd = "logcat".into();
+
+        h.state_mut().run_session();
+
+        let dir = h
+            .state()
+            .recording_directory_override
+            .as_ref()
+            .unwrap()
+            .clone();
+        let leftover = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("logfilter_"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            leftover, 0,
+            "a failed start must not leave a fragment in the recordings directory {dir:?}"
+        );
+        assert!(
+            h.state().last_recording.is_none(),
+            "a recording that never started is not the last one"
         );
     }
 

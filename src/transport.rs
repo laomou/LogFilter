@@ -550,8 +550,11 @@ impl Session {
     /// The I/O error that stopped the reader, if it stopped for that reason.
     ///
     /// `None` means the stream ended normally (EOF); see [`Self::stdout_ended`].
+    /// A poisoned lock still yields its value: the writer sets this *before* it
+    /// can panic elsewhere, and reporting "ended normally" for a capture that
+    /// failed is the one answer that is certainly wrong.
     pub fn read_error_text(&self) -> Option<String> {
-        self.read_error.lock().ok().and_then(|g| g.clone())
+        self.read_error.lock_recover().clone()
     }
 
     /// Snapshot of any stderr captured from the adb child so far.
@@ -611,6 +614,12 @@ impl Session {
     /// would keep every exited session "running" forever — no end-of-capture in
     /// the UI, and the worker and its buffer never released. Since stderr is now
     /// published as it arrives, giving up on the EOF costs no diagnostics.
+    ///
+    /// The grace period is measured against these calls, not in the background:
+    /// while the UI is not rendering (window hidden or the event loop starved)
+    /// nothing polls, so completion is deferred to the next repaint rather than
+    /// lost — the UI is the only consumer of it, and `exited_at` is real time,
+    /// so a long deferral costs nothing on the first poll after it.
     pub fn try_reap(&mut self) -> std::io::Result<bool> {
         if self.stop_requested.load(Ordering::Acquire) {
             self.stop();
