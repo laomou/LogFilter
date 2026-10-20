@@ -823,9 +823,11 @@ mod tests {
 
     /// A failed backup move must remove the reserved placeholder again: an
     /// empty `*.bak` file is exactly what a user would mistake for a copy of
-    /// their settings, the opposite of what the backup exists to ensure. A
-    /// non-empty directory cannot be renamed onto a file on any supported
-    /// platform, so it is the deterministic stand-in for a failed rename.
+    /// their settings, the opposite of what the backup exists to ensure.
+    ///
+    /// A source that does not exist is the stand-in for a failed rename: it
+    /// fails identically on every platform, unlike renaming a directory onto a
+    /// file, which unix rejects but Windows allows.
     #[test]
     fn a_failed_backup_move_leaves_no_empty_placeholder() {
         let dir = tempdir_new();
@@ -833,18 +835,15 @@ mod tests {
         let backup = dir.join("config.toml.1.1.bak");
         std::fs::write(&backup, b"").unwrap();
         let original = dir.join("config.toml");
-        std::fs::create_dir_all(&original).unwrap();
-        std::fs::write(original.join("nested"), b"x").unwrap();
 
         assert!(
             move_to_backup(&original, &backup).is_err(),
-            "renaming a non-empty directory onto a file must fail"
+            "renaming a source that does not exist must fail"
         );
         assert!(
             !backup.exists(),
             "a failed move must not leave the empty placeholder behind"
         );
-        assert!(original.exists(), "the original must stay in place");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
