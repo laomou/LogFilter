@@ -128,6 +128,9 @@ pub struct App {
     exit_recording_error: Option<String>,
     recording_directory: Option<recording::RecordingDirectory>,
     recording_directory_override: Option<PathBuf>,
+    /// Whether the Recent submenu was open on the previous frame, so the dead-link
+    /// prune runs on the rising edge instead of on every repaint.
+    recent_menu_open: bool,
     disk_budget: Arc<recording::DiskBudget>,
     pub devices: Vec<String>,
     /// Whether a device probe already reported to the status bar. The startup
@@ -507,6 +510,7 @@ impl App {
             exit_recording_error: None,
             recording_directory: None,
             recording_directory_override: None,
+            recent_menu_open: false,
             disk_budget,
             devices: Vec::new(),
             devices_probed: false,
@@ -3577,21 +3581,36 @@ impl App {
                         }
                         ui.close();
                     }
+                    let mut recent_open_now = false;
                     ui.menu_button(tr!("recent"), |ui| {
+                        recent_open_now = true;
                         // Prune entries whose file no longer exists so the list
                         // doesn't accumulate dead links.
-                        config::prune_missing_recent(&mut self.cfg);
-                        let recent = self.cfg.recent.files.clone();
-                        if recent.is_empty() {
+                        //
+                        // Only when the submenu opens. This is one `exists()`
+                        // per entry, and it ran on every repaint while the menu
+                        // was on screen — around 600 `stat` calls a second at
+                        // 60 fps. On a path into an unmounted network share or
+                        // an unplugged drive, `exists()` blocks until the kernel
+                        // gives up, so the window froze for as long as the
+                        // pointer rested on the one menu whose whole purpose is
+                        // to list such paths.
+                        if !self.recent_menu_open {
+                            config::prune_missing_recent(&mut self.cfg);
+                        }
+                        if self.cfg.recent.files.is_empty() {
                             ui.label(tr!("recent_empty"));
                         }
-                        for p in recent {
+                        // Borrowed, not cloned: this used to copy up to ten
+                        // PathBufs per frame.
+                        for p in &self.cfg.recent.files {
                             if ui.button(p.display().to_string()).clicked() {
-                                recent_open = Some(p);
+                                recent_open = Some(p.clone());
                                 ui.close();
                             }
                         }
                     });
+                    self.recent_menu_open = recent_open_now;
                     ui.separator();
                     if ui.button(tr!("save_filtered")).clicked() {
                         self.save_filtered();

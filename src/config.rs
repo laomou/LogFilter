@@ -346,9 +346,19 @@ fn load_config_file(path: &std::path::Path) -> ConfigFile {
 /// A timestamped backup path, so a second failure cannot destroy the only copy of
 /// the user's original settings.
 ///
-/// The name is made unique against the filesystem rather than assumed unique from
-/// the clock: two failures inside the same second would otherwise pick the same
-/// name and the second rename would overwrite the first backup.
+/// The name is *reserved*, not merely tested. `exists()` followed by a `rename`
+/// by the caller is a race: two instances failing inside the same second both
+/// see the same name free, and the second rename then overwrites the first
+/// backup — precisely the loss this function exists to prevent. Creating the
+/// file with `create_new` makes the winner unambiguous, and the caller's rename
+/// replaces the empty placeholder.
+///
+/// The process id is in the name as well, so concurrent instances do not even
+/// contend in the common case.
+///
+/// Old backups are deliberately never deleted. One accumulates per failed load,
+/// which is rare, and each is a copy of settings the user may not have anywhere
+/// else; a few kilobytes is the cheaper side of that trade.
 fn backup_path(path: &std::path::Path) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -358,11 +368,23 @@ fn backup_path(path: &std::path::Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
-    let mut candidate = path.with_file_name(format!("{name}.{stamp}.bak"));
-    let mut sequence = 1;
-    while candidate.exists() {
-        candidate = path.with_file_name(format!("{name}.{stamp}.{sequence}.bak"));
-        sequence += 1;
+    let pid = std::process::id();
+    let mut candidate = path.with_file_name(format!("{name}.{stamp}.{pid}.bak"));
+    for sequence in 1..1000 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = path.with_file_name(format!("{name}.{stamp}.{pid}.{sequence}.bak"));
+            }
+            // The name cannot be reserved for some other reason (read-only
+            // directory, no permission). Hand it back and let the caller's
+            // rename surface the real problem rather than masking it here.
+            Err(_) => return candidate,
+        }
     }
     candidate
 }
