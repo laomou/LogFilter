@@ -315,7 +315,7 @@ fn load_config_file(path: &std::path::Path) -> ConfigFile {
         Err(e) => {
             let cfg = recover_config(&text);
             let backup = backup_path(path);
-            let kept = std::fs::rename(path, &backup);
+            let kept = move_to_backup(path, &backup);
             // Write the recovered settings back immediately. The rename above
             // moved the only config away, and the caller only saves when the
             // serialized config *differs* from what it loaded — so without this
@@ -351,7 +351,9 @@ fn load_config_file(path: &std::path::Path) -> ConfigFile {
 /// see the same name free, and the second rename then overwrites the first
 /// backup — precisely the loss this function exists to prevent. Creating the
 /// file with `create_new` makes the winner unambiguous, and the caller's rename
-/// replaces the empty placeholder.
+/// replaces the empty placeholder. When that rename fails, the caller removes
+/// the placeholder again (see `move_to_backup`), so a failed backup cannot
+/// leave behind an empty file that looks like a backup.
 ///
 /// The process id is in the name as well, so concurrent instances do not even
 /// contend in the common case.
@@ -387,6 +389,22 @@ fn backup_path(path: &std::path::Path) -> PathBuf {
         }
     }
     candidate
+}
+
+/// Move the corrupt `original` onto its reserved `backup` name.
+///
+/// When the move fails, the empty placeholder `backup_path` reserved is
+/// removed again: a failed rename means the original never left its place,
+/// and an empty file named `*.bak` is exactly what a user would mistake for
+/// a backup of their settings — the opposite of what this exists to ensure.
+fn move_to_backup(original: &std::path::Path, backup: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(original, backup) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(backup);
+            Err(e)
+        }
+    }
 }
 
 /// Build a config from whatever part of a corrupt file still parses.
@@ -801,6 +819,33 @@ mod tests {
             "each failed load must keep its own backup"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A failed backup move must remove the reserved placeholder again: an
+    /// empty `*.bak` file is exactly what a user would mistake for a copy of
+    /// their settings, the opposite of what the backup exists to ensure. A
+    /// non-empty directory cannot be renamed onto a file on any supported
+    /// platform, so it is the deterministic stand-in for a failed rename.
+    #[test]
+    fn a_failed_backup_move_leaves_no_empty_placeholder() {
+        let dir = tempdir_new();
+        // The reserved placeholder, as `backup_path` would create it.
+        let backup = dir.join("config.toml.1.1.bak");
+        std::fs::write(&backup, b"").unwrap();
+        let original = dir.join("config.toml");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::write(original.join("nested"), b"x").unwrap();
+
+        assert!(
+            move_to_backup(&original, &backup).is_err(),
+            "renaming a non-empty directory onto a file must fail"
+        );
+        assert!(
+            !backup.exists(),
+            "a failed move must not leave the empty placeholder behind"
+        );
+        assert!(original.exists(), "the original must stay in place");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
