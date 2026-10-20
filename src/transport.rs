@@ -614,6 +614,12 @@ impl Session {
     /// would keep every exited session "running" forever — no end-of-capture in
     /// the UI, and the worker and its buffer never released. Since stderr is now
     /// published as it arrives, giving up on the EOF costs no diagnostics.
+    ///
+    /// The grace period is measured against these calls, not in the background:
+    /// while the UI is not rendering (window hidden or the event loop starved)
+    /// nothing polls, so completion is deferred to the next repaint rather than
+    /// lost — the UI is the only consumer of it, and `exited_at` is real time,
+    /// so a long deferral costs nothing on the first poll after it.
     pub fn try_reap(&mut self) -> std::io::Result<bool> {
         if self.stop_requested.load(Ordering::Acquire) {
             self.stop();
