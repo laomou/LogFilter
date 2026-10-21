@@ -674,19 +674,57 @@ impl Session {
         // Neither process exit nor pipe closure is guaranteed to be immediate.
         // In particular, descendants may retain stdout/stderr after the direct
         // child dies. Stop, Restart, file-open and Drop must never join on the UI.
-        if let Err(e) = thread::Builder::new()
-            .name("device-reap".into())
-            .spawn(move || {
-                let _ = child.wait();
+        // The child lives in a slot shared with the error path: the worker
+        // takes it out when it runs, and if spawning the worker itself fails
+        // the slot is what lets stop() recover the child instead of dropping
+        // it (a dropped `Child` is never reaped by std and stays a zombie).
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        if let Err(e) = thread::Builder::new().name("device-reap".into()).spawn({
+            let slot = child_slot.clone();
+            move || {
+                if let Some(mut child) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    let _ = child.wait();
+                }
                 if let Some(handle) = reader {
                     let _ = handle.join();
                 }
                 if let Some(handle) = stderr {
                     let _ = handle.join();
                 }
-            })
-        {
-            tracing::warn!("failed to spawn device cleanup worker: {e}");
+            }
+        }) {
+            // Degraded cleanup. `wait()` is off the table — stop must never
+            // block the UI — so:
+            //  1. reap inline if the child has already exited (non-blocking);
+            //  2. otherwise hand the child back to the session so the next
+            //     `stop()`/`try_reap()` — including the session's `Drop` when
+            //     the UI releases it — retries the cleanup.
+            // The reader/stderr handles are abandoned: those threads exit on
+            // pipe EOF on their own, and the UI has stopped polling them.
+            // The slot is shared with the worker above, but a spawn failure
+            // means the worker never ran, so the child is still here — unless
+            // this ever becomes impossible, in which case there is simply
+            // nothing left to recover.
+            let child = child_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            match child {
+                Some(mut child) => {
+                    let reaped = child.try_wait().is_ok_and(|status| status.is_some());
+                    if !reaped {
+                        self.child = Some(child);
+                    }
+                    tracing::warn!(
+                        "failed to spawn device cleanup worker: {e}; {}",
+                        if reaped {
+                            "child was reaped inline"
+                        } else {
+                            "child kept for the next reap poll"
+                        }
+                    );
+                }
+                None => tracing::warn!(
+                    "failed to spawn device cleanup worker: {e}; no child handle left to recover"
+                ),
+            }
         }
     }
 
@@ -758,7 +796,13 @@ impl Session {
                 let _ = stderr.join();
             })
         {
-            tracing::warn!("failed to spawn stderr cleanup worker: {e}");
+            // Degraded cleanup: abandon the drain thread instead of blocking
+            // the UI on `join()`. It exits on its own when the pipe's last
+            // holder closes it (the child is already gone), and the captured
+            // stderr text stays readable through `stderr_text()` because the
+            // buffer is shared — only this thread handle leaks, and only for
+            // as long as a descendant keeps the pipe open.
+            tracing::warn!("failed to spawn stderr cleanup worker: {e}; abandoning drain thread");
         }
     }
 }

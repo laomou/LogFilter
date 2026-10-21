@@ -779,4 +779,95 @@ mod tests {
             }
         }
     }
+
+    /// The ingest and paged-scan threads latch the hint on the first
+    /// non-Unknown line and reuse it for the whole stream
+    /// (`source_format_hint` / `scan_index`). Real captures are rarely
+    /// homogeneous: a threadtime stream picks up hilog lines after a system
+    /// reboot, kernel lines after a panic, and unparsed garbage around
+    /// them. This regression pins that a *stale latched hint* never changes
+    /// what a row of a different format yields.
+    #[test]
+    fn latched_hint_survives_a_real_mixed_format_stream() {
+        // Verbatim shapes from real captures, interleaved the way they arrive:
+        // the stream starts threadtime, latches, then hilog, kernel, epoch,
+        // brief and unknown lines follow under the same stale hint.
+        let stream = [
+            "01-01 12:34:56.789  1234  5678 I ActivityManager: Start proc 987",
+            "01-01 12:34:56.790  1234  5679 D Gralloc: buffer acquired",
+            "08-07 12:02:47.772 23643 23643 I A02F08/com.huawei.hmos.brid/Sec: local RiskFactor is valid.",
+            "08-07 12:02:47.780     0     0 I I00000/HiLog: ========Zeroth log of type: init",
+            "<6>[ 12345.678901] kernel: thermal throttling active",
+            "1704067200.123  1234  5678 W ActivityManager: Start proc",
+            "W/Tag(  42): hi",
+            "01-01 12:34:56.789 I/ActivityManager( 1234): Start proc",
+            "totally random garbage",
+            "",
+            "01-01 12:34:56.800  1234  5678 I ActivityManager: Start proc 1001",
+        ];
+
+        // Parse the stream first with a clean Unknown hint as the reference,
+        // then replay it the way the latching threads do: hint = first
+        // non-Unknown format, held for everything after.
+        let mut reference = Vec::with_capacity(stream.len());
+        let mut formats = Vec::with_capacity(stream.len());
+        for line in &stream {
+            let (e, f) = parse_line(line.to_string());
+            reference.push((
+                e.date().to_string(),
+                e.time().to_string(),
+                e.pid().to_string(),
+                e.tid().to_string(),
+                e.tag().to_string(),
+                e.message().to_string(),
+                e.level,
+            ));
+            formats.push(f);
+        }
+
+        let mut hint = LogFormat::Unknown;
+        for (i, line) in stream.iter().enumerate() {
+            if hint == LogFormat::Unknown {
+                hint = formats[i];
+            }
+            let (e, _) = parse_line_hinted(line.to_string(), hint);
+            // Compare everything `FilterSpec::matches` and the table observe.
+            // The `LogFormat` label is deliberately excluded: a line that two
+            // patterns both claim (hilog ⊂ threadtime) may be labelled by
+            // whichever tried first, and nothing outside the parser consults
+            // it.
+            assert_eq!(
+                (
+                    e.date().to_string(),
+                    e.time().to_string(),
+                    e.pid().to_string(),
+                    e.tid().to_string(),
+                    e.tag().to_string(),
+                    e.message().to_string(),
+                    e.level,
+                ),
+                reference[i],
+                "stale latched hint {hint:?} changed a row: {line:?}"
+            );
+        }
+        assert_eq!(
+            hint,
+            LogFormat::ThreadTime,
+            "the stream latches on its first line"
+        );
+        // The stream really is mixed: at least three different formats must
+        // have been parsed, so the test is not a degenerate single-format run.
+        // The stream really is mixed: at least three different formats must
+        // have been parsed, so the test is not a degenerate single-format run.
+        let mut distinct = 0;
+        for (i, f) in formats.iter().enumerate() {
+            if !formats[..i].contains(f) {
+                distinct += 1;
+            }
+        }
+        assert!(
+            distinct >= 3,
+            "expected a genuinely mixed stream, got {distinct} formats"
+        );
+    }
 }

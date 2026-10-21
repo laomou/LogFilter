@@ -696,6 +696,151 @@ mod tests {
         cleanup(&state);
     }
 
+    /// Delivers `data` in whole, then — on the *next* read, after the data
+    /// has been written — arms `stop` and keeps serving filler bytes forever,
+    /// so the capture can only end through the stop check. Arming on the read
+    /// that returns the last data byte would drop that chunk: `copy_raw`
+    /// checks stop before writing, so stop must be observed one iteration
+    /// later, with the pipe still live (a device would never return EOF while
+    /// it holds the write end).
+    struct StopArmingReader {
+        state: Arc<Recording>,
+        data: Vec<u8>,
+        offset: usize,
+        stop_armed: bool,
+    }
+
+    impl Read for StopArmingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.stop_armed || self.offset >= self.data.len() {
+                self.state.stop.store(true, Ordering::Release);
+                self.stop_armed = true;
+                buf[..1].fill(b'x');
+                return Ok(1);
+            }
+            let n = buf.len().min(self.data.len() - self.offset);
+            buf[..n].copy_from_slice(&self.data[self.offset..self.offset + n]);
+            self.offset += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stop_leaves_a_consistent_prefix_and_unterminated_tail() {
+        // Stopping a live capture cuts the file mid-line. Everything written
+        // before the cut must be intact and accounted for: the on-disk bytes,
+        // `written`, the export and the preview must all agree on the
+        // unterminated tail.
+        let writer = writer();
+        let state = writer.state.clone();
+        let data = b"line one\nline two\npartial tail";
+        writer.record(StopArmingReader {
+            state: state.clone(),
+            data: data.to_vec(),
+            offset: 0,
+            stop_armed: false,
+        });
+
+        assert!(state.finished.load(Ordering::Acquire));
+        assert!(state.error.lock_recover().is_none());
+        assert_eq!(state.written.load(Ordering::Acquire), data.len() as u64);
+        assert_eq!(std::fs::read(&state.path).unwrap(), data);
+
+        // Export of the written snapshot keeps the partial tail byte for byte.
+        let filtered = state.path.with_extension("filtered");
+        let spec = FilterSpec {
+            find: vec!["partial".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            export(&state.path, data.len() as u64, &filtered, &spec).unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(&filtered).unwrap(),
+            b"partial tail",
+            "the unterminated tail must survive the export"
+        );
+        std::fs::remove_file(filtered).unwrap();
+
+        // The preview of a finished recording ends with the same partial line.
+        let rx = preview(
+            state.clone(),
+            0,
+            1,
+            Arc::new(AtomicU64::new(1)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        while let Ok(batch) = rx.recv_timeout(Duration::from_secs(5)) {
+            got.extend(batch.entries.into_iter().map(|e| e.raw().to_owned()));
+        }
+        assert_eq!(got, ["line one", "line two", "partial tail"]);
+        cleanup(&state);
+    }
+
+    #[test]
+    fn stop_with_an_oversized_final_line() {
+        // A final line longer than both the write block and the preview line
+        // cap, terminated by stop rather than a newline: the writer must keep
+        // every byte, the export must keep the whole line, and the preview
+        // must omit it as oversized instead of buffering it without bound.
+        let writer = writer();
+        let state = writer.state.clone();
+        let data = vec![b'A'; 2 * 1024 * 1024];
+        writer.record(StopArmingReader {
+            state: state.clone(),
+            data: data.clone(),
+            offset: 0,
+            stop_armed: false,
+        });
+
+        assert!(state.finished.load(Ordering::Acquire));
+        assert!(state.error.lock_recover().is_none());
+        assert_eq!(state.written.load(Ordering::Acquire), data.len() as u64);
+        assert_eq!(std::fs::read(&state.path).unwrap(), data);
+
+        let filtered = state.path.with_extension("filtered");
+        assert_eq!(
+            export(
+                &state.path,
+                data.len() as u64,
+                &filtered,
+                &FilterSpec::default()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(&filtered).unwrap(),
+            data,
+            "a line spanning many write blocks must survive stop + export"
+        );
+        std::fs::remove_file(filtered).unwrap();
+
+        let rx = preview(
+            state.clone(),
+            0,
+            1,
+            Arc::new(AtomicU64::new(1)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let mut entries = 0;
+        let mut omitted = 0;
+        while let Ok(batch) = rx.recv_timeout(Duration::from_secs(5)) {
+            entries += batch.entries.len();
+            omitted += batch.omitted;
+        }
+        assert_eq!(entries, 0);
+        assert_eq!(
+            omitted, 1,
+            "the oversized line is dropped from the preview, counted"
+        );
+        cleanup(&state);
+    }
+
     #[test]
     fn blocked_preview_cannot_block_or_buffer_the_recording() {
         let writer = writer();

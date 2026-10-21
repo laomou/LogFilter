@@ -21,15 +21,23 @@ pub const ESTIMATE_FROM_BYTES: u64 = 256 * 1024 * 1024;
 pub const FORCE_PAGING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAGE_ROWS: u64 = 5_000_000;
-/// How much of a file to read when estimating its mean line length.
+/// How much of *each end* of a file to read when estimating its mean line
+/// length.
 ///
-/// This read happens on the UI thread (the open path validates access and makes
-/// the paged/in-memory decision before handing off to a worker), so it is kept
-/// small: a few thousand lines already pin the mean, and on slow or spun-down
-/// media every extra megabyte is a visible freeze. Neither consumer needs
-/// precision — `should_page` only picks a strategy that `poll_paged` can fall
-/// back out of, and `sample_page_rows` only picks a page size that `fits_page`
-/// re-checks against the real byte budget while scanning.
+/// These reads happen on the UI thread (the open path validates access and
+/// makes the paged/in-memory decision before handing off to a worker), so
+/// each is kept small: a few thousand lines already pin the mean of its
+/// region, and on slow or spun-down media every extra megabyte is a visible
+/// freeze.
+///
+/// Both ends are sampled because a leading region alone cannot represent a
+/// file whose line lengths shift partway through, and `should_page` has no
+/// later correction: `fits_page` can shrink an over-large page while
+/// scanning, but nothing can bail out of an in-memory load that turned out
+/// not to fit. The estimator therefore takes the *pessimistic* (smallest)
+/// mean across the sampled regions — a short-line region anywhere in the
+/// sampled ends biases the decision toward paging, which is always the safe
+/// direction.
 const SAMPLE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -207,32 +215,63 @@ fn row_cost(bytes: u64) -> u64 {
         .saturating_add(crate::model::ENTRY_OVERHEAD + 8)
 }
 
-fn sample_page_rows(path: &Path, page_budget: u64) -> io::Result<u64> {
-    let (bytes, lines) = sample_lines(path)?;
-    let average = average_line_bytes(bytes, lines);
+/// Read the first `SAMPLE_BYTES` of the file and, when the file is longer
+/// than twice that, the last `SAMPLE_BYTES` as well.
+///
+/// Returns `[(head_bytes, head_lines), (tail_bytes, tail_lines)]`. For short
+/// files both entries describe the same sampled region, so the pessimistic
+/// mean below degrades gracefully to the whole-file sample.
+fn sample_regions(path: &Path, file_len: u64) -> io::Result<[(u64, u64); 2]> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let read = |file: &mut File, buffer: &mut [u8], want: u64| -> io::Result<(u64, u64)> {
+        let mut bytes = 0u64;
+        let mut lines = 0u64;
+        while bytes < want {
+            let want = (want - bytes).min(buffer.len() as u64) as usize;
+            let n = file.read(&mut buffer[..want])?;
+            if n == 0 {
+                break;
+            }
+            bytes += n as u64;
+            lines += buffer[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+        }
+        Ok((bytes, lines))
+    };
+    let head = read(&mut file, &mut buffer, file_len.min(SAMPLE_BYTES))?;
+    let tail = if file_len > 2 * SAMPLE_BYTES {
+        file.seek(SeekFrom::Start(file_len - SAMPLE_BYTES))?;
+        read(&mut file, &mut buffer, SAMPLE_BYTES)?
+    } else {
+        head
+    };
+    Ok([head, tail])
+}
+
+/// The pessimistic (smallest) mean line length across the sampled regions.
+///
+/// A smaller mean estimates more rows, and more rows estimate more memory, so
+/// both consumers err toward the safe side: `should_page` toward paging, and
+/// `sample_page_rows` toward smaller pages (which `fits_page` re-checks
+/// against the real byte budget while scanning). The tail sample can start
+/// mid-line; its truncated first fragment lowers that region's mean slightly,
+/// which also errs conservatively.
+fn conservative_average_line_bytes(regions: &[(u64, u64); 2]) -> u64 {
+    regions
+        .iter()
+        .map(|&(bytes, lines)| average_line_bytes(bytes, lines))
+        .min()
+        .unwrap_or(1)
+}
+
+fn sample_page_rows(path: &Path, file_len: u64, page_budget: u64) -> io::Result<u64> {
+    let average = conservative_average_line_bytes(&sample_regions(path, file_len)?);
     let estimated_entry = row_cost(average);
     let rows = page_budget
         .checked_div(estimated_entry.max(1))
         .unwrap_or(CHECKPOINT_ROWS)
         .clamp(CHECKPOINT_ROWS, MAX_PAGE_ROWS);
     Ok((rows / CHECKPOINT_ROWS) * CHECKPOINT_ROWS)
-}
-
-fn sample_lines(path: &Path) -> io::Result<(u64, u64)> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut bytes = 0u64;
-    let mut lines = 0u64;
-    while bytes < SAMPLE_BYTES {
-        let want = (SAMPLE_BYTES - bytes).min(buffer.len() as u64) as usize;
-        let n = file.read(&mut buffer[..want])?;
-        if n == 0 {
-            break;
-        }
-        bytes += n as u64;
-        lines += buffer[..n].iter().filter(|&&b| b == b'\n').count() as u64;
-    }
-    Ok((bytes, lines))
 }
 
 fn average_line_bytes(bytes: u64, lines: u64) -> u64 {
@@ -255,8 +294,7 @@ pub fn should_page(path: &Path, log_budget: u64) -> io::Result<bool> {
     if file_len >= FORCE_PAGING_BYTES {
         return Ok(true);
     }
-    let (sample_bytes, sample_lines) = sample_lines(path)?;
-    let average = average_line_bytes(sample_bytes, sample_lines);
+    let average = conservative_average_line_bytes(&sample_regions(path, file_len)?);
     let estimated_lines = file_len.div_ceil(average);
     Ok(should_page_estimate(file_len, estimated_lines, log_budget))
 }
@@ -282,7 +320,7 @@ pub fn build_index(
     ctx: egui::Context,
 ) -> io::Result<Arc<PagedIndex>> {
     let stamp = FileStamp::read(path)?;
-    let page_rows = sample_page_rows(path, page_budget)?;
+    let page_rows = sample_page_rows(path, stamp.len, page_budget)?;
     let index = PagedIndex::new(path.to_path_buf(), stamp, page_rows, page_budget);
     let worker = index.clone();
     std::thread::Builder::new()
@@ -767,8 +805,9 @@ mod tests {
     #[test]
     fn page_size_uses_more_rows_when_the_memory_budget_is_larger() {
         let path = file(10_000);
-        let small = sample_page_rows(&path, 4 * 1024 * 1024).unwrap();
-        let large = sample_page_rows(&path, 1024 * 1024 * 1024).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let small = sample_page_rows(&path, len, 4 * 1024 * 1024).unwrap();
+        let large = sample_page_rows(&path, len, 1024 * 1024 * 1024).unwrap();
         assert_eq!(small, CHECKPOINT_ROWS);
         assert!(large > small);
         assert!(large <= MAX_PAGE_ROWS);
@@ -786,6 +825,147 @@ mod tests {
         assert!(!should_page_estimate(2 * GIB, 2 * GIB / 4096, 8 * GIB));
         // Larger memory permits the short-row file to load whole.
         assert!(!should_page_estimate(2 * GIB, 2 * GIB / 50, 32 * GIB));
+    }
+
+    // -- Stress tests: line-length distributions that shift across the file. --
+    //
+    // `should_page` decides on the UI thread with no later correction for a
+    // wrong in-memory call, so these build real files above
+    // `ESTIMATE_FROM_BYTES` whose leading region misrepresents the rest and
+    // check the decision against the ground-truth row count.
+
+    /// 300 MiB: above `ESTIMATE_FROM_BYTES`, far below `FORCE_PAGING_BYTES`.
+    const STRESS_FILE_BYTES: u64 = 300 * 1024 * 1024;
+    const STRESS_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+
+    fn stress_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("lf_paged_stress_{name}_{}.log", std::process::id()))
+    }
+
+    /// Fill `region_len` bytes with `line_len`-byte lines of `filler` padding.
+    /// The last piece may be shorter than `line_len` and ends without a
+    /// newline, so regions may end mid-line.
+    fn write_region(f: &mut File, region_len: u64, line_len: u64, filler: u8) {
+        let mut line = vec![filler; line_len as usize];
+        line[line_len as usize - 1] = b'\n';
+        let mut written = 0u64;
+        while written < region_len {
+            let take = (region_len - written).min(line_len) as usize;
+            f.write_all(&line[..take]).unwrap();
+            written += take as u64;
+        }
+    }
+
+    #[test]
+    fn conservative_average_prefers_the_smaller_region_mean() {
+        // 8 KiB rows vs 50-byte rows + a 44-byte fragment, either order.
+        // div_ceil(262_144, 5_242) = 51: the fragment lifts the region mean.
+        assert_eq!(
+            conservative_average_line_bytes(&[(262_144, 32), (262_144, 5_242)]),
+            51
+        );
+        assert_eq!(
+            conservative_average_line_bytes(&[(262_144, 5_242), (262_144, 32)]),
+            51
+        );
+        assert_eq!(conservative_average_line_bytes(&[(100, 2), (100, 2)]), 50);
+        // A region with no newline at all is one (partial) line.
+        assert_eq!(conservative_average_line_bytes(&[(0, 0), (262_144, 32)]), 1);
+    }
+
+    #[test]
+    fn sample_regions_covers_both_ends() {
+        let path = stress_path("two_ends");
+        let mut f = File::create(&path).unwrap();
+        write_region(&mut f, SAMPLE_BYTES, 50, b'a'); // 5242 rows + 44-byte fragment
+        write_region(&mut f, 524_288, 50, b'b'); // middle
+        write_region(&mut f, SAMPLE_BYTES, 8192, b'c'); // 32 rows of 8 KiB
+        f.sync_all().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 1_048_576);
+        let regions = sample_regions(&path, len).unwrap();
+        assert_eq!(regions[0], (SAMPLE_BYTES, 5_242));
+        assert_eq!(regions[1], (SAMPLE_BYTES, 32));
+        // The 44-byte fragment at the end of the head region lifts its mean
+        // from 50 to div_ceil(262_144, 5_242) = 51.
+        assert_eq!(conservative_average_line_bytes(&regions), 51);
+        // Short files cannot sample two distinct ends: both entries describe
+        // the same region.
+        let short = file(100);
+        let short_len = std::fs::metadata(&short).unwrap().len();
+        let short_regions = sample_regions(&short, short_len).unwrap();
+        assert_eq!(short_regions[0], short_regions[1]);
+        std::fs::remove_file(&short).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn should_page_survives_a_long_head_before_a_short_body() {
+        // The dangerous misread: a verbose leading region makes a head-only
+        // sample over-estimate the mean line length, under-estimate the row
+        // count, and call a file that does not fit the budget "safe" to load
+        // whole.
+        let path = stress_path("long_head");
+        let head_lines = SAMPLE_BYTES / 8192; // exactly 32
+        let mut f = File::create(&path).unwrap();
+        write_region(&mut f, SAMPLE_BYTES, 8192, b'x');
+        write_region(&mut f, STRESS_FILE_BYTES - SAMPLE_BYTES, 50, b'y');
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, STRESS_FILE_BYTES);
+        // Ground truth: the body's 50-byte rows dominate the row count.
+        let true_lines = head_lines + (STRESS_FILE_BYTES - SAMPLE_BYTES).div_ceil(50);
+        assert!(
+            should_page_estimate(len, true_lines, STRESS_BUDGET),
+            "test setup: the ground truth must not fit the budget"
+        );
+        assert!(
+            should_page(&path, STRESS_BUDGET).unwrap(),
+            "a short-line body must not be hidden by a long head"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn should_page_is_conservative_for_a_short_head_before_a_long_body() {
+        // The safe misread: a terse leading region under-estimates the mean
+        // line length. Paging here costs nothing (the file fits), so the
+        // pessimistic mean should still bias the decision toward paging.
+        let path = stress_path("short_head");
+        let mut f = File::create(&path).unwrap();
+        // 5242 rows of 50 bytes plus a 44-byte fragment fill the head region.
+        write_region(&mut f, SAMPLE_BYTES, 50, b'y');
+        write_region(&mut f, STRESS_FILE_BYTES - SAMPLE_BYTES, 8192, b'x');
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, STRESS_FILE_BYTES);
+        let true_lines = SAMPLE_BYTES.div_ceil(50) + (STRESS_FILE_BYTES - SAMPLE_BYTES) / 8192;
+        assert!(
+            !should_page_estimate(len, true_lines, STRESS_BUDGET),
+            "test setup: the ground truth fits, so paging here is pure conservatism"
+        );
+        assert!(
+            should_page(&path, STRESS_BUDGET).unwrap(),
+            "the pessimistic mean must still bias toward paging"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn should_page_agrees_with_the_truth_on_uniform_files() {
+        // Uniform line lengths: head and tail means coincide, so the
+        // pessimistic estimator must reproduce the decision exactly.
+        let path = stress_path("uniform");
+        let mut f = File::create(&path).unwrap();
+        write_region(&mut f, STRESS_FILE_BYTES, 50, b'z');
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, STRESS_FILE_BYTES);
+        let true_lines = len.div_ceil(50);
+        let truth = should_page_estimate(len, true_lines, STRESS_BUDGET);
+        assert_eq!(
+            should_page(&path, STRESS_BUDGET).unwrap(),
+            truth,
+            "uniform files must be decided from the sampled mean alone"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
