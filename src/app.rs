@@ -1984,7 +1984,7 @@ impl App {
                 let (tx, rx) = bounded(1);
                 self.save_result_rx = Some(rx);
                 let ctx = self.ctx.clone();
-                thread::Builder::new()
+                if let Err(e) = thread::Builder::new()
                     .name("paged-filter-export".into())
                     .spawn(move || {
                         let result = match paged_file::export_filtered(&source, &destination, &spec)
@@ -1998,7 +1998,14 @@ impl App {
                         let _ = tx.send(result);
                         ctx.request_repaint();
                     })
-                    .expect("spawn paged export");
+                {
+                    // The OS refused to create the thread (EAGAIN under memory
+                    // or thread limits). Report a failed export instead of
+                    // panicking the whole GUI process.
+                    self.save_result_rx = None;
+                    self.status = tr!("status_save_failed", { e: &format!("{e}") });
+                    return;
+                }
                 return;
             }
         }
@@ -2033,7 +2040,7 @@ impl App {
         let (tx, rx) = bounded(1);
         self.save_result_rx = Some(rx);
         let ctx = self.ctx.clone();
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("recording-export".into())
             .spawn(move || {
                 let result = match recording::export(&source, length, &destination, &filter) {
@@ -2046,7 +2053,13 @@ impl App {
                 let _ = tx.send(result);
                 ctx.request_repaint();
             })
-            .expect("spawn recording export");
+        {
+            // The OS refused to create the thread (EAGAIN under memory or
+            // thread limits). Report a failed export instead of panicking the
+            // whole GUI process.
+            self.save_result_rx = None;
+            self.status = tr!("status_save_failed", { e: &format!("{e}") });
+        }
     }
 
     fn save_filtered_view(&mut self) {
@@ -2119,6 +2132,7 @@ impl App {
                 ctx.request_repaint();
             })
         {
+            // Report thread creation failures without panicking the GUI.
             self.save_result_rx = None;
             self.status = tr!("status_save_failed", { e: &e.to_string() });
         }

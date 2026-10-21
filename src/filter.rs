@@ -78,7 +78,18 @@ impl FilterSpec {
 }
 
 fn any_contains(hay: &str, needles: &[String]) -> bool {
-    needles.iter().any(|n| contains_ci(hay, n))
+    // ASCII needles scan the raw bytes with no allocation. A non-ASCII needle
+    // needs the case-folded line; fold it at most once per message so several
+    // Unicode tokens share a single allocation instead of each re-folding
+    // the whole message.
+    let folded: Option<String> = needles
+        .iter()
+        .any(|needle| !needle.is_ascii())
+        .then(|| hay.to_lowercase());
+    needles.iter().any(|needle| match folded.as_deref() {
+        Some(folded) if !needle.is_ascii() => folded.contains(needle.as_str()),
+        _ => contains_ci(hay, needle),
+    })
 }
 
 /// Case-insensitive substring search. `needle` is assumed already lowercased
@@ -275,5 +286,87 @@ mod tests {
         assert!(spec.matches(&e("hello there", "T", LevelMask::I), 0, &hs));
         assert!(!spec.matches(&e("hello world", "T", LevelMask::I), 0, &hs));
         assert!(!spec.matches(&e("no match", "T", LevelMask::I), 0, &hs));
+    }
+
+    // Microbenchmarks for the search paths `matches` takes. They run inside
+    // the regular suite (an external `criterion` target cannot link a
+    // binary-only package), print ns/op with `--nocapture`, and fail only on
+    // a catastrophic regression — the bounds are orders of magnitude above
+    // the expected cost.
+    mod benches {
+        use super::*;
+        use std::time::Instant;
+
+        /// ~4 KiB of realistic mixed-language log text (ASCII + CJK).
+        fn mixed_line() -> String {
+            let unit =
+                "01-01 12:34:56.789  1234  5678 E LogCat: 网络请求失败 retry=3 error=timeout ";
+            let mut line = String::with_capacity(4096);
+            while line.len() < 4096 {
+                line.push_str(unit);
+            }
+            line.truncate(4096);
+            // 4096 may land mid-UTF-8; back off to a char boundary.
+            while !line.is_char_boundary(line.len()) {
+                line.pop();
+            }
+            line
+        }
+
+        fn time_ops(mut op: impl FnMut()) -> f64 {
+            for _ in 0..20 {
+                op();
+            }
+            let start = Instant::now();
+            for _ in 0..200 {
+                op();
+            }
+            start.elapsed().as_nanos() as f64 / 200.0
+        }
+
+        #[test]
+        fn bench_ascii_needle_ascii_line() {
+            let line = mixed_line();
+            let hit = time_ops(|| assert!(any_contains(&line, &["error".into()])));
+            let miss = time_ops(|| assert!(!any_contains(&line, &["zzzabsentneedle".into()])));
+            eprintln!("bench ascii needle (4KiB line): hit {hit:.0} ns/op, miss {miss:.0} ns/op");
+            // Byte-wise scan: tens of thousands of compares at most.
+            assert!(
+                miss < 1_000_000.0,
+                "ASCII search regressed to {miss:.0} ns/op"
+            );
+        }
+
+        #[test]
+        fn bench_unicode_needle_mixed_line() {
+            let line = mixed_line();
+            // One Unicode needle must fold the line exactly once.
+            let hit = time_ops(|| assert!(any_contains(&line, &["网络".into()])));
+            eprintln!("bench unicode needle (4KiB line): hit {hit:.0} ns/op");
+            assert!(
+                hit < 5_000_000.0,
+                "Unicode search regressed to {hit:.0} ns/op"
+            );
+        }
+
+        #[test]
+        fn bench_mixed_needles_share_one_fold() {
+            let line = mixed_line();
+            // Two ASCII + two Unicode needles. Before the shared-fold fix the
+            // line was re-folded once per Unicode needle (two allocations of
+            // the whole message); now it is folded once total.
+            let needles = vec![
+                "error".into(),
+                "timeout".into(),
+                "网络".into(),
+                "失败".into(),
+            ];
+            let hit = time_ops(|| assert!(any_contains(&line, &needles)));
+            eprintln!("bench mixed needles (4KiB line): {hit:.0} ns/op");
+            assert!(
+                hit < 5_000_000.0,
+                "Mixed-needle search regressed to {hit:.0} ns/op"
+            );
+        }
     }
 }
