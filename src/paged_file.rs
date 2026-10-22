@@ -593,10 +593,20 @@ fn decode_line(raw: &[u8], first: bool) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn export_filtered(
     index: &PagedIndex,
     destination: &Path,
     spec: &FilterSpec,
+) -> io::Result<u64> {
+    export_with_bookmarks(index, destination, spec, &HashSet::new())
+}
+
+pub fn export_with_bookmarks(
+    index: &PagedIndex,
+    destination: &Path,
+    spec: &FilterSpec,
+    bookmarked_lines: &HashSet<u64>,
 ) -> io::Result<u64> {
     let file = index.open_snapshot()?;
     // Never write over the file being exported from, through any path or link to
@@ -617,7 +627,7 @@ pub fn export_filtered(
         .truncate(true)
         .open(&tmp)?;
     let mut writer = std::io::BufWriter::new(output);
-    let result = export_to(index, file, &mut writer, spec);
+    let result = export_to_bookmarked(index, file, &mut writer, spec, bookmarked_lines);
     let result = result.and_then(|rows| {
         writer.get_ref().sync_all()?;
         Ok(rows)
@@ -645,14 +655,27 @@ pub fn export_filtered(
     }
 }
 
+#[cfg(test)]
 fn export_to(
     index: &PagedIndex,
     file: File,
     writer: &mut impl io::Write,
     spec: &FilterSpec,
 ) -> io::Result<u64> {
+    export_to_bookmarked(index, file, writer, spec, &HashSet::new())
+}
+
+fn export_to_bookmarked(
+    index: &PagedIndex,
+    file: File,
+    writer: &mut impl io::Write,
+    spec: &FilterSpec,
+    bookmarked_lines: &HashSet<u64>,
+) -> io::Result<u64> {
     let mut reader = BufReader::with_capacity(1024 * 1024, file.take(index.file_len));
     let bookmarks = HashSet::new();
+    let mut disk_spec = spec.clone();
+    disk_spec.bookmarks_only = false;
     let mut raw = Vec::new();
     let mut hint = LogFormat::Unknown;
     let mut rows = 0u64;
@@ -675,7 +698,9 @@ fn export_to(
         if hint == LogFormat::Unknown && format != LogFormat::Unknown {
             hint = format;
         }
-        if spec.matches(&entry, 0, &bookmarks) {
+        if (!spec.bookmarks_only || bookmarked_lines.contains(&source_line))
+            && disk_spec.matches(&entry, 0, &bookmarks)
+        {
             // Match on the decoded text but write the *original bytes*, exactly
             // as `recording::export` does: an export is a copy of the matching
             // rows, so invalid UTF-8, CRLF endings and any BOM must survive it.
@@ -738,6 +763,33 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn bookmark_export_includes_lines_from_multiple_pages() {
+        let path = file(CHECKPOINT_ROWS as usize + 5);
+        let index = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
+        wait(&index);
+        let destination = path.with_extension("bookmarks");
+        let lines = HashSet::from([1, CHECKPOINT_ROWS + 3]);
+        let mut spec = FilterSpec {
+            bookmarks_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            export_with_bookmarks(&index, &destination, &spec, &lines).unwrap(),
+            2
+        );
+        let output = std::fs::read_to_string(&destination).unwrap();
+        assert!(output.contains("message 0\n"));
+        assert!(output.contains(&format!("message {}\n", CHECKPOINT_ROWS + 2)));
+        spec.find = vec![format!("message {}", CHECKPOINT_ROWS + 2)];
+        assert_eq!(
+            export_with_bookmarks(&index, &destination, &spec, &lines).unwrap(),
+            1
+        );
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

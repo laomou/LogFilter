@@ -368,14 +368,24 @@ fn send_decoded_lines_with_enc(
 ) -> std::io::Result<Tail> {
     let identity = file_identity(&file)?;
     let mut reader = BufReader::with_capacity(8192, file);
-    // A decoder may override the locale encoding when it sees a BOM. Resolve
-    // that override here as well so tailing uses the same encoding and byte
-    // alignment as the initial load. fill_buf leaves the BOM for the decoder.
-    let enc = Encoding::for_bom(reader.fill_buf()?).map_or(enc, |(detected, _)| detected);
-    let mut decoder = enc.new_decoder();
+    // A UTF-16 BOM carries byte-order information. A UTF-8 BOM, however,
+    // must not override a legacy encoding chosen after the Local sniff found
+    // invalid UTF-8 bytes. Strip that marker and decode with the chosen codec.
+    let bom = Encoding::for_bom(reader.fill_buf()?);
+    let mut bom_bytes = 0;
+    let enc = match bom {
+        Some((detected, len)) if detected == encoding_rs::UTF_8 && enc != encoding_rs::UTF_8 => {
+            reader.consume(len);
+            bom_bytes = len as u64;
+            enc
+        }
+        Some((detected, _)) => detected,
+        None => enc,
+    };
+    let mut decoder = enc.new_decoder_with_bom_removal();
     let mut lines = InitialLines::new(MAX_INITIAL_LINE_BYTES);
     let mut raw_buf = [0u8; 8192];
-    let mut read_bytes: u64 = 0;
+    let mut read_bytes: u64 = bom_bytes;
     // All encodings here tail incrementally: UTF-8 and the byte-safe legacy
     // codepages split on raw `\n`, and UTF-16 is handled specially in
     // `read_appended` (decode code units, split on the '\n' character).
@@ -1688,6 +1698,32 @@ mod tests {
             .encoding_name(),
             "UTF-16LE"
         );
+    }
+
+    #[test]
+    fn legacy_body_with_utf8_bom_keeps_selected_encoding_and_tail_offset() {
+        let tmp = unique_tmp("legacy_utf8_bom");
+        let (body, _, _) = encoding_rs::GBK.encode("中文\n");
+        let mut bytes = vec![0xef, 0xbb, 0xbf];
+        bytes.extend_from_slice(&body);
+        std::fs::write(&tmp, &bytes).unwrap();
+        assert!(!looks_like_utf8(&mut File::open(&tmp).unwrap()).unwrap());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tail = send_decoded_lines_with_enc(
+            File::open(&tmp).unwrap(),
+            tx,
+            1,
+            Arc::new(AtomicU64::new(1)),
+            encoding_rs::GBK,
+        )
+        .unwrap();
+        assert_eq!(rx.recv().unwrap().1, "中文");
+        assert_eq!(tail.encoding_name(), "GBK");
+        match tail {
+            Tail::Append { offset, .. } => assert_eq!(offset, bytes.len() as u64),
+            _ => panic!("expected append tail"),
+        }
+        std::fs::remove_file(tmp).unwrap();
     }
 
     #[test]

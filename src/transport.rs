@@ -133,6 +133,34 @@ pub fn default_commands(transport: Transport) -> Vec<String> {
         .collect()
 }
 
+/// Resolve only our built-in hdc presets on the device. hilogcat does not
+/// share hilog's option grammar, so its fallback uses default streaming and
+/// explicitly reports when a domain preset cannot be applied.
+fn device_command_args(transport: Transport, cmd: &str) -> Result<Vec<String>> {
+    let args = shlex::split(cmd)
+        .ok_or_else(|| anyhow!("unbalanced quotes or trailing backslash in command: {cmd}"))?;
+    if transport != Transport::Hdc || builtin_command(cmd).is_none() {
+        return Ok(args);
+    }
+    let primary = args
+        .iter()
+        .map(|arg| shlex::try_quote(arg).map(|q| q.into_owned()))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join(" ");
+    let notice = if args.iter().any(|a| a == "-D") {
+        "LogFilter: hilog unavailable; using hilogcat defaults (domain preset not supported)"
+    } else {
+        "LogFilter: hilog unavailable; using hilogcat default output"
+    };
+    let script = format!(
+        "if command -v hilog >/dev/null 2>&1; then exec {primary}; \
+         elif command -v hilogcat >/dev/null 2>&1; then echo '{}' >&2; exec hilogcat; \
+         else echo 'LogFilter: neither hilog nor hilogcat is available' >&2; exit 127; fi",
+        notice,
+    );
+    Ok(vec!["shell".into(), script])
+}
+
 /// Windows CREATE_NO_WINDOW: suppresses the black cmd.exe window that would
 /// otherwise flash for every child process when running as a GUI (windows
 /// subsystem) executable.
@@ -473,8 +501,7 @@ impl Session {
         // on the tag `"My` plus a stray operand and the user sees nothing but
         // "session ended". There is no injection risk either way — no shell is
         // involved — but a refusal is the only honest answer.
-        let args = shlex::split(cmd)
-            .ok_or_else(|| anyhow!("unbalanced quotes or trailing backslash in command: {cmd}"))?;
+        let args = device_command_args(transport, cmd)?;
         for tok in args {
             command.arg(tok);
         }
@@ -927,6 +954,64 @@ mod tests {
             std::fs::remove_file(&state.path).unwrap();
             std::fs::remove_dir(&dir).unwrap();
         }
+    }
+
+    #[test]
+    fn hdc_fallback_script_executes_hilogcat_and_reports_missing_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = gate_path("hdc_tools");
+        std::fs::create_dir(&dir).unwrap();
+        let tool = dir.join("hilogcat");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf '01-01 12:34:56.789 1 2 I 00400/Tag: next log\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = device_command_args(Transport::Hdc, "hilog -D 0x2F00 -v time").unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&args[1])
+            .env("PATH", &dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("domain preset not supported"));
+        let (_, format) =
+            crate::parser::parse_line(String::from_utf8(output.stdout).unwrap().trim_end().into());
+        assert_eq!(format, LogFormat::HiLog);
+        std::fs::remove_file(&tool).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&args[1])
+            .env("PATH", &dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("neither hilog nor hilogcat"));
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn hdc_presets_resolve_device_tools_without_reusing_hilogcat_flags() {
+        for cmd in default_commands(Transport::Hdc) {
+            let args = device_command_args(Transport::Hdc, &cmd).unwrap();
+            assert_eq!(args[0], "shell");
+            assert!(args[1].contains(&format!("exec {cmd};")));
+            assert!(args[1].contains("exec hilogcat;"));
+            assert!(!args[1].contains("exec hilogcat -"));
+            if cmd.contains("-D") {
+                assert!(args[1].contains("domain preset not supported"));
+            }
+        }
+        assert_eq!(
+            device_command_args(Transport::Hdc, "shell echo custom").unwrap(),
+            ["shell", "echo", "custom"]
+        );
+        assert_eq!(
+            device_command_args(Transport::Adb, "logcat -v threadtime").unwrap(),
+            ["logcat", "-v", "threadtime"]
+        );
     }
 
     #[test]
