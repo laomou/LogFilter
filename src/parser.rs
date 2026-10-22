@@ -6,7 +6,7 @@ fn re_threadtime() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>(?:\d{4}-)?\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?:(?P<uid>\d+)\s+)?(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+            r"^(?P<date>(?:\d{4}-)?\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?:(?P<uid>[A-Za-z0-9_]+)\s+)?(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -16,7 +16,8 @@ fn re_threadtime() -> &'static Regex {
 /// Differs from threadtime by the `Domain/Tag` field and a fractional-second
 /// part that may be 3–9 digits (ms/µs/ns). The domain is a log-type letter
 /// (`A`=app, `C`=core, `I`=init/system, …) followed by hex digits, e.g.
-/// `A06666`, `C01719`, `I00000`. Requiring an uppercase letter + ≥4 hex digits
+/// `A06666`, `C01719`, `I00000`; older tools also emit numeric-leading hex
+/// domains such as `01FF3` and `00400`. Requiring at least five characters
 /// means this doesn't claim an Android tag that merely starts with a short hex
 /// word then a slash (e.g. `DB/query`); any that still slip through fall back to
 /// lossless ThreadTime. Safe to try before threadtime.
@@ -24,7 +25,7 @@ fn re_hilog() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<domain>[A-Z][0-9A-Fa-f]{4,})/(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
+            r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3,9})\s+(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<lv>[VDIWEFA])\s+(?P<domain>(?:[A-Z][0-9A-Fa-f]{4,}|[0-9][0-9A-Fa-f]{4,}))/(?P<tag>[^:]+?):\s?(?P<msg>.*)$",
         )
         .unwrap()
     })
@@ -81,7 +82,7 @@ fn re_long() -> &'static Regex {
 fn re_kernel() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"^<(?P<lv>[0-7])>\[?\s*(?P<time>[\d.]+)\]?\s?(?P<msg>.*)$").unwrap()
+        Regex::new(r"^(?:<(?P<lv>[0-7])>)?(?:\[\s*(?P<time>\d+(?:\.\d+)?)\]|(?P<bare_time>\d+(?:\.\d+)?))\s*(?:\[\s*[TC](?P<tid>\d+)\]\s*)?(?P<msg>.*)$").unwrap()
     })
 }
 
@@ -258,21 +259,41 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             })
         };
         let try_kernel = |s: &str| {
-            re_kernel().captures(s).map(|c| {
-                let digit: u8 = c["lv"].parse().unwrap_or(7);
-                (
+            re_kernel().captures(s).and_then(|c| {
+                // Bare numbers are not kernel records without a syslog prefix.
+                if c.name("time").is_none() && c.name("lv").is_none() {
+                    return None;
+                }
+                let level = c
+                    .name("lv")
+                    .and_then(|m| m.as_str().parse::<u8>().ok())
+                    .map(LevelMask::from_kernel_digit)
+                    .unwrap_or_else(|| {
+                        let message = c["msg"].to_ascii_lowercase();
+                        if message.contains("kernel panic") {
+                            LevelMask::F
+                        } else if message.starts_with("oops:") || message.starts_with("bug:") {
+                            LevelMask::E
+                        } else {
+                            LevelMask::I
+                        }
+                    });
+                Some((
                     LogFormat::Kernel,
-                    LevelMask::from_kernel_digit(digit),
+                    level,
                     [
                         EMPTY,
-                        span(&c, "time"),
+                        c.name("time").map_or_else(
+                            || span(&c, "bare_time"),
+                            |m| (m.start() as u32, m.end() as u32),
+                        ),
                         EMPTY,
-                        EMPTY,
+                        span(&c, "tid"),
                         EMPTY,
                         EMPTY,
                         span(&c, "msg"),
                     ],
-                )
+                ))
             })
         };
 
@@ -286,7 +307,7 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
 
         // Try the hinted format first; fall back to the full scan only on a miss.
         let hinted = match hint {
-            LogFormat::ThreadTime => try_threadtime_family(s),
+            LogFormat::ThreadTime => try_hilog(s).or_else(|| try_threadtime_family(s)),
             LogFormat::HiLog => try_hilog(s),
             LogFormat::Time => try_time(s),
             LogFormat::Brief => try_brief(s),
@@ -668,11 +689,67 @@ mod tests {
         assert_eq!(f, LogFormat::ThreadTime);
         assert_eq!(e.date(), "07-20");
         assert_eq!(e.time(), "15:43:53.405");
-        assert_eq!(e.pid(), "1047");
-        assert_eq!(e.tid(), "17520");
+        assert_eq!(e.uid(), "1047");
+        assert_eq!(e.pid(), "17520");
+        assert_eq!(e.tid(), "18175");
         assert_eq!(e.level, LevelMask::I);
         assert_eq!(e.tag(), "AncSDK");
         assert_eq!(e.message(), "key frame id: 0");
+    }
+
+    #[test]
+    fn real_device_uid_kernel_and_numeric_domain_formats() {
+        for uid in ["1000", "root", "system", "u0_a123"] {
+            let line = format!("07-20 15:43:53.405 {uid} 17520 18175 I Tag: message");
+            let (entry, format) = parse_line(line.clone());
+            assert_eq!(format, LogFormat::ThreadTime);
+            assert_eq!(
+                (entry.uid(), entry.pid(), entry.tid()),
+                (uid, "17520", "18175")
+            );
+            assert_eq!(entry.raw(), line);
+        }
+        for (line, level, tid, message) in [
+            (
+                "<3>[ 12.345] [T123] usb: disconnect",
+                LevelMask::E,
+                "123",
+                "usb: disconnect",
+            ),
+            (
+                "[ 12.345] [ T42] Kernel panic - not syncing",
+                LevelMask::F,
+                "42",
+                "Kernel panic - not syncing",
+            ),
+            (
+                "[ 12.345] Oops: bad state",
+                LevelMask::E,
+                "",
+                "Oops: bad state",
+            ),
+            (
+                "[ 12.345] Linux version 6.1",
+                LevelMask::I,
+                "",
+                "Linux version 6.1",
+            ),
+        ] {
+            let (entry, format) = parse_line(line.into());
+            assert_eq!(format, LogFormat::Kernel);
+            assert_eq!(entry.level, level);
+            assert_eq!(entry.tid(), tid);
+            assert_eq!(entry.message(), message);
+            assert_eq!(entry.raw(), line);
+        }
+        for domain in ["01FF3", "00400"] {
+            let line = format!("01-01 12:34:56.789 1234 5678 I {domain}/Tag: message");
+            for hint in [LogFormat::Unknown, LogFormat::ThreadTime] {
+                let (entry, format) = parse_line_hinted(line.clone(), hint);
+                assert_eq!(format, LogFormat::HiLog);
+                assert_eq!(entry.tag(), format!("{domain}/Tag"));
+            }
+        }
     }
 
     #[test]

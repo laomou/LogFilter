@@ -133,7 +133,9 @@ Find, remove, level, PID, TID, and tag filters scan the complete file in the
 background and build a separate sparse match index. Filtered pages preserve the
 original source line numbers. Goto uses the source line number when no global
 filter is active. Filtered export streams the complete file with a snapshot of
-the current filters. Bookmarks remain scoped to the loaded page.
+the current filters. Bookmarks are kept by source line across page changes;
+bookmarks-only export includes bookmarked rows from every page and applies the
+other filters too. Reopening or clearing the file resets bookmarks.
 Column-picker counts and bookmark markers describe the loaded page; selecting a
 column value still applies that value as a global disk filter.
 
@@ -155,6 +157,15 @@ LogFilter can launch adb commands from the toolbar. By default it includes prese
 - `shell cat /proc/kmsg`
 
 If `adb` is not on `PATH`, set `adb.adb_path` in the config file. On Windows, the app also checks the default Android Studio SDK location.
+
+## HarmonyOS log compatibility
+
+Built-in hdc log presets check tools in the device shell: use the original
+preset with `hilog` when available, otherwise use `hilogcat` defaults. Their
+flags are not interchangeable, so fallback does not copy `-v`, `-r`, or `-D`.
+A domain preset that cannot be applied emits a warning; use GUI tag filters
+instead. Missing both tools is an explicit error. Custom commands are unchanged.
+This fallback still needs validation on the corresponding HarmonyOS NEXT device.
 
 ## Filtering
 

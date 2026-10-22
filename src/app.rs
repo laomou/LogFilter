@@ -670,18 +670,24 @@ impl App {
                     Err(e) => {
                         // A mid-stream read error truncated the load; record it so
                         // the UI surfaces "partially loaded" rather than silence.
-                        if let Ok(mut slot) = load_error.lock() {
-                            if source_epoch.load(Ordering::Acquire) == epoch {
-                                *slot = Some(format!("{src}: {e}"));
-                                ctx.request_repaint();
-                            }
+                        let mut slot = load_error.lock_recover();
+                        if source_epoch.load(Ordering::Acquire) == epoch {
+                            *slot = Some(format!("{src}: {e}"));
+                            ctx.request_repaint();
                         }
                         return;
                     }
                 };
                 // Publish the encoding actually used (resolves "Local" to the
                 // sniffed codepage) so the status bar can show it.
-                *detected_encoding.lock_recover() = Some(tail.encoding_name().to_string());
+                if !publish_detected_encoding(
+                    &detected_encoding,
+                    &source_epoch,
+                    epoch,
+                    tail.encoding_name(),
+                ) {
+                    return;
+                }
                 ctx.request_repaint();
                 follow_file(
                     &follow_path,
@@ -1298,6 +1304,20 @@ fn follow_file(
 /// follower even though reloading the file can recover it. Only errors built
 /// with `io::permanent_io_error` stop the follower; every other failure keeps
 /// polling, exactly as a transient rotation gap does.
+fn publish_detected_encoding(
+    detected: &Mutex<Option<String>>,
+    source_epoch: &AtomicU64,
+    epoch: u64,
+    encoding: &str,
+) -> bool {
+    let mut slot = detected.lock_recover();
+    if source_epoch.load(Ordering::Acquire) != epoch {
+        return false;
+    }
+    *slot = Some(encoding.to_string());
+    true
+}
+
 fn permanent_read_error(e: &std::io::Error) -> bool {
     e.get_ref()
         .is_some_and(|inner| inner.is::<PermanentTailReadError>())
@@ -1959,55 +1979,58 @@ impl App {
         if self.save_result_rx.is_some() {
             return;
         }
-        if !self.ui.bookmarks_only {
-            if let Some(paged) = &self.paged {
-                let source = paged.source.base.clone();
-                let spec = self.ui.to_filter_spec();
-                let default_name = format!(
-                    "logfilter_filtered_{}.txt",
-                    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-                );
-                let Some(destination) = rfd::FileDialog::new()
-                    .set_file_name(default_name)
-                    .save_file()
-                else {
-                    return;
-                };
-                if self.recording_destination_is_protected(&destination) {
-                    self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
-                    return;
-                }
-                if let Some(reason) = self.view_file_is(&destination).refusal() {
-                    self.status = tr!("status_save_failed", { e: &reason });
-                    return;
-                }
-                let (tx, rx) = bounded(1);
-                self.save_result_rx = Some(rx);
-                let ctx = self.ctx.clone();
-                if let Err(e) = thread::Builder::new()
-                    .name("paged-filter-export".into())
-                    .spawn(move || {
-                        let result = match paged_file::export_filtered(&source, &destination, &spec)
-                        {
-                            Ok(rows) => SaveOutcome::Saved {
-                                rows: rows as usize,
-                                path: destination,
-                            },
-                            Err(e) => SaveOutcome::Failed(e.to_string()),
-                        };
-                        let _ = tx.send(result);
-                        ctx.request_repaint();
-                    })
-                {
-                    // The OS refused to create the thread (EAGAIN under memory
-                    // or thread limits). Report a failed export instead of
-                    // panicking the whole GUI process.
-                    self.save_result_rx = None;
-                    self.status = tr!("status_save_failed", { e: &format!("{e}") });
-                    return;
-                }
+        if let Some(paged) = &self.paged {
+            let source = paged.source.base.clone();
+            let bookmarked_lines = paged.bookmarks.clone();
+            let spec = self.ui.to_filter_spec();
+            let default_name = format!(
+                "logfilter_filtered_{}.txt",
+                chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+            );
+            let Some(destination) = rfd::FileDialog::new()
+                .set_file_name(default_name)
+                .save_file()
+            else {
+                return;
+            };
+            if self.recording_destination_is_protected(&destination) {
+                self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
                 return;
             }
+            if let Some(reason) = self.view_file_is(&destination).refusal() {
+                self.status = tr!("status_save_failed", { e: &reason });
+                return;
+            }
+            let (tx, rx) = bounded(1);
+            self.save_result_rx = Some(rx);
+            let ctx = self.ctx.clone();
+            if let Err(e) = thread::Builder::new()
+                .name("paged-filter-export".into())
+                .spawn(move || {
+                    let result = match paged_file::export_with_bookmarks(
+                        &source,
+                        &destination,
+                        &spec,
+                        &bookmarked_lines,
+                    ) {
+                        Ok(rows) => SaveOutcome::Saved {
+                            rows: rows as usize,
+                            path: destination,
+                        },
+                        Err(e) => SaveOutcome::Failed(e.to_string()),
+                    };
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                })
+            {
+                // The OS refused to create the thread (EAGAIN under memory
+                // or thread limits). Report a failed export instead of
+                // panicking the whole GUI process.
+                self.save_result_rx = None;
+                self.status = tr!("status_save_failed", { e: &format!("{e}") });
+                return;
+            }
+            return;
         }
         if self.recording.is_some() && !self.ui.bookmarks_only {
             self.export_filtered_recording();
@@ -6079,6 +6102,16 @@ mod tests {
         assert_eq!(page_row(Some(95), 100, 10, true), Some(99));
         assert_eq!(page_row(Some(5), 100, 10, false), Some(0));
         assert_eq!(page_row(Some(5), 100, 0, true), Some(6));
+    }
+
+    #[test]
+    fn superseded_load_cannot_publish_detected_encoding() {
+        let detected = Mutex::new(Some("UTF-8 (paged)".into()));
+        let epoch = AtomicU64::new(2);
+        assert!(!publish_detected_encoding(&detected, &epoch, 1, "GBK"));
+        assert_eq!(detected.lock_recover().as_deref(), Some("UTF-8 (paged)"));
+        assert!(publish_detected_encoding(&detected, &epoch, 2, "UTF-16LE"));
+        assert_eq!(detected.lock_recover().as_deref(), Some("UTF-16LE"));
     }
 
     #[test]
