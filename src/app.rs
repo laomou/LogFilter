@@ -1466,6 +1466,17 @@ impl App {
     /// Start (or restart) a streaming session for the selected transport, device,
     /// and command, replacing any session or file tail currently feeding the view.
     fn run_session(&mut self) {
+        self.run_session_with_preview(recording::prepare_preview);
+    }
+
+    fn run_session_with_preview(
+        &mut self,
+        prepare: impl FnOnce(
+            Arc<Recording>,
+            u64,
+            egui::Context,
+        ) -> std::io::Result<recording::PreparedPreview>,
+    ) {
         if self.closing {
             return;
         }
@@ -1544,7 +1555,21 @@ impl App {
             }
         };
 
-        // Handover: past this point the previous source is gone.
+        let preview = match prepare(recorded.clone(), 0, self.ctx.clone()) {
+            Ok(preview) => preview,
+            Err(e) => {
+                let mut session = session;
+                session.stop();
+                // Capture has already started: keep its bytes and track final
+                // sync on close, without replacing the previous view/last capture.
+                self.previous_recordings.push(recorded);
+                self.last_recording = previous_last_recording;
+                self.status = tr!("status_recording_failed", { e: &e.to_string() });
+                return;
+            }
+        };
+
+        // Handover: all fallible initialization succeeded before replacing the view.
         self.paged = None;
         self.retire_recording();
         self.poll_recording();
@@ -1564,25 +1589,7 @@ impl App {
         // file open, which switches to an unrelated source.
         self.notify_filter();
 
-        // Opening a file that was just created and spawning one thread; unlike
-        // the session start there is no external cause to fail on, so the view is
-        // already committed here. Don't leave the session running without a
-        // reader if it does.
-        let preview = match recording::preview(
-            recorded.clone(),
-            0,
-            epoch,
-            self.source_epoch.clone(),
-            self.ctx.clone(),
-        ) {
-            Ok(rx) => rx,
-            Err(e) => {
-                let mut session = session;
-                session.stop();
-                self.status = tr!("status_recording_failed", { e: &e.to_string() });
-                return;
-            }
-        };
+        let preview = preview.activate(epoch, self.source_epoch.clone());
         self.session = Some(session);
         self.preview_rx = Some(preview);
         self.recording = Some(recorded);
@@ -1924,6 +1931,28 @@ impl App {
         }
     }
 
+    fn recording_destination_is_protected(&self, dest: &Path) -> bool {
+        let canonical = std::fs::canonicalize(dest).ok();
+        let existing = std::fs::File::open(dest).ok();
+        let same = |source: &Path| {
+            source == dest
+                || canonical
+                    .as_deref()
+                    .zip(std::fs::canonicalize(source).ok())
+                    .is_some_and(|(a, b)| a == b)
+                || existing
+                    .as_ref()
+                    .zip(std::fs::File::open(source).ok())
+                    .is_some_and(|(a, b)| crate::io::same_file(a, &b).unwrap_or(true))
+        };
+        self.recording
+            .iter()
+            .chain(&self.previous_recordings)
+            .chain(&self.last_recording)
+            .any(|r| same(&r.path))
+            || self.retired_recording_paths.iter().any(|path| same(path))
+    }
+
     fn save_filtered(&mut self) {
         // Another export is still running: its result would be dropped with the
         // replaced receiver, and the shutdown flow only tracks the newest one.
@@ -1944,6 +1973,10 @@ impl App {
                 else {
                     return;
                 };
+                if self.recording_destination_is_protected(&destination) {
+                    self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
+                    return;
+                }
                 if let Some(reason) = self.view_file_is(&destination).refusal() {
                     self.status = tr!("status_save_failed", { e: &reason });
                     return;
@@ -1993,6 +2026,10 @@ impl App {
         let Some(destination) = rfd::FileDialog::new().set_file_name(name).save_file() else {
             return;
         };
+        if self.recording_destination_is_protected(&destination) {
+            self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
+            return;
+        }
         let (tx, rx) = bounded(1);
         self.save_result_rx = Some(rx);
         let ctx = self.ctx.clone();
@@ -2040,23 +2077,7 @@ impl App {
             .set_file_name(default_name)
             .save_file();
         let Some(dest) = path else { return };
-        let dest_canonical = std::fs::canonicalize(&dest).ok();
-        let is_dest = |recorded: &Arc<Recording>| {
-            recorded.path == dest
-                || dest_canonical
-                    .as_deref()
-                    .zip(std::fs::canonicalize(&recorded.path).ok())
-                    .is_some_and(|(a, b)| a == b)
-        };
-        if self
-            .recording
-            .iter()
-            .chain(&self.previous_recordings)
-            .any(is_dest)
-            || dest_canonical
-                .as_ref()
-                .is_some_and(|c| self.retired_recording_paths.contains(c))
-        {
+        if self.recording_destination_is_protected(&dest) {
             self.status = tr!("status_save_failed", { e: &tr!("recording_no_overwrite") });
             return;
         }
@@ -2075,10 +2096,15 @@ impl App {
         // (5 GB of matches used to mean 5 GB of extra allocations on the UI
         // thread). Each row is saved verbatim so the output preserves the source
         // format (adb stream / original file) rather than a re-joined table.
+        self.start_view_export(source_generation, indices, dest);
+    }
+
+    fn start_view_export(&mut self, source_generation: u64, indices: Vec<u32>, dest: PathBuf) {
         let model = self.model.clone();
+        let ctx = self.ctx.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.save_result_rx = Some(rx);
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("save-filtered".into())
             .spawn(move || {
                 let outcome = match write_filtered_rows(&model, source_generation, &indices, &dest)
@@ -2090,8 +2116,12 @@ impl App {
                     Err(e) => SaveOutcome::Failed(format!("{e}")),
                 };
                 let _ = tx.send(outcome);
+                ctx.request_repaint();
             })
-            .expect("spawn save thread");
+        {
+            self.save_result_rx = None;
+            self.status = tr!("status_save_failed", { e: &e.to_string() });
+        }
     }
 
     /// Alt+left-click on a Tag cell → "only this tag".
@@ -3365,6 +3395,9 @@ impl Drop for App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Collect even already-finished errors before deciding whether native
+        // close is safe; otherwise the error dialog is bypassed entirely.
+        self.poll_recording();
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_ready {
             let unfinished = self
                 .recording
@@ -3374,7 +3407,14 @@ impl eframe::App for App {
                     .previous_recordings
                     .iter()
                     .any(|r| !r.finished.load(Ordering::Acquire));
-            if unfinished || self.save_result_rx.is_some() {
+            if self.exit_recording_error.is_none() {
+                self.exit_recording_error = self
+                    .recording
+                    .iter()
+                    .chain(&self.previous_recordings)
+                    .find_map(|r| r.error.lock_recover().clone());
+            }
+            if unfinished || self.save_result_rx.is_some() || self.exit_recording_error.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.closing = true;
                 self.stop_session();
@@ -3400,7 +3440,9 @@ impl eframe::App for App {
                     };
                     self.save_result_rx = None;
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => {} // still in progress
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     // The save thread dropped its sender without sending a result
                     // (it panicked). Surface a failure rather than spin forever
@@ -3448,12 +3490,17 @@ impl eframe::App for App {
         // Autosave the settings. They used to be written only on a clean exit, so a
         // crash silently dropped every change made during the session. Serializing
         // is cheap and only a real change is written.
-        if self.autosave_config && std::time::Instant::now() >= self.next_config_save {
-            self.next_config_save = std::time::Instant::now() + Duration::from_secs(5);
-            let current = toml::to_string(&self.cfg).unwrap_or_default();
-            if current != self.last_saved_config && config::save(&self.cfg).is_ok() {
-                self.last_saved_config = current;
+        if self.autosave_config {
+            let now = std::time::Instant::now();
+            if now >= self.next_config_save {
+                self.sync_config_from_view();
+                self.next_config_save = now + Duration::from_secs(5);
+                let current = toml::to_string(&self.cfg).unwrap_or_default();
+                if current != self.last_saved_config && config::save(&self.cfg).is_ok() {
+                    self.last_saved_config = current;
+                }
             }
+            ctx.request_repaint_after(self.next_config_save.saturating_duration_since(now));
         }
 
         // Surface a truncated file load (mid-stream read error) once.
@@ -3494,7 +3541,6 @@ impl eframe::App for App {
             };
         }
 
-        self.poll_recording();
         if self.closing {
             let finished = self
                 .recording
@@ -3504,6 +3550,13 @@ impl eframe::App for App {
                     .previous_recordings
                     .iter()
                     .all(|r| r.finished.load(Ordering::Acquire));
+            if self.exit_recording_error.is_none() {
+                self.exit_recording_error = self
+                    .recording
+                    .iter()
+                    .chain(&self.previous_recordings)
+                    .find_map(|r| r.error.lock_recover().clone());
+            }
             let saving = self.save_result_rx.is_some();
             if finished && !saving && self.exit_recording_error.is_none() {
                 self.close_ready = true;
@@ -3554,16 +3607,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.ui.write_back(&mut self.cfg);
-        if let Some(size) = self.last_window_size {
-            self.cfg.window.width = size.x;
-            self.cfg.window.height = size.y;
-        }
-        self.cfg.view.columns = self.cached_col_widths;
-        // Persist the last-used adb command/device so the next launch restores it.
-        self.cfg.device.selected_cmd = self.selected_cmd.clone();
-        self.cfg.device.selected_device = self.selected_device.clone();
-        self.cfg.device.transport = self.transport;
+        self.sync_config_from_view();
         // On exit there's no UI left to surface a status, but a failed save
         // silently loses the user's window size / filters / column widths /
         // recent files. Log it so it's at least diagnosable rather than invisible.
@@ -3574,6 +3618,18 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn sync_config_from_view(&mut self) {
+        self.ui.write_back(&mut self.cfg);
+        if let Some(size) = self.last_window_size {
+            self.cfg.window.width = size.x;
+            self.cfg.window.height = size.y;
+        }
+        self.cfg.view.columns = self.cached_col_widths;
+        self.cfg.device.selected_cmd = self.selected_cmd.clone();
+        self.cfg.device.selected_device = self.selected_device.clone();
+        self.cfg.device.transport = self.transport;
+    }
+
     fn ui_menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Menu bar — File · Format · View · Encoding
@@ -6785,7 +6841,142 @@ mod ui_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preview_initialization_failure_preserves_view_and_tracks_finalization() {
+        let mut h = harness();
+        h.step();
+        inject(h.state_mut(), 20);
+        let viewed = PathBuf::from("previous.log");
+        h.state_mut().model.write_recover().file_path = Some(viewed.clone());
+        let old_writer =
+            recording::Writer::create(h.state().recording_directory_override.as_ref().unwrap())
+                .unwrap();
+        let old = old_writer.state.clone();
+        old_writer.record(std::io::Cursor::new(b"previous capture\n"));
+        h.state_mut().last_recording = Some(old.clone());
+        h.state_mut().cfg.device.adb_path = Some("/bin/sh".into());
+        h.state_mut().selected_cmd = "-c 'printf captured; exec sleep 30'".into();
+        let epoch = h.state().source_epoch.load(Ordering::Acquire);
+        let mut failed = None;
+        h.state_mut().run_session_with_preview(|state, _, _| {
+            failed = Some(state);
+            Err(std::io::Error::other(
+                "injected preview initialization failure",
+            ))
+        });
+        let app = h.state();
+        let failed = failed.unwrap();
+        assert!(app.session.is_none());
+        assert!(app.recording.is_none());
+        assert_eq!(app.source_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(app.model.read_recover().entries.len(), 20);
+        assert_eq!(app.model.read_recover().file_path.as_ref(), Some(&viewed));
+        assert!(Arc::ptr_eq(app.last_recording.as_ref().unwrap(), &old));
+        assert!(app
+            .previous_recordings
+            .iter()
+            .any(|r| Arc::ptr_eq(r, &failed)));
+        assert!(failed.path.exists(), "started captures must not be deleted");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !failed.finished.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(failed.error.lock_recover().is_none());
+    }
+
     // ─── FilterSpec sync ─────────────────────────────────────────────────
+
+    #[test]
+    fn configuration_snapshot_includes_current_ui_and_device_state() {
+        let mut h = harness();
+        h.step();
+        let app = h.state_mut();
+        app.ui.find = "new find".into();
+        app.ui.remove = "new remove".into();
+        app.ui.highlight = "new highlight".into();
+        app.ui.find_on = true;
+        app.ui.remove_on = false;
+        app.ui.highlight_on = true;
+        app.ui.encoding = "local".into();
+        app.ui.col_uid = true;
+        app.ui.col_date = false;
+        app.cached_col_widths[0] = 155.0;
+        app.last_window_size = Some(egui::vec2(1500.0, 850.0));
+        app.transport = Transport::Hdc;
+        app.selected_cmd = "hilog -v time -r".into();
+        app.selected_device = "new-device".into();
+        app.sync_config_from_view();
+        let text = toml::to_string(&app.cfg).unwrap();
+        let saved: Config = toml::from_str(&text).unwrap();
+        assert_eq!(saved.filters.find, "new find");
+        assert_eq!(saved.filters.remove, "new remove");
+        assert_eq!(saved.filters.highlight, "new highlight");
+        assert_eq!(saved.filters.find_on, Some(true));
+        assert_eq!(saved.filters.remove_on, Some(false));
+        assert_eq!(saved.filters.highlight_on, Some(true));
+        assert_eq!(saved.view.encoding, "local");
+        assert!(saved.view.columns_visible[6]);
+        assert!(!saved.view.columns_visible[1]);
+        assert_eq!(saved.view.columns[0], 155.0);
+        assert_eq!((saved.window.width, saved.window.height), (1500.0, 850.0));
+        assert_eq!(saved.device.transport, Transport::Hdc);
+        assert_eq!(saved.device.selected_device, "new-device");
+        assert_eq!(saved.device.selected_cmd, "hilog -v time -r");
+    }
+
+    #[test]
+    fn export_destination_guard_protects_previous_recordings() {
+        let mut h = harness();
+        h.step();
+        let writer =
+            recording::Writer::create(h.state().recording_directory_override.as_ref().unwrap())
+                .unwrap();
+        let recorded = writer.state.clone();
+        writer.record(std::io::Cursor::new(b"original\n"));
+        h.state_mut()
+            .retired_recording_paths
+            .insert(recorded.path.clone());
+        assert!(h.state().recording_destination_is_protected(&recorded.path));
+        let alias = recorded.path.with_extension("alias");
+        std::fs::hard_link(&recorded.path, &alias).unwrap();
+        assert!(h.state().recording_destination_is_protected(&alias));
+        let ordinary = recorded.path.with_extension("export");
+        std::fs::write(&ordinary, b"old export").unwrap();
+        assert!(!h.state().recording_destination_is_protected(&ordinary));
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(ordinary).unwrap();
+    }
+
+    #[test]
+    fn local_view_export_requests_repaint_on_completion() {
+        let mut h = harness();
+        h.step();
+        inject(h.state_mut(), 3);
+        let (generation, indices) = {
+            let model = h.state().model.read_recover();
+            (model.source_generation, model.filtered.clone())
+        };
+        let destination = h
+            .state()
+            .recording_directory_override
+            .as_ref()
+            .unwrap()
+            .with_extension("export");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        h.state().ctx.set_request_repaint_callback(move |_| {
+            let _ = tx.send(());
+        });
+        h.state_mut()
+            .start_view_export(generation, indices, destination.clone());
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("export must wake the idle UI");
+        h.step();
+        assert!(h.state().save_result_rx.is_none());
+        assert!(destination.exists());
+        std::fs::remove_file(destination).unwrap();
+    }
 
     #[test]
     fn filter_spec_reflects_ui_state_after_notify() {
@@ -7350,9 +7541,22 @@ mod ui_tests {
             recording::Writer::create(h.state().recording_directory_override.as_ref().unwrap())
                 .unwrap();
         h.state_mut().recording = Some(writer.state.clone());
-        h.state_mut().closing = true;
         drop(writer); // An unfinished writer is marked failed, not saved.
+        assert!(h
+            .state()
+            .recording
+            .as_ref()
+            .unwrap()
+            .finished
+            .load(Ordering::Acquire));
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
         h.step();
+        assert!(h.state().closing);
         assert!(!h.state().close_ready);
         assert!(h.state().exit_recording_error.is_some());
     }

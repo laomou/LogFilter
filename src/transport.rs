@@ -323,6 +323,88 @@ pub struct Session {
 /// whose descendant never closes it.
 const STDERR_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Poll pipe readiness instead of blocking indefinitely on a silent descendant.
+/// This reader is the pipe's sole consumer, so reading only ready bytes is safe.
+struct CancellableStdout {
+    pipe: std::process::ChildStdout,
+    stop: Arc<AtomicBool>,
+}
+
+impl Read for CancellableStdout {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let mut fd = libc::pollfd {
+                    fd: self.pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: fd owns valid pollfd storage and the pipe remains open.
+                let ready = unsafe { libc::poll(&mut fd, 1, 50) };
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready > 0 {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    return self.pipe.read(buf);
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+                use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+                let mut available = 0;
+                // SAFETY: the pipe owns a valid handle and available is writable.
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        self.pipe.as_raw_handle(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                        return Ok(0);
+                    }
+                    return Err(error);
+                }
+                if available > 0 {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    let count = buf.len().min(available as usize);
+                    return self.pipe.read(&mut buf[..count]);
+                }
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            #[cfg(not(any(unix, windows)))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "cancellable device pipes are unsupported on this platform",
+            ));
+        }
+    }
+}
+
 enum Output {
     Recording(recording::Writer),
     #[cfg(test)]
@@ -428,6 +510,10 @@ impl Session {
             Output::Recording(writer) => writer.state.stop.clone(),
             #[cfg(test)]
             Output::Lines(_) => Arc::new(AtomicBool::new(false)),
+        };
+        let stdout = CancellableStdout {
+            pipe: stdout,
+            stop: stop_requested.clone(),
         };
         #[cfg(test)]
         let reader_stop_requested = stop_requested.clone();
@@ -759,6 +845,44 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn stop_finishes_recording_while_a_silent_descendant_holds_stdout() {
+        for paused in [false, true] {
+            let dir = gate_path("silent_stdout");
+            let writer = recording::Writer::create(&dir).unwrap();
+            let state = writer.state.clone();
+            // sleep inherits stdout and survives the direct shell's death.
+            // Its pid is reported on stderr so cleanup always releases it.
+            let script = "sleep 30 & printf '%s' $! >&2; printf 'prefix\\n'; wait";
+            let cmd = format!("-c {}", shlex::try_quote(script).unwrap());
+            let mut session =
+                Session::start_recording(Transport::Adb, Some("/bin/sh"), None, &cmd, writer)
+                    .unwrap();
+            wait_until(|| !session.stderr_text().is_empty());
+            let pid: i32 = session.stderr_text().parse().unwrap();
+            wait_until(|| state.written.load(Ordering::Acquire) >= 7);
+            state.paused.store(paused, Ordering::Release);
+            session.stop();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !state.finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let finished = state.finished.load(Ordering::Acquire);
+            // SAFETY: pid is the sleep child created by this test, not a process group.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            assert!(
+                finished,
+                "Stop must not depend on a descendant closing stdout"
+            );
+            assert!(state.error.lock_recover().is_none());
+            assert_eq!(std::fs::read(&state.path).unwrap(), b"prefix\n");
+            std::fs::remove_file(&state.path).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+        }
     }
 
     #[test]

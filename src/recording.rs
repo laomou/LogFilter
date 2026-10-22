@@ -155,8 +155,7 @@ impl Writer {
             } else {
                 format!("logfilter_{stamp}_{sequence}.log")
             };
-            // Keep the active file visibly marked until close/final sync. Startup
-            // counts these incomplete recordings against the directory limit.
+            // Names remain persistent after Stop; never overwrite older captures.
             let path = directory.join(name);
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => {
@@ -243,6 +242,9 @@ fn copy_raw<R: Read, W: Write>(
     let mut bytes_since_space_check = SPACE_CHECK_BYTES as usize;
     let read_result = (|| {
         loop {
+            if state.stop.load(Ordering::Acquire) {
+                break;
+            }
             // A paused capture writes nothing, so a free-space failure it would
             // report can only come from other writers filling the disk; do not
             // stop the recording over bytes it never needed to write.
@@ -313,6 +315,20 @@ pub struct PreviewBatch {
 
 /// A single-slot channel: at most one queued batch and one being assembled.
 /// No amount of disk backlog can increase its resident memory.
+pub struct PreparedPreview {
+    activate: crossbeam_channel::Sender<(u64, Arc<AtomicU64>)>,
+    batches: Receiver<PreviewBatch>,
+}
+
+impl PreparedPreview {
+    pub fn activate(self, epoch: u64, source_epoch: Arc<AtomicU64>) -> Receiver<PreviewBatch> {
+        // The worker waits for this handover; dropping an unactivated preview
+        // disconnects the channel and exits without touching any source.
+        let _ = self.activate.send((epoch, source_epoch));
+        self.batches
+    }
+}
+
 pub fn preview(
     state: Arc<Recording>,
     start: u64,
@@ -320,6 +336,14 @@ pub fn preview(
     source_epoch: Arc<AtomicU64>,
     ctx: egui::Context,
 ) -> io::Result<Receiver<PreviewBatch>> {
+    Ok(prepare_preview(state, start, ctx)?.activate(epoch, source_epoch))
+}
+
+pub fn prepare_preview(
+    state: Arc<Recording>,
+    start: u64,
+    ctx: egui::Context,
+) -> io::Result<PreparedPreview> {
     let mut file = File::open(&state.path)?;
     let mut skip_partial = false;
     if start > 0 {
@@ -330,9 +354,13 @@ pub fn preview(
     }
     file.seek(SeekFrom::Start(start))?;
     let (tx, rx) = bounded(1);
+    let (activate, activated) = bounded::<(u64, Arc<AtomicU64>)>(1);
     std::thread::Builder::new()
         .name("recording-preview".into())
         .spawn(move || {
+            let Ok((epoch, source_epoch)) = activated.recv() else {
+                return;
+            };
             let result = (|| -> io::Result<()> {
                 let mut offset = start;
                 let mut raw = [0u8; BLOCK];
@@ -441,7 +469,10 @@ pub fn preview(
                 ctx.request_repaint();
             }
         })?;
-    Ok(rx)
+    Ok(PreparedPreview {
+        activate,
+        batches: rx,
+    })
 }
 
 fn push_preview(
@@ -487,10 +518,10 @@ pub fn export(
             "recording was truncated before export",
         ));
     }
-    let output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    // A confirmed overwrite is published only after the snapshot is fully
+    // written and synced; failures leave any existing export untouched.
+    let tmp = crate::config::temp_sibling(destination);
+    let output = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     let mut writer = io::BufWriter::new(output);
     let mut reader = io::BufReader::new(input.take(length));
     let bookmarks = std::collections::HashSet::new();
@@ -534,14 +565,12 @@ pub fn export(
         writer.flush()?;
         writer.get_ref().sync_all()
     })();
-    if let Err(e) = body {
-        // Never leave a partial export behind: `create_new` would then make a
-        // retry to the same path fail with "already exists", and the truncated
-        // file looks exactly like a successful export.
-        drop(writer);
-        let _ = std::fs::remove_file(destination);
+    drop(writer);
+    if let Err(e) = body.and_then(|()| std::fs::rename(&tmp, destination)) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    crate::config::sync_parent_dir(destination);
     Ok(rows)
 }
 
@@ -946,6 +975,47 @@ mod tests {
             b"I/Tag( 1): keep first\r\n"
         );
         std::fs::remove_file(filtered).unwrap();
+        cleanup(&state);
+    }
+
+    #[test]
+    fn export_replaces_existing_output_and_preserves_it_on_failure() {
+        let writer = writer();
+        let state = writer.state.clone();
+        writer.record(Cursor::new(b"keep\r\ndrop\n"));
+        let output = state.path.with_extension("export");
+        std::fs::write(&output, b"old export").unwrap();
+        let filter = FilterSpec {
+            find: vec!["keep".into()],
+            ..Default::default()
+        };
+        assert_eq!(export(&state.path, 11, &output, &filter).unwrap(), 1);
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep\r\n");
+        let tmp = crate::config::temp_sibling(&output);
+        assert!(!tmp.exists());
+        // Fail after opening the output, while scanning an over-limit source row.
+        File::create(&state.path)
+            .unwrap()
+            .set_len(crate::io::MAX_INITIAL_LINE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(export(
+            &state.path,
+            crate::io::MAX_INITIAL_LINE_BYTES as u64 + 1,
+            &output,
+            &filter
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep\r\n");
+        assert!(!tmp.exists());
+        // Publishing to a directory also cleans up the completed temporary file.
+        let directory = state.path.with_extension("directory");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&state.path, b"keep\n").unwrap();
+        assert!(export(&state.path, 5, &directory, &filter).is_err());
+        assert!(directory.is_dir());
+        assert!(!crate::config::temp_sibling(&directory).exists());
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_file(output).unwrap();
         cleanup(&state);
     }
 
