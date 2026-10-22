@@ -721,9 +721,21 @@ mod tests {
     }
 
     fn wait(index: &PagedIndex) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Indexing here is a correctness prerequisite, not a speed benchmark.
+        // Shared Windows CI disks can be busy with the concurrent 300 MiB
+        // stress fixtures; keep a finite deadlock bound without requiring a
+        // large scan to finish in five seconds on every runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !index.complete.load(Ordering::Acquire) {
-            assert!(std::time::Instant::now() < deadline);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "indexing timed out for {}: {} / {} bytes, {} rows, error: {:?}",
+                index.path.display(),
+                index.indexed_bytes.load(Ordering::Acquire),
+                index.file_len,
+                index.total_rows.load(Ordering::Acquire),
+                index.error.lock_recover().as_deref(),
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
