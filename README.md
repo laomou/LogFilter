@@ -161,10 +161,23 @@ If `adb` is not on `PATH`, set `adb.adb_path` in the config file. On Windows, th
 ## HarmonyOS log compatibility
 
 Built-in hdc log presets check tools in the device shell: use the original
-preset with `hilog` when available, otherwise use `hilogcat` defaults. Their
-flags are not interchangeable, so fallback does not copy `-v`, `-r`, or `-D`.
-A domain preset that cannot be applied emits a warning; use GUI tag filters
-instead. Missing both tools is an explicit error. Custom commands are unchanged.
+preset with `hilog` when available, otherwise fall back to `hilogcat` default
+streaming. Their flags are not interchangeable, so the fallback does not copy
+`-v` or `-D`; a domain preset that cannot be applied emits a warning — use GUI
+tag filters instead. Missing both tools is an explicit error. Custom commands
+are unchanged.
+
+Presets stream with plain `hilog` (or `hilog -v time`). They deliberately do
+not use `-r`: per the official hilog source, `-r` clears the device log buffer
+and exits, which would wipe the very log being captured. Older versions
+shipped presets with `-r` (and the invalid `threadtime` format); configs saved
+before the fix are migrated to the safe equivalents on load, and the old
+strings still resolve to the safe commands if typed by hand.
+
+hdc also reports protocol failures (no matching target, device dropped) as a
+`[Fail] …` line on *stdout* while exiting 0; LogFilter detects that, records
+nothing, and reports the failure instead of an ordinary "session ended".
+
 This fallback still needs validation on the corresponding HarmonyOS NEXT device.
 
 ## Filtering

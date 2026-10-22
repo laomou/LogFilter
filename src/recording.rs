@@ -368,6 +368,10 @@ pub fn prepare_preview(
                 let mut skipping = skip_partial;
                 let mut hint = LogFormat::Unknown;
                 let mut sent_offset = start;
+                // The BOM (when the device emitted one) sits at byte 0 of the
+                // file: it belongs to the first row, and only the first row. It
+                // would otherwise break the timestamp parse of row 1.
+                let mut first_line = start == 0;
                 loop {
                     if source_epoch.load(Ordering::Acquire) != epoch {
                         return Ok(());
@@ -404,6 +408,9 @@ pub fn prepare_preview(
                                     line.clear();
                                     skipping = true;
                                     omitted += 1;
+                                    // The over-long row is discarded: if it was
+                                    // the file's first row, its BOM went with it.
+                                    first_line = false;
                                 } else {
                                     line.try_reserve(chunk.len()).map_err(|_| {
                                         io::Error::new(
@@ -416,7 +423,15 @@ pub fn prepare_preview(
                             }
                             if newline {
                                 if !skipping {
-                                    push_preview(&mut entries, &mut bytes, &mut line, &mut hint);
+                                    let strip = first_line;
+                                    first_line = false;
+                                    push_preview(
+                                        &mut entries,
+                                        &mut bytes,
+                                        &mut line,
+                                        &mut hint,
+                                        strip,
+                                    );
                                 }
                                 skipping = false;
                             }
@@ -430,7 +445,9 @@ pub fn prepare_preview(
                         }
                     }
                     if done && offset == end && !line.is_empty() && !skipping {
-                        push_preview(&mut entries, &mut bytes, &mut line, &mut hint);
+                        let strip = first_line;
+                        first_line = false;
+                        push_preview(&mut entries, &mut bytes, &mut line, &mut hint, strip);
                     }
                     if !done && offset == sent_offset && entries.is_empty() && omitted == 0 {
                         std::thread::sleep(Duration::from_millis(50));
@@ -480,10 +497,15 @@ fn push_preview(
     bytes: &mut usize,
     line: &mut Vec<u8>,
     hint: &mut LogFormat,
+    strip_bom: bool,
 ) {
-    let text = String::from_utf8_lossy(line)
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
+    let cow = String::from_utf8_lossy(line);
+    let text = if strip_bom {
+        cow.trim_start_matches('\u{feff}')
+    } else {
+        cow.as_ref()
+    };
+    let text = text.trim_end_matches(['\r', '\n']).to_string();
     let (entry, format) = parse_line_hinted(text, *hint);
     if *hint == LogFormat::Unknown {
         *hint = format;
@@ -528,6 +550,9 @@ pub fn export(
     let mut rows = 0u64;
     let mut hint = LogFormat::Unknown;
     let mut raw = Vec::new();
+    // A BOM at byte 0 belongs to row 1's *text* (it would break the timestamp
+    // parse) but the raw export bytes are copied verbatim, BOM included.
+    let mut first_line = true;
     let body: io::Result<()> = (|| {
         loop {
             let n = crate::io::read_line_bounded(
@@ -546,6 +571,12 @@ pub fn export(
             // Decoding the output would turn invalid bytes into U+FFFD and
             // normalise line endings.
             let text = String::from_utf8_lossy(&raw);
+            let text = if first_line {
+                text.trim_start_matches('\u{feff}')
+            } else {
+                text.as_ref()
+            };
+            first_line = false;
             let (entry, format) =
                 parse_line_hinted(text.trim_end_matches(['\r', '\n']).to_string(), hint);
             if hint == LogFormat::Unknown {
@@ -904,6 +935,33 @@ mod tests {
     }
 
     #[test]
+    fn preview_strips_bom_from_first_row_only() {
+        let writer = writer();
+        let state = writer.state.clone();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let rx = preview(state.clone(), 0, 1, epoch, egui::Context::default()).unwrap();
+        let text = [
+            &[0xEF, 0xBB, 0xBF][..],
+            b"01-01 12:00:00.000 1 2 I 00400/Tag: first\n",
+            b"01-01 12:00:00.001 1 2 I 00400/Tag: second\n",
+        ]
+        .concat();
+        writer.record(Cursor::new(text));
+        let mut got = Vec::new();
+        while let Ok(batch) = rx.recv_timeout(Duration::from_secs(5)) {
+            got.extend(batch.entries);
+        }
+        assert_eq!(got.len(), 2);
+        // Row 1 must parse as a hilog row despite the BOM at byte 0.
+        assert_eq!(got[0].time(), "12:00:00.000");
+        assert_eq!(got[0].date(), "01-01");
+        assert_eq!(got[0].level, crate::model::LevelMask::I);
+        assert_eq!(got[0].message(), "first");
+        assert_eq!(got[1].message(), "second");
+        cleanup(&state);
+    }
+
+    #[test]
     fn oversized_preview_line_is_still_recorded_completely() {
         let writer = writer();
         let state = writer.state.clone();
@@ -1160,6 +1218,33 @@ mod tests {
         assert!(directory.is_dir());
         assert!(!crate::config::temp_sibling(&directory).exists());
         std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_file(output).unwrap();
+        cleanup(&state);
+    }
+
+    #[test]
+    fn export_matches_first_line_through_a_bom_but_keeps_raw_bytes() {
+        let writer = writer();
+        let state = writer.state.clone();
+        let bom = [0xEF, 0xBB, 0xBF];
+        let bytes = [
+            &bom[..],
+            b"01-01 12:00:00.000 1 2 I 00400/Tag: first\n",
+            b"01-01 12:00:00.001 1 2 I 00400/Tag: second\n",
+        ]
+        .concat();
+        writer.record(Cursor::new(bytes.clone()));
+        let output = state.path.with_extension("bom_export");
+        // A level filter on the parsed rows: without stripping the BOM, row 1
+        // would fail the timestamp parse (level V) and be silently dropped.
+        let filter = FilterSpec {
+            allowed_levels: Some(crate::model::LevelMask::I),
+            ..Default::default()
+        };
+        let rows = export(&state.path, bytes.len() as u64, &output, &filter).unwrap();
+        assert_eq!(rows, 2, "the BOM must not break row 1's parse");
+        // The exported bytes are the raw rows, BOM included.
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
         std::fs::remove_file(output).unwrap();
         cleanup(&state);
     }

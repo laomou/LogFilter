@@ -173,6 +173,11 @@ pub struct Appended {
     /// backlog drains quickly while the memory per read stays bounded. `more` is
     /// never set when the call consumed nothing, so it cannot spin.
     pub more: bool,
+    /// This call emitted an over-budget *fragment* — a prefix of a line longer
+    /// than the read budget, without its terminating newline. The next read
+    /// must drop one leading newline if the stream happens to start exactly at
+    /// that terminator, or it would resurface as a phantom empty row.
+    pub fragment_pending_newline: bool,
 }
 
 /// A tail-read failure that retrying is not expected to fix.
@@ -298,10 +303,18 @@ pub fn send_utf8_lines(
     tx: Sender<(u64, String)>,
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
+    hold_partial_tail: bool,
 ) -> std::io::Result<Tail> {
     // Use the same fixed-size decoder and bounded line buffer for every file
     // encoding, including BOM-detected UTF-16 and lossy UTF-8.
-    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, encoding_rs::UTF_8)
+    send_decoded_lines_with_enc(
+        file,
+        tx,
+        epoch,
+        source_epoch,
+        encoding_rs::UTF_8,
+        hold_partial_tail,
+    )
 }
 
 pub fn send_decoded_lines(
@@ -310,32 +323,47 @@ pub fn send_decoded_lines(
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
     choice: EncodingChoice,
+    hold_partial_tail: bool,
 ) -> std::io::Result<Tail> {
     let enc = match choice {
         EncodingChoice::Utf8 => encoding_rs::UTF_8,
         EncodingChoice::Local => {
             // UTF-8 is self-validating: a legacy-encoded (GBK/Shift_JIS/…) file's
             // multibyte sequences almost never form valid UTF-8, while real UTF-8
-            // virtually never validates by accident. So sniff a prefix first —
-            // decode modern UTF-8 logs correctly and only fall back to the
-            // locale's legacy codepage when the bytes are clearly not UTF-8. This
-            // stops "Local" from mojibaking a UTF-8 file (the common case today).
-            if looks_like_utf8(&mut file)? {
-                encoding_rs::UTF_8
-            } else {
-                let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
-                pick_local_encoding(&locale)
+            // virtually never validates by accident. So sniff a prefix first.
+            // An all-ASCII prefix is conclusive for NEITHER encoding: decode it
+            // with the locale's legacy codepage, which is also what a pure-ASCII
+            // file produces under UTF-8 — so a legacy file that merely starts
+            // with an English banner is no longer mojibaked from its first
+            // non-ASCII byte onward.
+            match sniff_utf8_prefix(&mut file)? {
+                Utf8Prefix::Utf8 => encoding_rs::UTF_8,
+                Utf8Prefix::NotUtf8 | Utf8Prefix::Inconclusive => {
+                    let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+                    pick_local_encoding(&locale)
+                }
             }
         }
     };
-    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc)
+    send_decoded_lines_with_enc(file, tx, epoch, source_epoch, enc, hold_partial_tail)
 }
 
-/// Peek up to 64 KiB from the start of `file` and report whether it is valid
-/// UTF-8, then rewind so the caller reads from the beginning. A truncated
-/// multibyte sequence at the sniff boundary is tolerated: if the only error is
-/// an incomplete tail, the prefix is still treated as UTF-8.
-fn looks_like_utf8(file: &mut File) -> std::io::Result<bool> {
+/// Outcome of the Local-encoding prefix sniff.
+enum Utf8Prefix {
+    /// The prefix holds non-ASCII bytes that validate as UTF-8.
+    Utf8,
+    /// The prefix holds non-ASCII bytes that are not valid UTF-8.
+    NotUtf8,
+    /// The prefix is pure ASCII: it decodes identically under UTF-8 and the
+    /// locale codepage, so the sniff cannot choose between them.
+    Inconclusive,
+}
+
+/// Peek up to 64 KiB from the start of `file` and classify its UTF-8-ness, then
+/// rewind so the caller reads from the beginning. A truncated multibyte
+/// sequence at the sniff boundary is tolerated: if the only error is an
+/// incomplete tail, the prefix is still treated as UTF-8.
+fn sniff_utf8_prefix(file: &mut File) -> std::io::Result<Utf8Prefix> {
     const SNIFF: usize = 64 * 1024;
     let mut buf = [0u8; SNIFF];
     let mut read = 0;
@@ -350,12 +378,19 @@ fn looks_like_utf8(file: &mut File) -> std::io::Result<bool> {
     }
     file.seek(SeekFrom::Start(0))?;
     let bytes = &buf[..read];
+    if bytes.iter().all(|&b| b < 0x80) {
+        return Ok(Utf8Prefix::Inconclusive);
+    }
     match std::str::from_utf8(bytes) {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(Utf8Prefix::Utf8),
         // `valid_up_to` bytes decoded cleanly; if the remaining error is only a
         // multibyte char cut off by the 64 KiB boundary (no explicit error_len),
         // the content is still UTF-8 — the cut is our artifact, not the file's.
-        Err(e) => Ok(e.error_len().is_none() && e.valid_up_to() > 0),
+        Err(e) => Ok(if e.error_len().is_none() && e.valid_up_to() > 0 {
+            Utf8Prefix::Utf8
+        } else {
+            Utf8Prefix::NotUtf8
+        }),
     }
 }
 
@@ -365,6 +400,7 @@ fn send_decoded_lines_with_enc(
     epoch: u64,
     source_epoch: Arc<AtomicU64>,
     enc: &'static Encoding,
+    hold_partial_tail: bool,
 ) -> std::io::Result<Tail> {
     let identity = file_identity(&file)?;
     let mut reader = BufReader::with_capacity(8192, file);
@@ -421,7 +457,14 @@ fn send_decoded_lines_with_enc(
     }
     // Emit any remaining text without a trailing newline as a final line.
     let has_partial_line = !lines.pending.is_empty();
-    if has_partial_line {
+    // `hold_partial_tail` is set for the reload pass — a file reopened after its
+    // follower detected truncation/rotation. Emitting the tentative final line
+    // here would re-arm `Tail::ReloadOnChange`, and every later change to that
+    // live log would trigger ANOTHER whole-file reload (O(size) I/O per poll).
+    // Instead, keep the partial line out of the model and tail from its start:
+    // the first append read delivers the completed line exactly once.
+    let hold = hold_partial_tail && !is_utf16;
+    if has_partial_line && !hold {
         // Match the UTF-8 reader's `read_until` behavior: a final logical line
         // is preserved even if CR/LF normalization leaves it empty (for example
         // a file ending in a lone `\r`).
@@ -430,6 +473,16 @@ fn send_decoded_lines_with_enc(
         }
     }
     if has_partial_line {
+        if hold {
+            // The follower checks the epoch on every poll and this load just ran
+            // with it, so the tail is safe to arm.
+            let partial_start = partial_line_start(reader.get_mut(), read_bytes, bom_bytes)?;
+            return Ok(Tail::Append {
+                offset: partial_start,
+                enc,
+                identity,
+            });
+        }
         let metadata = reader.get_ref().metadata()?;
         Ok(Tail::ReloadOnChange {
             loaded_len: read_bytes,
@@ -439,6 +492,30 @@ fn send_decoded_lines_with_enc(
         })
     } else {
         Ok(tail_for(read_bytes))
+    }
+}
+
+/// Byte offset of the start of the (unterminated) final line in a file whose
+/// loaded prefix is `end` bytes long: the byte after the last `\n` at or before
+/// `end`, never below `floor` (the load start, just past the BOM). Scans
+/// backwards in 64 KiB chunks; the partial line is capped at
+/// `MAX_INITIAL_LINE_BYTES` by the load itself, so the scan stays bounded.
+fn partial_line_start(file: &mut File, end: u64, floor: u64) -> std::io::Result<u64> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut pos = end;
+    loop {
+        if pos <= floor {
+            return Ok(floor);
+        }
+        let from = pos.saturating_sub(CHUNK).max(floor);
+        let take = (pos - from) as usize;
+        file.seek(SeekFrom::Start(from))?;
+        let mut buf = vec![0u8; take];
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return Ok(from + i as u64 + 1);
+        }
+        pos = from;
     }
 }
 
@@ -466,9 +543,11 @@ pub fn read_appended(
         epoch,
         None,
         &tail_anchor(path, offset),
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_appended_checked(
     path: &Path,
     offset: u64,
@@ -477,6 +556,7 @@ pub(crate) fn read_appended_checked(
     epoch: u64,
     expected_identity: Option<FileIdentity>,
     anchor: &[u8],
+    skip_fragment_newline: bool,
 ) -> std::io::Result<Appended> {
     read_appended_with_budget(
         path,
@@ -487,6 +567,7 @@ pub(crate) fn read_appended_checked(
         expected_identity,
         anchor,
         MAX_TAIL_READ,
+        skip_fragment_newline,
     )
 }
 
@@ -504,6 +585,7 @@ fn read_appended_with_budget(
     expected_identity: Option<FileIdentity>,
     anchor: &[u8],
     max_read: u64,
+    skip_fragment_newline: bool,
 ) -> std::io::Result<Appended> {
     let mut file = File::open(path)?;
     if expected_identity.is_some_and(|expected| file_identity(&file).ok() != Some(expected)) {
@@ -511,6 +593,7 @@ fn read_appended_with_budget(
             offset,
             truncated: true,
             more: false,
+            fragment_pending_newline: false,
         });
     }
     let len = file.seek(SeekFrom::End(0))?;
@@ -519,6 +602,7 @@ fn read_appended_with_budget(
             offset,
             truncated: true,
             more: false,
+            fragment_pending_newline: false,
         });
     }
     // The already-consumed prefix must still be the content we consumed. An
@@ -540,6 +624,7 @@ fn read_appended_with_budget(
                 offset,
                 truncated: true,
                 more: false,
+                fragment_pending_newline: false,
             });
         }
     }
@@ -548,6 +633,7 @@ fn read_appended_with_budget(
             offset,
             truncated: false,
             more: false,
+            fragment_pending_newline: false,
         });
     }
     // Bounded, chunked read: buffer at most `max_read` of the growth, so the
@@ -576,17 +662,31 @@ fn read_appended_with_budget(
         // and, if it happens to start with BOM-like bytes (a real U+FEFF char, or
         // 0xFFFE), drop a char or switch encoding — drifting the byte offset.
         let (text, _) = enc.decode_without_bom_handling(&raw[..usable]);
+        // The previous read emitted an over-budget fragment. If the stream now
+        // starts exactly at that fragment's terminator, the newline belongs to
+        // the already-emitted row: count it in the offset and drop it so it
+        // cannot resurface as a phantom empty row.
+        let (text, skip_units) = if skip_fragment_newline && text.starts_with('\n') {
+            (&text[1..], 2u64)
+        } else {
+            (text.as_ref(), 0u64)
+        };
+        let mut emitted_fragment = false;
         let consumed_chars = match text.rfind('\n') {
             Some(nl) => nl + 1,
             // No complete line in this chunk, and the file holds more than we
             // read: the line exceeds the budget. Emit what we buffered so the
             // tail keeps moving instead of retrying the same read forever.
-            None if unconsumed_beyond => text.len(),
+            None if unconsumed_beyond => {
+                emitted_fragment = true;
+                text.len()
+            }
             None => {
                 return Ok(Appended {
-                    offset,
+                    offset: offset + skip_units,
                     truncated: false,
                     more: false,
+                    fragment_pending_newline: false,
                 })
             }
         };
@@ -594,9 +694,10 @@ fn read_appended_with_budget(
             // Nothing consumable (e.g. only a stray half code unit): report no
             // progress so the caller does not spin.
             return Ok(Appended {
-                offset,
+                offset: offset + skip_units,
                 truncated: false,
                 more: false,
+                fragment_pending_newline: false,
             });
         }
         let consumed = &text[..consumed_chars];
@@ -604,22 +705,32 @@ fn read_appended_with_budget(
             let line = chunk.trim_end_matches(['\r', '\n']).to_string();
             if !send_throttled(tx, epoch, line) {
                 return Ok(Appended {
-                    offset,
+                    offset: offset + skip_units,
                     truncated: false,
                     more: false,
+                    fragment_pending_newline: false,
                 });
             }
         }
         let consumed_bytes = consumed.encode_utf16().count() as u64 * 2;
-        let new_offset = offset + consumed_bytes;
+        let new_offset = offset + skip_units + consumed_bytes;
         return Ok(Appended {
             offset: new_offset,
             truncated: false,
             more: new_offset < len,
+            fragment_pending_newline: emitted_fragment,
         });
     }
 
+    // Same fragment-terminator handling as the UTF-16 arm above, for the
+    // byte-safe codepages (UTF-8 and the legacy single/multibyte ones).
+    let (raw, offset) = if skip_fragment_newline && raw.first() == Some(&b'\n') {
+        (&raw[1..], offset + 1)
+    } else {
+        (&raw[..], offset)
+    };
     // Only consume up to the last newline; bytes after it are a partial line.
+    let mut emitted_fragment = false;
     let end = match raw.iter().rposition(|&b| b == b'\n') {
         Some(nl) => nl + 1,
         // No complete line in this chunk, and the file holds more than we read:
@@ -627,7 +738,8 @@ fn read_appended_with_budget(
         // backing off to a character boundary so the split cannot halve a
         // character; the unconsumed tail is picked up by the next read.
         None if unconsumed_beyond => {
-            let safe = floor_char_boundary(enc, &raw);
+            emitted_fragment = true;
+            let safe = floor_char_boundary(enc, raw);
             if safe == 0 {
                 // The chunk is nothing but an incomplete character (only
                 // reachable when the budget is smaller than one character).
@@ -645,6 +757,7 @@ fn read_appended_with_budget(
                 offset,
                 truncated: false,
                 more: false,
+                fragment_pending_newline: false,
             });
         }
     };
@@ -654,6 +767,7 @@ fn read_appended_with_budget(
             offset,
             truncated: false,
             more: false,
+            fragment_pending_newline: false,
         });
     }
     let complete = &raw[..end];
@@ -670,6 +784,7 @@ fn read_appended_with_budget(
                 offset,
                 truncated: false,
                 more: false,
+                fragment_pending_newline: false,
             });
         }
     }
@@ -678,6 +793,7 @@ fn read_appended_with_budget(
         offset: new_offset,
         truncated: false,
         more: new_offset < len,
+        fragment_pending_newline: emitted_fragment,
     })
 }
 
@@ -1041,9 +1157,9 @@ mod tests {
             let file = File::open(&path).unwrap();
             let epoch = Arc::new(AtomicU64::new(1));
             let result = if local {
-                send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local)
+                send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local, false)
             } else {
-                send_utf8_lines(file, tx, 1, epoch)
+                send_utf8_lines(file, tx, 1, epoch, false)
             };
             let err = result
                 .err()
@@ -1085,7 +1201,7 @@ mod tests {
         let file = std::fs::File::open(&tmp).unwrap();
         // BOM sniffing must retain the buffered prefix so UTF-16 content is
         // decoded from the start, including when opened through the UTF-8 entry point.
-        let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
+        let tail = send_utf8_lines(file, tx, 1, epoch, false).unwrap();
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         assert_eq!(
             lines,
@@ -1120,6 +1236,7 @@ mod tests {
                 1,
                 source_epoch,
                 EncodingChoice::Local,
+                false,
             )
             .unwrap();
             assert_eq!(rx.try_iter().map(|(_, s)| s).collect::<Vec<_>>(), ["first"]);
@@ -1169,6 +1286,7 @@ mod tests {
             1,
             Arc::new(AtomicU64::new(1)),
             EncodingChoice::Local,
+            false,
         )
         .unwrap();
         assert!(matches!(tail, Tail::ReloadOnChange { .. }));
@@ -1195,7 +1313,7 @@ mod tests {
         // Immediately bump epoch so the reader sees a mismatch after first line
         epoch.store(2, std::sync::atomic::Ordering::Release);
         let file = std::fs::File::open(&tmp).unwrap();
-        let _ = send_utf8_lines(file, tx, 1, epoch);
+        let _ = send_utf8_lines(file, tx, 1, epoch, false);
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         let _ = std::fs::remove_file(&tmp);
         // Should have stopped early (at most 1 line read before epoch check)
@@ -1213,9 +1331,9 @@ mod tests {
             let epoch = Arc::new(AtomicU64::new(1));
             let file = std::fs::File::open(&tmp).unwrap();
             if decoded {
-                send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::UTF_8).unwrap();
+                send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::UTF_8, false).unwrap();
             } else {
-                send_utf8_lines(file, tx, 1, epoch).unwrap();
+                send_utf8_lines(file, tx, 1, epoch, false).unwrap();
             }
             rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>()
         };
@@ -1239,7 +1357,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(4);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::GBK).unwrap();
+        send_decoded_lines_with_enc(file, tx, 1, epoch, encoding_rs::GBK, false).unwrap();
         let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
         let _ = std::fs::remove_file(&tmp);
 
@@ -1257,7 +1375,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(64);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local).unwrap();
+        send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local, false).unwrap();
         let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
         let _ = std::fs::remove_file(&tmp);
         lines
@@ -1288,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_utf8_true_for_ascii_and_utf8() {
+    fn utf8_sniff_classifies_ascii_utf8_and_legacy() {
         let mk = |bytes: &[u8]| {
             let tmp = std::env::temp_dir().join(format!(
                 "lf_sniff_{}_{}.bin",
@@ -1297,28 +1415,29 @@ mod tests {
             ));
             std::fs::write(&tmp, bytes).unwrap();
             let mut f = std::fs::File::open(&tmp).unwrap();
-            let r = looks_like_utf8(&mut f).unwrap();
+            let r = sniff_utf8_prefix(&mut f).unwrap();
             // Sniff must rewind: a full read after it still sees all bytes.
             let mut all = Vec::new();
             f.read_to_end(&mut all).unwrap();
             let _ = std::fs::remove_file(&tmp);
             (r, all.len())
         };
-        let (ok, len) = mk("plain ascii\nsecond".as_bytes());
-        assert!(ok);
+        // Pure ASCII is conclusive for neither codec.
+        let (r, len) = mk("plain ascii\nsecond".as_bytes());
+        assert!(matches!(r, Utf8Prefix::Inconclusive));
         assert_eq!(len, "plain ascii\nsecond".len(), "must rewind after sniff");
 
-        let (ok, _) = mk("多字节 UTF-8 内容".as_bytes());
-        assert!(ok);
+        let (r, _) = mk("多字节 UTF-8 内容".as_bytes());
+        assert!(matches!(r, Utf8Prefix::Utf8));
 
         // GBK bytes → not valid UTF-8.
         let (gbk, _, _) = encoding_rs::GBK.encode("中文");
-        let (ok, _) = mk(gbk.as_ref());
-        assert!(!ok);
+        let (r, _) = mk(gbk.as_ref());
+        assert!(matches!(r, Utf8Prefix::NotUtf8));
     }
 
     #[test]
-    fn looks_like_utf8_tolerates_truncated_tail() {
+    fn utf8_sniff_tolerates_truncated_tail() {
         // A valid multibyte char split by the sniff boundary must still count as
         // UTF-8 (error_len is None → incomplete tail, not a real error).
         let mut bytes = "ok ".as_bytes().to_vec();
@@ -1327,7 +1446,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("lf_trunc_{}.bin", std::process::id()));
         std::fs::write(&tmp, &bytes).unwrap();
         let mut f = std::fs::File::open(&tmp).unwrap();
-        assert!(looks_like_utf8(&mut f).unwrap());
+        assert!(matches!(
+            sniff_utf8_prefix(&mut f).unwrap(),
+            Utf8Prefix::Utf8
+        ));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -1435,8 +1557,14 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
-        let tail =
-            send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx, 1, epoch.clone()).unwrap();
+        let tail = send_utf8_lines(
+            std::fs::File::open(&tmp).unwrap(),
+            tx,
+            1,
+            epoch.clone(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>(),
             vec!["partial".to_string()]
@@ -1460,7 +1588,8 @@ mod tests {
 
         // The reload sees the original prefix and appended suffix as one row.
         let (tx, rx) = crossbeam_channel::bounded(16);
-        let _tail = send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx, 1, epoch).unwrap();
+        let _tail =
+            send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx, 1, epoch, false).unwrap();
         assert_eq!(
             rx.try_iter().map(|(_, line)| line).collect::<Vec<_>>(),
             vec!["partial line".to_string()]
@@ -1477,8 +1606,14 @@ mod tests {
 
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
-        let tail =
-            send_utf8_lines(std::fs::File::open(&tmp).unwrap(), tx.clone(), 1, epoch).unwrap();
+        let tail = send_utf8_lines(
+            std::fs::File::open(&tmp).unwrap(),
+            tx.clone(),
+            1,
+            epoch,
+            false,
+        )
+        .unwrap();
         let (offset, identity) = match tail {
             Tail::Append {
                 offset, identity, ..
@@ -1499,6 +1634,7 @@ mod tests {
             1,
             Some(identity),
             &tail_anchor(&tmp, offset),
+            false,
         )
         .unwrap();
         assert!(result.truncated, "replacement must trigger a full reload");
@@ -1533,6 +1669,7 @@ mod tests {
             None,
             &anchor,
             4096,
+            false,
         )
         .unwrap();
         assert!(
@@ -1563,6 +1700,7 @@ mod tests {
             None,
             &anchor,
             4096,
+            false,
         )
         .unwrap();
         assert!(
@@ -1590,6 +1728,7 @@ mod tests {
             None,
             &anchor,
             4096,
+            false,
         )
         .unwrap();
         assert!(
@@ -1667,7 +1806,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        let tail = send_utf8_lines(file, tx, 1, epoch).unwrap();
+        let tail = send_utf8_lines(file, tx, 1, epoch, false).unwrap();
         match tail {
             Tail::Append { offset, enc, .. } => {
                 assert_eq!(offset, 12);
@@ -1707,7 +1846,10 @@ mod tests {
         let mut bytes = vec![0xef, 0xbb, 0xbf];
         bytes.extend_from_slice(&body);
         std::fs::write(&tmp, &bytes).unwrap();
-        assert!(!looks_like_utf8(&mut File::open(&tmp).unwrap()).unwrap());
+        assert!(matches!(
+            sniff_utf8_prefix(&mut File::open(&tmp).unwrap()).unwrap(),
+            Utf8Prefix::NotUtf8
+        ));
         let (tx, rx) = crossbeam_channel::unbounded();
         let tail = send_decoded_lines_with_enc(
             File::open(&tmp).unwrap(),
@@ -1715,6 +1857,7 @@ mod tests {
             1,
             Arc::new(AtomicU64::new(1)),
             encoding_rs::GBK,
+            false,
         )
         .unwrap();
         assert_eq!(rx.recv().unwrap().1, "中文");
@@ -1735,8 +1878,84 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let epoch = Arc::new(AtomicU64::new(1));
         let file = std::fs::File::open(&tmp).unwrap();
-        let tail = send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local).unwrap();
+        let tail = send_decoded_lines(file, tx, 1, epoch, EncodingChoice::Local, false).unwrap();
         assert_eq!(tail.encoding_name(), "UTF-8");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn hold_partial_tail_anchors_append_at_partial_line_start() {
+        // The reload pass: a partial final line must NOT be emitted (it was not
+        // shown by the superseded load) and the tail must start at the partial
+        // line's beginning, so the first append read delivers the completed line
+        // exactly once.
+        let tmp = unique_tmp("hold_partial_tail");
+        std::fs::write(&tmp, "first\nsecond\npartial".as_bytes()).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let tail = send_utf8_lines(
+            File::open(&tmp).unwrap(),
+            tx.clone(),
+            1,
+            epoch.clone(),
+            true,
+        )
+        .unwrap();
+        // Only the two complete lines arrived; "partial" was held back.
+        assert_eq!(
+            rx.try_iter().map(|(_, l)| l).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        let offset = match tail {
+            Tail::Append { offset, .. } => offset,
+            _ => panic!("hold must yield an append tail anchored at the partial line"),
+        };
+        assert_eq!(
+            offset,
+            "first\nsecond\n".len() as u64,
+            "the anchor is the partial line's start, not the EOF"
+        );
+
+        // The writer finishes the partial line: it arrives exactly once, from the
+        // anchored tail.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+        f.write_all(b" line\n").unwrap();
+        let a = read_appended_checked(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], false)
+            .unwrap();
+        assert_eq!(a.offset, "first\nsecond\npartial line\n".len() as u64);
+        let got = rx.try_iter().map(|(_, l)| l).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec!["partial line"],
+            "the completed line must arrive once"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn normal_open_still_arms_reload_on_change_for_partial_tail() {
+        // The non-reload path is unchanged: a partial tail emits its final line
+        // and returns ReloadOnChange, not an append tail.
+        let tmp = unique_tmp("reload_arming");
+        std::fs::write(&tmp, "a\nb".as_bytes()).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let tail = send_utf8_lines(
+            File::open(&tmp).unwrap(),
+            tx,
+            1,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rx.try_iter().map(|(_, l)| l).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(
+            matches!(tail, Tail::ReloadOnChange { .. }),
+            "a normal open keeps the legacy reload-on-change arming"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -1781,9 +2000,18 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0;
         loop {
-            let a =
-                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 64)
-                    .unwrap();
+            let a = read_appended_with_budget(
+                &tmp,
+                offset,
+                encoding_rs::UTF_8,
+                &tx,
+                1,
+                None,
+                &[],
+                64,
+                false,
+            )
+            .unwrap();
             calls += 1;
             assert!(a.offset > offset, "every call must make progress");
             assert!(
@@ -1822,9 +2050,18 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0;
         loop {
-            let a =
-                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 100)
-                    .unwrap();
+            let a = read_appended_with_budget(
+                &tmp,
+                offset,
+                encoding_rs::UTF_8,
+                &tx,
+                1,
+                None,
+                &[],
+                100,
+                false,
+            )
+            .unwrap();
             calls += 1;
             offset = a.offset;
             if !a.more {
@@ -1845,8 +2082,18 @@ mod tests {
             let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
             f.write_all(b"\n").unwrap();
         }
-        let a = read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 100)
-            .unwrap();
+        let a = read_appended_with_budget(
+            &tmp,
+            offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &[],
+            100,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             a.offset,
             original.len() as u64 + 1,
@@ -1880,9 +2127,18 @@ mod tests {
         let mut offset = 0u64;
         let mut guard = 0;
         loop {
-            let a =
-                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 10)
-                    .unwrap();
+            let a = read_appended_with_budget(
+                &tmp,
+                offset,
+                encoding_rs::UTF_8,
+                &tx,
+                1,
+                None,
+                &[],
+                10,
+                false,
+            )
+            .unwrap();
             guard += 1;
             assert!(a.offset > offset, "a force-split must still advance");
             offset = a.offset;
@@ -1923,9 +2179,18 @@ mod tests {
         let mut offset = 0u64;
         let mut calls = 0usize;
         loop {
-            let a =
-                read_appended_with_budget(&tmp, offset, encoding_rs::UTF_8, &tx, 1, None, &[], 1)
-                    .unwrap();
+            let a = read_appended_with_budget(
+                &tmp,
+                offset,
+                encoding_rs::UTF_8,
+                &tx,
+                1,
+                None,
+                &[],
+                1,
+                false,
+            )
+            .unwrap();
             calls += 1;
             assert!(
                 a.offset > offset || !a.more,
@@ -1974,6 +2239,7 @@ mod tests {
                 None,
                 &[],
                 6,
+                false,
             )
             .unwrap();
             guard += 1;
@@ -2027,9 +2293,18 @@ mod tests {
 
         // Consume one budget-sized chunk: the offset is now mid-file and a
         // backlog is still pending.
-        let first =
-            read_appended_with_budget(&tmp, 0, encoding_rs::UTF_8, &tx, 1, Some(identity), &[], 64)
-                .unwrap();
+        let first = read_appended_with_budget(
+            &tmp,
+            0,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            Some(identity),
+            &[],
+            64,
+            false,
+        )
+        .unwrap();
         assert!(first.more, "a backlog must still be pending");
         assert!(first.offset > 0 && first.offset < content.len() as u64);
 
@@ -2045,6 +2320,7 @@ mod tests {
             Some(identity),
             &tail_anchor(&tmp, first.offset),
             64,
+            false,
         )
         .unwrap();
         assert!(after_trunc.truncated, "truncation must trigger a reload");
@@ -2064,6 +2340,7 @@ mod tests {
             Some(identity),
             &[],
             64,
+            false,
         )
         .unwrap();
         assert!(after_replace.truncated, "replacement must trigger a reload");
@@ -2193,6 +2470,130 @@ mod tests {
             joined.bytes().all(|b| b == b'x'),
             "content must be preserved exactly"
         );
+    }
+
+    #[test]
+    fn fragment_terminator_at_chunk_boundary_is_not_a_phantom_line() {
+        // A line of exactly `budget` + 1 bytes crosses the read boundary on its
+        // newline: the first read emits the fragment (no terminator), and the
+        // second read starts exactly at that newline. Without the
+        // fragment_pending_newline handoff the newline would be emitted as a
+        // phantom empty row.
+        let tmp = unique_tmp("fragment_terminator");
+        let budget: u64 = 64;
+        let line: String = "A".repeat(64); // + '\n' = 65 bytes total
+        std::fs::write(&tmp, format!("{line}\n").as_bytes()).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+
+        // Read 1: the whole budget is one un-terminated fragment; the newline
+        // already exists just beyond the read boundary.
+        let a = read_appended_with_budget(
+            &tmp,
+            0,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &[],
+            budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.offset, budget);
+        assert!(a.more);
+        assert!(
+            a.fragment_pending_newline,
+            "an over-budget fragment must flag its pending terminator"
+        );
+
+        // Read 2: starts exactly at read 1's terminator; it must count the byte
+        // and emit nothing.
+        let b = read_appended_with_budget(
+            &tmp,
+            a.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &[],
+            budget,
+            true,
+        )
+        .unwrap();
+        assert_eq!(b.offset, 65, "the terminator byte must be counted");
+        assert!(!b.more);
+        assert!(!b.fragment_pending_newline);
+
+        // A normal follow-up line still arrives.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+        f.write_all(b"next\n").unwrap();
+        let c = read_appended_with_budget(
+            &tmp,
+            b.offset,
+            encoding_rs::UTF_8,
+            &tx,
+            1,
+            None,
+            &[],
+            budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.offset, 70);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            got,
+            vec![line, "next".to_string()],
+            "the terminator must not resurface as an empty row"
+        );
+    }
+
+    #[test]
+    fn utf16_fragment_terminator_at_chunk_boundary_is_not_a_phantom_line() {
+        // Same boundary case for the UTF-16 arm, where the terminator is the
+        // '\n' *character* (two bytes) and the offset advances in code units.
+        let tmp = unique_tmp("fragment_terminator_utf16");
+        let mut bytes = "BBBB"
+            .encode_utf16()
+            .collect::<Vec<u16>>()
+            .into_iter()
+            .flat_map(|u| u.to_le_bytes())
+            .collect::<Vec<u8>>(); // 4 code units = 8 bytes
+        bytes.extend_from_slice(&10u16.to_le_bytes()); // + '\n' => 10 bytes total
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let collector = collect_lines(rx);
+        let a =
+            read_appended_with_budget(&tmp, 0, encoding_rs::UTF_16LE, &tx, 1, None, &[], 8, false)
+                .unwrap();
+        assert_eq!(a.offset, 8);
+        assert!(a.fragment_pending_newline);
+
+        let b = read_appended_with_budget(
+            &tmp,
+            a.offset,
+            encoding_rs::UTF_16LE,
+            &tx,
+            1,
+            None,
+            &[],
+            8,
+            true,
+        )
+        .unwrap();
+        assert_eq!(b.offset, 10, "the terminator unit must be counted");
+        assert!(!b.more);
+
+        drop(tx);
+        let got = collector.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, vec!["BBBB"], "no phantom empty row for UTF-16 either");
     }
 
     #[test]
