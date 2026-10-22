@@ -120,6 +120,7 @@ status_loaded = 已加载 {path} — {n} 行
 status_dev_started = {tool} {cmd} 已启动
 status_dev_start_failed = {tool} 启动失败: {e}
 status_dev_stopped = {tool} 已停止
+status_dev_notice = {tool} 提示：{e}
 status_dev_paused = {tool} 已暂停
 status_dev_resumed = {tool} 已恢复
 status_dev_devices = {tool} 设备: {n} 个
@@ -153,6 +154,7 @@ status_page_failed = 分页文件错误：{e}
 status_paged_reloading = 文件已在磁盘上改变（{e}），正在重建磁盘索引
 status_paged_fallback = 磁盘索引构建失败（{e}），已改用普通方式重新加载该文件
 status_paged_filter_fallback = 过滤索引构建失败（{e}），当前显示未过滤的分页内容
+status_cleared_paged = 已清空；大文件的磁盘索引已释放（重新打开该文件会重建）
 paged_utf8_only = 大文件分页浏览目前仅支持 UTF-8
 status_goto_paged_filtered = 跳转原始行号前请先清除全局过滤
 

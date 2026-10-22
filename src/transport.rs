@@ -90,13 +90,17 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         transport: Transport::Adb,
         format: LogFormat::Time,
     },
+    // Plain `hilog` (optionally with an explicit format) does a *blocking
+    // streaming* read. Older presets used `-r`, which per the official hilog
+    // source **clears the device log buffer and exits** — destructive for a
+    // capture tool — and `threadtime`, which is not a valid hilog `-v` value.
     BuiltinCommand {
-        cmd: "hilog -v threadtime -r",
+        cmd: "hilog",
         transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
     BuiltinCommand {
-        cmd: "hilog -v time -r",
+        cmd: "hilog -v time",
         transport: Transport::Hdc,
         format: LogFormat::HiLog,
     },
@@ -133,21 +137,44 @@ pub fn default_commands(transport: Transport) -> Vec<String> {
         .collect()
 }
 
+/// Presets shipped by older versions that turned out to be broken: `-r` clears
+/// the device hilog buffer (destructive) and `threadtime` is not a valid hilog
+/// `-v` value. Configs saved before the fix can still contain them — and a user
+/// can retype one — so they resolve to the closest safe streaming preset.
+pub fn legacy_hdc_preset(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "hilog -v threadtime -r" => Some("hilog"),
+        "hilog -v time -r" => Some("hilog -v time"),
+        _ => None,
+    }
+}
+
 /// Resolve only our built-in hdc presets on the device. hilogcat does not
 /// share hilog's option grammar, so its fallback uses default streaming and
 /// explicitly reports when a domain preset cannot be applied.
 fn device_command_args(transport: Transport, cmd: &str) -> Result<Vec<String>> {
     let args = shlex::split(cmd)
         .ok_or_else(|| anyhow!("unbalanced quotes or trailing backslash in command: {cmd}"))?;
-    if transport != Transport::Hdc || builtin_command(cmd).is_none() {
+    if transport != Transport::Hdc {
         return Ok(args);
     }
-    let primary = args
+    // A legacy preset is rewritten to its safe replacement so the wrapper (and
+    // the hilogcat fallback) still apply to configs saved before the fix.
+    let effective_cmd = match legacy_hdc_preset(cmd) {
+        Some(replacement) => replacement,
+        None => match builtin_command(cmd) {
+            Some(_) => cmd,
+            None => return Ok(args),
+        },
+    };
+    let effective_args = shlex::split(effective_cmd)
+        .ok_or_else(|| anyhow!("malformed built-in command: {effective_cmd}"))?;
+    let primary = effective_args
         .iter()
         .map(|arg| shlex::try_quote(arg).map(|q| q.into_owned()))
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join(" ");
-    let notice = if args.iter().any(|a| a == "-D") {
+    let notice = if effective_args.iter().any(|a| a == "-D") {
         "LogFilter: hilog unavailable; using hilogcat defaults (domain preset not supported)"
     } else {
         "LogFilter: hilog unavailable; using hilogcat default output"
@@ -233,6 +260,22 @@ pub fn list_devices(transport: Transport, override_path: Option<&str>) -> Result
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    // hdc reports daemon/protocol errors (no matching target, device dropped)
+    // as `[Fail] …` lines on **stdout** with exit code 0 — so the success
+    // check above is dead for hdc. Surface the failure instead of letting the
+    // error text be parsed as a device list.
+    if transport == Transport::Hdc {
+        if let Some(line) = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("[Fail]"))
+        {
+            return Err(anyhow!(
+                "`{bin} {}` failed: {line}",
+                transport.list_args().join(" ")
+            ));
+        }
+    }
     Ok(match transport {
         Transport::Adb => parse_device_lines(&text),
         Transport::Hdc => parse_hdc_targets(&text),
@@ -240,11 +283,11 @@ pub fn list_devices(transport: Transport, override_path: Option<&str>) -> Result
 }
 
 /// Parse `hdc list targets` output: one connect key per line, or `[Empty]` when
-/// no device is attached.
+/// no device is attached. `[Fail]` protocol-error lines are never devices.
 fn parse_hdc_targets(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && *l != "[Empty]")
+        .filter(|l| !l.is_empty() && *l != "[Empty]" && !l.starts_with("[Fail]"))
         .map(String::from)
         .collect()
 }
@@ -433,6 +476,79 @@ impl Read for CancellableStdout {
     }
 }
 
+/// hdc reports protocol errors — no matching target, device dropped — by
+/// printing a `[Fail] …` line to **stdout** and still exiting 0. Without this
+/// guard such a session records the error text as one row of log data and the
+/// UI reports an ordinary "session ended".
+///
+/// The guard inspects the first line of the stream. A `[Fail]` line is
+/// published into the session's `read_error` slot (surfaced by the existing
+/// "capture failed: …" status) and nothing is recorded; any other first line is
+/// passed through untouched, followed by the rest of the stream.
+struct HdcFailureGuard<R: Read> {
+    inner: R,
+    /// First-line bytes pulled in but not yet passed through.
+    pending: Vec<u8>,
+    checked: bool,
+    failed: bool,
+    read_error: Arc<Mutex<Option<String>>>,
+}
+
+impl<R: Read> HdcFailureGuard<R> {
+    fn new(inner: R, read_error: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            checked: false,
+            failed: false,
+            read_error,
+        }
+    }
+}
+
+impl<R: Read> Read for HdcFailureGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.failed {
+            return Ok(0);
+        }
+        if !self.checked {
+            self.checked = true;
+            // Pull until the first newline (protocol-error lines are short; the
+            // cap keeps a pathological stream from being buffered forever).
+            let mut tmp = [0u8; 4096];
+            loop {
+                if self.pending.contains(&b'\n') || self.pending.len() >= 8192 {
+                    break;
+                }
+                let n = self.inner.read(&mut tmp)?;
+                if n == 0 {
+                    break;
+                }
+                self.pending.extend_from_slice(&tmp[..n]);
+            }
+            let first_end = self
+                .pending
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(self.pending.len(), |i| i);
+            let first_line = String::from_utf8_lossy(&self.pending[..first_end]);
+            if first_line.trim_start().starts_with("[Fail]") {
+                self.failed = true;
+                *self.read_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(first_line.trim().to_string());
+                return Ok(0);
+            }
+        }
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
 enum Output {
     Recording(recording::Writer),
     #[cfg(test)]
@@ -547,6 +663,14 @@ impl Session {
         let epoch = Arc::new(AtomicU64::new(epoch));
         #[cfg(test)]
         let reader_epoch = epoch.clone();
+        // See `HdcFailureGuard`: for hdc, session failures arrive on stdout and
+        // are published into `read_error` so the UI reports "capture failed"
+        // instead of an ordinary "session ended".
+        let stdout: Box<dyn Read + Send> = if transport == Transport::Hdc {
+            Box::new(HdcFailureGuard::new(stdout, read_error_thr.clone()))
+        } else {
+            Box::new(stdout)
+        };
         let handle = thread::Builder::new()
             .name("device-reader".into())
             .spawn(move || {
@@ -594,8 +718,6 @@ impl Session {
 
         // Drain stderr on its own thread into a shared buffer.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
-
-        // Drain stderr on its own thread into the buffer created above.
         let stderr_handle = if let Some(mut es) = child.get().stderr.take() {
             let buf = stderr_buf.clone();
             Some(
@@ -1012,6 +1134,137 @@ mod tests {
             device_command_args(Transport::Adb, "logcat -v threadtime").unwrap(),
             ["logcat", "-v", "threadtime"]
         );
+    }
+
+    #[test]
+    fn legacy_hdc_presets_resolve_to_safe_streaming() {
+        // Configs saved before the fix (or retyped by hand) still carry the
+        // old presets, whose `-r` flag CLEARS the device buffer. They must
+        // resolve to the safe streaming equivalents, never run verbatim.
+        let args = device_command_args(Transport::Hdc, "hilog -v time -r").unwrap();
+        assert_eq!(args[0], "shell");
+        assert!(args[1].contains("exec hilog -v time;"), "{}", args[1]);
+        assert!(!args[1].contains("-r"), "{}", args[1]);
+
+        let args = device_command_args(Transport::Hdc, "hilog -v threadtime -r").unwrap();
+        assert!(args[1].contains("exec hilog;"), "{}", args[1]);
+        assert!(!args[1].contains("threadtime"), "{}", args[1]);
+
+        // A different command that merely contains the old string untouched.
+        assert_eq!(
+            device_command_args(Transport::Hdc, "hilog -v time -r extra").unwrap(),
+            ["hilog", "-v", "time", "-r", "extra"]
+        );
+    }
+
+    #[test]
+    fn parse_hdc_targets_skips_failure_lines() {
+        assert_eq!(parse_hdc_targets("[Empty]"), Vec::<String>::new());
+        assert_eq!(
+            parse_hdc_targets("FAKE123\n[Fail]Not match target founded\n"),
+            vec!["FAKE123"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_devices_reports_hdc_stdout_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = gate_path("hdc_list_fail");
+        std::fs::create_dir(&dir).unwrap();
+        let bin = dir.join("hdc");
+        // hdc exits 0 even when the daemon reports a protocol failure; the
+        // error text arrives on stdout.
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\necho '[Fail]Not match target founded, check connect-key please'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = list_devices(Transport::Hdc, Some(bin.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("[Fail]"), "{err}");
+
+        // A plain empty list is still a normal result.
+        std::fs::write(&bin, "#!/bin/sh\necho '[Empty]'\n").unwrap();
+        assert_eq!(
+            list_devices(Transport::Hdc, Some(bin.to_str().unwrap())).unwrap(),
+            Vec::<String>::new()
+        );
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hdc_fail_on_stdout_is_reported_not_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = gate_path("hdc_capture_fail");
+        std::fs::create_dir(&dir).unwrap();
+        let bin = dir.join("hdc");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\necho '[Fail]Not match target founded, check connect-key please'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = recording::Writer::create(&dir).unwrap();
+        let state = writer.state.clone();
+        let mut session = Session::start_recording(
+            Transport::Hdc,
+            Some(bin.to_str().unwrap()),
+            None,
+            "hilog",
+            writer,
+        )
+        .unwrap();
+        // The failure text must surface as a diagnostic, not vanish.
+        wait_until(|| {
+            session
+                .read_error_text()
+                .is_some_and(|e| e.contains("[Fail]"))
+        });
+        wait_for_reap(&mut session);
+        // And it must not be recorded as a row of log data.
+        wait_until(|| state.finished.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&state.path).unwrap(), Vec::<u8>::new());
+        std::fs::remove_file(&state.path).unwrap();
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hdc_guard_passes_real_log_lines_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = gate_path("hdc_capture_ok");
+        std::fs::create_dir(&dir).unwrap();
+        let bin = dir.join("hdc");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\necho '01-01 12:34:56.789 1 2 I 00400/Tag: first line'\necho '01-01 12:34:56.790 1 2 I 00400/Tag: second line'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = recording::Writer::create(&dir).unwrap();
+        let state = writer.state.clone();
+        let mut session = Session::start_recording(
+            Transport::Hdc,
+            Some(bin.to_str().unwrap()),
+            None,
+            "hilog",
+            writer,
+        )
+        .unwrap();
+        wait_for_reap(&mut session);
+        wait_until(|| state.finished.load(Ordering::Acquire));
+        assert_eq!(
+            std::fs::read(&state.path).unwrap(),
+            b"01-01 12:34:56.789 1 2 I 00400/Tag: first line\n01-01 12:34:56.790 1 2 I 00400/Tag: second line\n"
+        );
+        assert!(session.read_error_text().is_none());
+        std::fs::remove_file(&state.path).unwrap();
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

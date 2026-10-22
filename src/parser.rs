@@ -82,7 +82,13 @@ fn re_long() -> &'static Regex {
 fn re_kernel() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"^(?:<(?P<lv>[0-7])>)?(?:\[\s*(?P<time>\d+(?:\.\d+)?)\]|(?P<bare_time>\d+(?:\.\d+)?))\s*(?:\[\s*[TC](?P<tid>\d+)\]\s*)?(?P<msg>.*)$").unwrap()
+        // The `<pri>` field is the full syslog priority (facility*8 + level,
+        // 0–191 on real devices, e.g. `<14>` and `<38>` for audit/init), so
+        // accept up to three digits and derive the level with `prio % 8`.
+        // The timestamp must be bracketed (`[ 12.345]`): an unbracketed number
+        // right after `<pri>` is message content (e.g. `<6>123 hello`), not a
+        // timestamp.
+        Regex::new(r"^(?:<(?P<lv>[0-9]{1,3})>)?(?:\[\s*(?P<time>\d+(?:\.\d+)?)\])?\s*(?:\[\s*[TC](?P<tid>\d+)\]\s*)?(?P<msg>.*)$").unwrap()
     })
 }
 
@@ -266,8 +272,8 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                 }
                 let level = c
                     .name("lv")
-                    .and_then(|m| m.as_str().parse::<u8>().ok())
-                    .map(LevelMask::from_kernel_digit)
+                    .and_then(|m| m.as_str().parse::<u16>().ok())
+                    .map(|prio| LevelMask::from_kernel_digit((prio % 8) as u8))
                     .unwrap_or_else(|| {
                         let message = c["msg"].to_ascii_lowercase();
                         if message.contains("kernel panic") {
@@ -283,10 +289,8 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
                     level,
                     [
                         EMPTY,
-                        c.name("time").map_or_else(
-                            || span(&c, "bare_time"),
-                            |m| (m.start() as u32, m.end() as u32),
-                        ),
+                        c.name("time")
+                            .map_or(EMPTY, |m| (m.start() as u32, m.end() as u32)),
                         EMPTY,
                         span(&c, "tid"),
                         EMPTY,
@@ -778,6 +782,45 @@ mod tests {
         let (e, f) = parse_line("<7>[0.003] debug msg".to_string());
         assert_eq!(f, LogFormat::Kernel);
         assert_eq!(e.level, LevelMask::D);
+    }
+
+    #[test]
+    fn kernel_multidigit_syslog_priority() {
+        // Real MTK/Android kmsg carries the full syslog priority
+        // (facility*8 + level): `<14>` and `<38>` both map to level 6 (Info).
+        let (e, f) = parse_line(
+            "<14>[81083.676255][    T1] init: starting service 'audioserver'".to_string(),
+        );
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.time(), "81083.676255");
+        assert_eq!(e.tid(), "1");
+        assert_eq!(e.message(), "init: starting service 'audioserver'");
+
+        let (e, f) =
+            parse_line("<38>[81083.731142][  T534] type=1400 audit(0.0:42): denied".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::I);
+
+        // facility 1, level 0 (KERN_EMERG) → Fatal
+        let (e, f) = parse_line("<8>[1.2] oops".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::F);
+    }
+
+    #[test]
+    fn kernel_priority_without_timestamp_keeps_numeric_message() {
+        // No `[ts]` (CONFIG_PRINTK_TIME off): the number after `<pri>` is
+        // message content, not a timestamp.
+        let (e, f) = parse_line("<6>123 hello".to_string());
+        assert_eq!(f, LogFormat::Kernel);
+        assert_eq!(e.level, LevelMask::I);
+        assert_eq!(e.time(), "");
+        assert_eq!(e.message(), "123 hello");
+
+        // A bare number with no syslog prefix is not a kernel record at all.
+        let (_, f) = parse_line("123456: some message".to_string());
+        assert_eq!(f, LogFormat::Unknown);
     }
 
     /// Field extraction must not depend on the hint.

@@ -40,6 +40,10 @@ enum SaveOutcome {
         path: PathBuf,
     },
     Failed(String),
+    /// A paged export failed because the file changed under the index while it
+    /// ran. The destination is untouched; the UI rebuilds the index (or falls
+    /// back to streaming) and the user re-runs the export.
+    FileChanged(String),
 }
 
 struct DeviceRefresh {
@@ -120,6 +124,10 @@ pub struct App {
     /// retired recording per save attempt.
     retired_recording_paths: std::collections::HashSet<PathBuf>,
     recording_error_reported: bool,
+    /// stderr already surfaced as a live notice for the current device session,
+    /// so a growing buffer (e.g. the hilogcat fallback warning) updates the
+    /// status once per new content instead of every frame.
+    session_stderr_notified: String,
     preview_rx: Option<Receiver<PreviewBatch>>,
     preview_offset: u64,
     preview_omitted: u64,
@@ -168,9 +176,10 @@ pub struct App {
     /// repaint and hand reload requests back to the UI thread.
     ctx: egui::Context,
     /// Set by the tail poller when the followed file is rotated/truncated (or
-    /// grows under a reload-only encoding). The UI thread picks it up and does a
-    /// full `open_file` reload. `None` = nothing pending.
-    reload_request: Arc<Mutex<Option<PathBuf>>>,
+    /// grows under a reload-only encoding). Carries the load's epoch so the UI
+    /// can discard a request superseded by a newer open/clear before it lands.
+    /// The UI thread picks it up and does a full reload. `None` = nothing pending.
+    reload_request: Arc<Mutex<Option<(PathBuf, u64)>>>,
     /// Encoding actually used for the current file load, resolved by the loader
     /// (notably "Local" → the sniffed UTF-8/legacy codepage). Shown in the status
     /// bar so the user sees the real encoding, not just their menu choice.
@@ -502,6 +511,7 @@ impl App {
             previous_recordings: Vec::new(),
             retired_recording_paths: std::collections::HashSet::new(),
             recording_error_reported: false,
+            session_stderr_notified: String::new(),
             preview_rx: None,
             preview_offset: 0,
             preview_omitted: 0,
@@ -583,15 +593,28 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
-        self.open_file_impl(path, true)
+        self.open_file_impl(path, true, false)
+    }
+
+    /// Reopen a *followed* file after its follower detected a truncation or
+    /// rotation. The reload pass holds the tentative final line out of the
+    /// model and anchors the tail at its start, so a live writer cannot re-arm
+    /// `ReloadOnChange` and trigger another whole-file reload on every change.
+    pub(crate) fn reload_followed_file(&mut self, path: &Path) -> Result<()> {
+        self.open_file_impl(path, true, true)
     }
 
     /// Open a file for the view. `allow_paged` selects the bounded-memory paged
     /// viewer when the file outgrows the in-memory budget. A failed paged index
     /// build retries through this method with `allow_paged = false` (see
     /// [`Self::poll_paged`]); the flag keeps that retry from re-entering the
-    /// paged path and looping.
-    fn open_file_impl(&mut self, path: &Path, allow_paged: bool) -> Result<()> {
+    /// paged path and looping. `hold_partial_tail` is the reload behavior above.
+    fn open_file_impl(
+        &mut self,
+        path: &Path,
+        allow_paged: bool,
+        hold_partial_tail: bool,
+    ) -> Result<()> {
         // Open the file here to validate access and hold the handle through the
         // background load — avoids TOCTOU (open-to-use race) and eliminates the
         // duplicate open in the reader thread.
@@ -658,12 +681,21 @@ impl App {
             .name("file-load".into())
             .spawn(move || {
                 let res = match choice {
-                    EncodingChoice::Utf8 => {
-                        send_utf8_lines(file, tx.clone(), epoch, source_epoch.clone())
-                    }
-                    EncodingChoice::Local => {
-                        send_decoded_lines(file, tx.clone(), epoch, source_epoch.clone(), choice)
-                    }
+                    EncodingChoice::Utf8 => send_utf8_lines(
+                        file,
+                        tx.clone(),
+                        epoch,
+                        source_epoch.clone(),
+                        hold_partial_tail,
+                    ),
+                    EncodingChoice::Local => send_decoded_lines(
+                        file,
+                        tx.clone(),
+                        epoch,
+                        source_epoch.clone(),
+                        choice,
+                        hold_partial_tail,
+                    ),
                 };
                 let tail = match res {
                     Ok(t) => t,
@@ -881,7 +913,7 @@ impl App {
     fn fallback_from_paged(&mut self, path: &Path, index_error: &str) {
         // Cancels the failed indexes and their workers.
         self.paged = None;
-        match self.open_file_impl(path, false) {
+        match self.open_file_impl(path, false, false) {
             Ok(()) => {
                 self.status = tr!("status_paged_fallback", { e: index_error });
             }
@@ -1213,13 +1245,15 @@ fn follow_file(
     tx: &Sender<(u64, String)>,
     epoch: u64,
     source_epoch: &Arc<AtomicU64>,
-    reload_request: &Arc<Mutex<Option<PathBuf>>>,
+    reload_request: &Arc<Mutex<Option<(PathBuf, u64)>>>,
     load_error: &Arc<Mutex<Option<String>>>,
     ctx: &egui::Context,
 ) {
     const POLL: Duration = Duration::from_millis(500);
+    // The epoch is carried so the UI can discard the request if a newer load
+    // (open or clear) superseded this follower before it got to the slot.
     let request_reload = || {
-        *reload_request.lock_recover() = Some(path.to_path_buf());
+        *reload_request.lock_recover() = Some((path.to_path_buf(), epoch));
         ctx.request_repaint();
     };
     match tail {
@@ -1238,6 +1272,10 @@ fn follow_file(
             // `copytruncate` rewrite (same inode, possibly the same length) is
             // detected instead of being spliced onto the old offset.
             let mut anchor = crate::io::tail_anchor(path, offset);
+            // Carries the fragment-terminator state between reads: after a read
+            // emits an over-long line's fragment, the next read must drop one
+            // leading newline if the stream happens to start exactly there.
+            let mut fragment_pending_newline = false;
             let mut wait = POLL;
             loop {
                 if !wait.is_zero() {
@@ -1247,12 +1285,23 @@ fn follow_file(
                 if source_epoch.load(Ordering::Acquire) != epoch {
                     return; // superseded by a newer load
                 }
-                match read_appended_checked(path, offset, enc, tx, epoch, Some(identity), &anchor) {
+                let skip = fragment_pending_newline;
+                match read_appended_checked(
+                    path,
+                    offset,
+                    enc,
+                    tx,
+                    epoch,
+                    Some(identity),
+                    &anchor,
+                    skip,
+                ) {
                     Ok(a) if a.truncated => {
                         request_reload();
                         return;
                     }
                     Ok(a) => {
+                        fragment_pending_newline = a.fragment_pending_newline;
                         if a.offset != offset {
                             offset = a.offset;
                             anchor = crate::io::tail_anchor(path, offset);
@@ -1614,6 +1663,7 @@ impl App {
         self.preview_rx = Some(preview);
         self.recording = Some(recorded);
         self.recording_error_reported = false;
+        self.session_stderr_notified.clear();
         self.preview_offset = 0;
         self.preview_omitted = 0;
         self.status =
@@ -1629,6 +1679,11 @@ impl App {
 
     fn toggle_pause(&mut self) {
         if let Some(recorded) = &self.recording {
+            // A finished capture holds nothing left to pause: toggling would
+            // only flip a flag and announce a pause that has no effect.
+            if recorded.finished.load(Ordering::Acquire) {
+                return;
+            }
             let paused = !recorded.paused.load(Ordering::Relaxed);
             recorded.paused.store(paused, Ordering::Relaxed);
             self.status = if paused {
@@ -1650,6 +1705,9 @@ impl App {
     }
 
     fn clear(&mut self) {
+        // Dropping a paged view discards its snapshot and index without any
+        // fallback load — say so, or the empty table looks like a failure.
+        let had_paged = self.paged.is_some();
         self.paged = None;
         let epoch = {
             let mut m = self.model.write_recover();
@@ -1663,6 +1721,9 @@ impl App {
             self.recording_full.store(false, Ordering::Relaxed);
             epoch
         };
+        if had_paged {
+            self.status = tr!("status_cleared_paged");
+        }
         if let Some(recorded) = &self.recording {
             self.preview_offset = recorded.written.load(Ordering::Acquire);
             self.preview_omitted = 0;
@@ -2017,6 +2078,11 @@ impl App {
                             rows: rows as usize,
                             path: destination,
                         },
+                        // The file changed under the index: recover the view
+                        // instead of only reporting a failed save.
+                        Err(e) if page_load_saw_a_changed_file(&e) => {
+                            SaveOutcome::FileChanged(e.to_string())
+                        }
                         Err(e) => SaveOutcome::Failed(e.to_string()),
                     };
                     let _ = tx.send(result);
@@ -3464,18 +3530,30 @@ impl eframe::App for App {
         if let Some(rx) = &self.save_result_rx {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    self.status = match outcome {
-                        SaveOutcome::Saved { rows, path } => tr!(
-                            "status_saved",
-                            { n: &rows.to_string(), path: &path.display().to_string() }
-                        ),
-                        SaveOutcome::Interrupted { rows, path } => tr!(
-                            "status_saved_incomplete",
-                            { n: &rows.to_string(), path: &path.display().to_string() }
-                        ),
-                        SaveOutcome::Failed(e) => tr!("status_save_failed", { e: &e }),
-                    };
                     self.save_result_rx = None;
+                    if let SaveOutcome::FileChanged(reason) = outcome {
+                        // The destination was left untouched by the failed
+                        // export. Rebuild the view on the new file; the user
+                        // re-runs the export against the rebuilt index.
+                        if self.paged.is_some() {
+                            self.recover_paged_after_file_change(&reason);
+                        } else {
+                            self.status = tr!("status_save_failed", { e: &reason });
+                        }
+                    } else {
+                        self.status = match outcome {
+                            SaveOutcome::Saved { rows, path } => tr!(
+                                "status_saved",
+                                { n: &rows.to_string(), path: &path.display().to_string() }
+                            ),
+                            SaveOutcome::Interrupted { rows, path } => tr!(
+                                "status_saved_incomplete",
+                                { n: &rows.to_string(), path: &path.display().to_string() }
+                            ),
+                            SaveOutcome::FileChanged(_) => unreachable!(),
+                            SaveOutcome::Failed(e) => tr!("status_save_failed", { e: &e }),
+                        };
+                    }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -3496,17 +3574,21 @@ impl eframe::App for App {
         // A followed file was rotated/truncated: reload it from scratch. Taken
         // before other work so the fresh epoch is in place for this frame.
         let reload = self.reload_request.lock_recover().take();
-        if let Some(path) = reload {
+        if let Some((path, req_epoch)) = reload {
             // Only reload if it's still the file we're viewing (guards against a
-            // stale request landing after the user opened something else).
+            // stale request landing after the user opened something else) AND
+            // the load that raised it hasn't been superseded (a newer open or a
+            // clear bumped the epoch, so the request is stale and must not
+            // re-open the old file over the new model).
             let still_current = self
                 .model
                 .read_recover()
                 .file_path
                 .as_ref()
                 .is_some_and(|p| p == &path);
-            if still_current {
-                if let Err(e) = self.open_file(&path) {
+            let still_current_epoch = req_epoch == self.source_epoch.load(Ordering::Acquire);
+            if still_current && still_current_epoch {
+                if let Err(e) = self.reload_followed_file(&path) {
                     self.status = tr!("status_failed_open", { e: &format!("{}", e) });
                 }
             }
@@ -3561,6 +3643,22 @@ impl eframe::App for App {
         } else {
             false
         };
+        // While the session runs, surface new stderr as a live notice: the
+        // hilogcat fallback warning and device diagnostics must not wait for
+        // the stream to end to be seen.
+        if !session_done {
+            if let Some(session) = self.session.as_ref() {
+                let err = session.stderr_text();
+                if !err.is_empty() && !err.starts_with(&self.session_stderr_notified) {
+                    let mut notice = err.lines().next().unwrap_or_default().to_string();
+                    if notice.chars().count() > 200 {
+                        notice = notice.chars().take(200).collect::<String>() + "…";
+                    }
+                    self.session_stderr_notified = err;
+                    self.status = tr!("status_dev_notice", { e: &notice });
+                }
+            }
+        }
         if session_done {
             let s = self.session.take().expect("completed session exists");
             let err = s.stderr_text();
@@ -4906,10 +5004,16 @@ impl App {
                 if let Some(i) = entry_idx {
                     self.toggle_bookmark(i);
                 }
-                self.selected_rows.clear();
-                self.selected_rows.insert(r);
-                self.selection_anchor = Some(r);
-                self.selection_cursor = Some(r);
+                // In "bookmarks only" mode the toggle just re-filtered
+                // asynchronously and renumbered every visible row, so `r` no
+                // longer designates the same line; toggle_bookmark already
+                // dropped the selection, so do not re-select a stale row.
+                if !self.ui.bookmarks_only {
+                    self.selected_rows.clear();
+                    self.selected_rows.insert(r);
+                    self.selection_anchor = Some(r);
+                    self.selection_cursor = Some(r);
+                }
             }
             if let Some(t) = alt_left_tag {
                 self.add_show_tag(&t);
@@ -5979,7 +6083,7 @@ mod tests {
         let (tx, rx) = bounded(8);
         let source_epoch = Arc::new(AtomicU64::new(42));
         let file = std::fs::File::open(&path).unwrap();
-        send_utf8_lines(file, tx, 42, source_epoch).expect("clean read should return Ok");
+        send_utf8_lines(file, tx, 42, source_epoch, false).expect("clean read should return Ok");
         let lines: Vec<String> = rx.try_iter().map(|(_, line)| line).collect();
 
         let _ = std::fs::remove_file(path);
@@ -6141,16 +6245,14 @@ mod tests {
             LogFormat::Unknown
         );
         // Real (built-in) hilog commands resolve to HiLog via the command table.
-        assert_eq!(
-            detect_format_from_cmd("hilog -v threadtime -r"),
-            LogFormat::HiLog
-        );
+        assert_eq!(detect_format_from_cmd("hilog"), LogFormat::HiLog);
+        assert_eq!(detect_format_from_cmd("hilog -v time"), LogFormat::HiLog);
         assert_eq!(
             detect_format_from_cmd("hilog -D 0x2F00 -v time"),
             LogFormat::HiLog
         );
         // A bare, non-shipped string isn't in the table and has no -v flag → Unknown.
-        assert_eq!(detect_format_from_cmd("hilog"), LogFormat::Unknown);
+        assert_eq!(detect_format_from_cmd("hilog -x"), LogFormat::Unknown);
     }
 
     #[test]
@@ -6952,7 +7054,7 @@ mod ui_tests {
         app.cached_col_widths[0] = 155.0;
         app.last_window_size = Some(egui::vec2(1500.0, 850.0));
         app.transport = Transport::Hdc;
-        app.selected_cmd = "hilog -v time -r".into();
+        app.selected_cmd = "hilog -v time".into();
         app.selected_device = "new-device".into();
         app.sync_config_from_view();
         let text = toml::to_string(&app.cfg).unwrap();
@@ -6970,7 +7072,7 @@ mod ui_tests {
         assert_eq!((saved.window.width, saved.window.height), (1500.0, 850.0));
         assert_eq!(saved.device.transport, Transport::Hdc);
         assert_eq!(saved.device.selected_device, "new-device");
-        assert_eq!(saved.device.selected_cmd, "hilog -v time -r");
+        assert_eq!(saved.device.selected_cmd, "hilog -v time");
     }
 
     #[test]

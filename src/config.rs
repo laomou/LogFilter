@@ -489,6 +489,30 @@ fn ensure_builtin_commands(cfg: &mut Config) {
         }
     }
 
+    // One-time migration of the old hdc presets, which were unsafe: `-r`
+    // *clears* the device log buffer at capture start, and `-v threadtime` is
+    // not a valid hilog option. Replace them in place with the safe streaming
+    // equivalents and drop the duplicates the replacement can create.
+    // `device_command_args` keeps mapping these strings defensively too, so a
+    // hand-edited config that slips past this migration still runs safe.
+    for list in [&mut cfg.device.adb_commands, &mut cfg.device.hdc_commands] {
+        for cmd in list.iter_mut() {
+            if let Some(replacement) = transport::legacy_hdc_preset(cmd) {
+                *cmd = replacement.to_string();
+            }
+        }
+        let mut deduped = Vec::with_capacity(list.len());
+        for cmd in list.iter() {
+            if !deduped.iter().any(|d| d == cmd) {
+                deduped.push(cmd.clone());
+            }
+        }
+        *list = deduped;
+    }
+    if let Some(replacement) = transport::legacy_hdc_preset(&cfg.device.selected_cmd) {
+        cfg.device.selected_cmd = replacement.to_string();
+    }
+
     // Keep the kernel-log command last in the adb list: injecting the commands
     // above (or an older saved order) can otherwise strand it mid-dropdown.
     const KMSG: &str = "shell cat /proc/kmsg";
@@ -949,6 +973,51 @@ mod tests {
             (na, nh),
             "no duplicate on re-run"
         );
+    }
+
+    #[test]
+    fn ensure_builtin_commands_migrates_legacy_hdc_presets() {
+        // A config saved before the preset fix still carries the old strings,
+        // whose `-r` flag would clear the device buffer at capture start.
+        let mut cfg = Config::default();
+        cfg.device.hdc_commands = vec!["hilog -v threadtime -r".into(), "hilog -v time -r".into()];
+        cfg.device.selected_cmd = "hilog -v time -r".into();
+        ensure_builtin_commands(&mut cfg);
+        assert!(
+            !cfg.device.hdc_commands.iter().any(|c| c.contains("-r")),
+            "no destructive preset survives: {:?}",
+            cfg.device.hdc_commands
+        );
+        assert!(
+            !cfg.device
+                .hdc_commands
+                .iter()
+                .any(|c| c.contains("threadtime")),
+            "invalid -v option removed: {:?}",
+            cfg.device.hdc_commands
+        );
+        assert_eq!(cfg.device.selected_cmd, "hilog -v time");
+        // Replacement must not duplicate the injected builtins.
+        assert_eq!(
+            cfg.device
+                .hdc_commands
+                .iter()
+                .filter(|c| c.as_str() == "hilog")
+                .count(),
+            1
+        );
+        assert_eq!(
+            cfg.device
+                .hdc_commands
+                .iter()
+                .filter(|c| c.as_str() == "hilog -v time")
+                .count(),
+            1
+        );
+        // Idempotent: a second run changes nothing.
+        let before = cfg.device.hdc_commands.clone();
+        ensure_builtin_commands(&mut cfg);
+        assert_eq!(cfg.device.hdc_commands, before);
     }
 
     #[test]

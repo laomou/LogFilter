@@ -510,6 +510,23 @@ fn load_page_cancellable(
     let checkpoint = index
         .checkpoint(page)
         .ok_or_else(|| io::Error::other("page is not indexed yet"))?;
+    // A cleanly completed index with zero matching rows (or an empty file)
+    // has nothing to read: return the empty page instead of re-scanning the
+    // whole snapshot on every request — with a filtered view that would be
+    // O(file) per page. The stamp was just validated by `open_snapshot`, so a
+    // changed file still surfaces as a `FileChangedError`. A scan that *failed*
+    // (e.g. a row beyond the page budget) is not zero-row: it must keep
+    // reporting its error.
+    if index.complete.load(Ordering::Acquire)
+        && index.error.lock_recover().is_none()
+        && index.total_rows.load(Ordering::Acquire) == 0
+    {
+        return Ok(Page {
+            page,
+            total_rows: 0,
+            entries: Vec::new(),
+        });
+    }
     let mut reader = BufReader::with_capacity(1024 * 1024, file.take(index.file_len));
     reader
         .get_mut()
@@ -833,6 +850,26 @@ mod tests {
         assert!(!page.entries.is_empty());
         assert!(page.entries.iter().all(|e| e.tag() == "Tag1"));
         assert!(page.entries[0].line_no > CHECKPOINT_ROWS);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zero_row_completed_index_returns_an_empty_page_without_rescanning() {
+        // A filter that matches nothing must not pay a full-file re-read per
+        // page request once the index is complete.
+        let path = file(10_000);
+        let base = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
+        wait(&base);
+        let spec = FilterSpec {
+            allowed_tags: Some(["NoSuchTag".to_string()].into()),
+            ..Default::default()
+        };
+        let index = build_filter_index(&base, spec.clone(), egui::Context::default()).unwrap();
+        wait(&index);
+        assert_eq!(index.total_rows.load(Ordering::Acquire), 0);
+        let page = load_page_sync(&index, 0, Some(&spec)).unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.total_rows, 0);
         std::fs::remove_file(path).unwrap();
     }
 
