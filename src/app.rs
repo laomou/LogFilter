@@ -7119,10 +7119,26 @@ mod ui_tests {
         });
         h.state_mut()
             .start_view_export(generation, indices, destination.clone());
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("export must wake the idle UI");
-        h.step();
-        assert!(h.state().save_result_rx.is_none());
+        // The export must (a) request a repaint while the UI is idle and (b)
+        // have its result consumed by a subsequent frame. Neither is race-free
+        // to observe in one shot: an unrelated background repaint (e.g. the
+        // initial filter pass) can fire the callback before the export
+        // finishes, and egui's one-shot repaint state can defer the export's
+        // own callback until the next frame runs. So keep stepping until the
+        // result is consumed, then assert a repaint was requested somewhere
+        // along the way.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.state().save_result_rx.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "export result was never consumed"
+            );
+            h.step();
+        }
+        assert!(
+            rx.try_recv().is_ok(),
+            "export completion must request a repaint of the idle UI"
+        );
         assert!(destination.exists());
         std::fs::remove_file(destination).unwrap();
     }
