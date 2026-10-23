@@ -310,6 +310,9 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
         };
 
         // Try the hinted format first; fall back to the full scan only on a miss.
+        // For the ThreadTime hint, the hint branch already tried HiLog (a hilog
+        // line would otherwise match threadtime with the domain glued onto the
+        // tag), so the fallback must not try it a second time.
         let hinted = match hint {
             LogFormat::ThreadTime => try_hilog(s).or_else(|| try_threadtime_family(s)),
             LogFormat::HiLog => try_hilog(s),
@@ -323,16 +326,15 @@ pub fn parse_line_hinted(line: String, hint: LogFormat) -> (LogEntry, LogFormat)
             hinted
         } else {
             // Full scan in priority order (HiLog → ThreadTime → Time → Brief →
-            // Kernel), skipping whichever format the hint already tried. HiLog is
-            // tried before ThreadTime because a hilog line would otherwise match
-            // threadtime with the domain glued onto the tag.
+            // Kernel), skipping whichever formats the hint already tried. HiLog
+            // is tried before ThreadTime because a hilog line would otherwise
+            // match threadtime with the domain glued onto the tag.
             match hint {
                 LogFormat::HiLog => try_threadtime_family(s)
                     .or_else(|| try_time(s))
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
-                LogFormat::ThreadTime => try_hilog(s)
-                    .or_else(|| try_time(s))
+                LogFormat::ThreadTime => try_time(s)
                     .or_else(|| try_brief(s))
                     .or_else(|| try_kernel(s)),
                 LogFormat::Time => try_hilog(s)
@@ -989,5 +991,44 @@ mod tests {
             distinct >= 3,
             "expected a genuinely mixed stream, got {distinct} formats"
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_hint_independence {
+    use crate::parser::{parse_line_hinted, LogFormat};
+
+    /// The index scan latches its hint from the file's first line, while a
+    /// paged load re-latches from its page's first line (H1). They can only
+    /// agree if the parse result does not depend on the hint: every order
+    /// tries HiLog before ThreadTime, and the kernel arm rejects lines
+    /// without a `<pri>`/`[ts]` prefix, so no hint may change what a line
+    /// parses into.
+    #[test]
+    fn parse_result_is_independent_of_the_hint() {
+        let lines = [
+            "07-20 12:00:00.000  1  2 I First: hello",
+            "07-20 12:00:00.000 123 456 I A06666/MyTag: hilog msg",
+            "<6>[    1.000] kernel line",
+            "I/First(123): brief msg",
+        ];
+        let hints = [
+            LogFormat::HiLog,
+            LogFormat::ThreadTime,
+            LogFormat::Time,
+            LogFormat::Brief,
+            LogFormat::Kernel,
+        ];
+        for line in lines {
+            let (e, f) = parse_line_hinted(line.to_string(), LogFormat::Unknown);
+            for hint in hints {
+                let (e2, f2) = parse_line_hinted(line.to_string(), hint);
+                assert_eq!(
+                    (f2, e2.tag(), e2.level, e2.pid(), e2.tid()),
+                    (f, e.tag(), e.level, e.pid(), e.tid()),
+                    "hint {hint:?} changed the parse of {line:?}"
+                );
+            }
+        }
     }
 }

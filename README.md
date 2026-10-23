@@ -165,7 +165,8 @@ preset with `hilog` when available, otherwise fall back to `hilogcat` default
 streaming. Their flags are not interchangeable, so the fallback does not copy
 `-v` or `-D`; a domain preset that cannot be applied emits a warning — use GUI
 tag filters instead. Missing both tools is an explicit error. Custom commands
-are unchanged.
+are unchanged. The two domain presets filter by subsystem: `0x2F00` (Security)
+and `0x2D00` (DFX), named after the OpenHarmony hilog domain table.
 
 Presets stream with plain `hilog` (or `hilog -v time`). They deliberately do
 not use `-r`: per the official hilog source, `-r` clears the device log buffer

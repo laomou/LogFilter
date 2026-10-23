@@ -874,6 +874,52 @@ mod tests {
     }
 
     #[test]
+    fn page_loads_parse_with_the_hint_the_scan_latched() {
+        // bugreport-style mix: the file starts with a threadtime line (which
+        // latches the filter scan's hint), 20 000 kernel lines then fill page 0,
+        // and the final line is threadtime again. Page 1 begins on a kernel
+        // line and re-latches its hint from that line, while the scan latched
+        // its hint from line 1. The page must still parse its trailing
+        // threadtime row identically to the scan: the parse has to stay
+        // hint-independent (the kernel arm rejects lines without `<pri>`/`[ts]`
+        // and every hint order tries HiLog before ThreadTime), or tag/level
+        // filters would disagree with the scan's matched set (missing or
+        // duplicated rows, wrong total_rows).
+        let path = file(0);
+        let mut body = String::new();
+        body.push_str("07-20 12:00:00.000  1  2 I First: hello zz\n");
+        for _ in 0..CHECKPOINT_ROWS {
+            body.push_str("<6>[    1.000] kernel line zz\n");
+        }
+        body.push_str("07-20 12:00:01.000  1  2 I First: again zz\n");
+        std::fs::write(&path, body).unwrap();
+        let base = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
+        wait(&base);
+        let spec = FilterSpec {
+            find: vec!["zz".to_string()],
+            ..Default::default()
+        };
+        let index = build_filter_index(&base, spec.clone(), egui::Context::default()).unwrap();
+        wait(&index);
+        // Every row matches the find filter, so the scan counts all of them and
+        // the page boundary lands on a kernel line.
+        assert_eq!(
+            index.total_rows.load(Ordering::Acquire),
+            CHECKPOINT_ROWS + 2
+        );
+        assert_eq!(index.pages(), 2, "fixture must span two pages");
+        let page = load_page_sync(&index, 1, Some(&spec)).unwrap();
+        let last = page.entries.last().expect("page 1 holds the final row");
+        assert_eq!(last.line_no, CHECKPOINT_ROWS + 2);
+        assert_eq!(
+            last.tag(),
+            "First",
+            "final row must keep its threadtime parse, not degrade to a kernel row"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn page_load_rejects_a_file_changed_after_indexing() {
         let path = file(100);
         let index = build_index(&path, 6 * 1024 * 1024, egui::Context::default()).unwrap();
