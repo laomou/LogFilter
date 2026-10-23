@@ -4,6 +4,7 @@ use crate::recording;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::Read;
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
@@ -125,6 +126,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 /// Look up a command in [`BUILTIN_COMMANDS`] by exact match.
 pub fn builtin_command(cmd: &str) -> Option<&'static BuiltinCommand> {
     BUILTIN_COMMANDS.iter().find(|b| b.cmd == cmd)
+}
+
+/// A human-readable rendering of a command for UI labels.
+///
+/// Bare numeric `-D` domain ids are opaque, so the two domain presets are
+/// annotated with the subsystem they select. The names come from the
+/// OpenHarmony hilog domain table (`hiviewdfx_hilog` `log_domains.cpp`):
+/// 0x2F00 = Security, 0x2D00 = DFX. Everything else renders verbatim.
+pub fn display_command(cmd: &str) -> Cow<'_, str> {
+    match cmd {
+        "hilog -D 0x2F00 -v time" => Cow::Owned(format!("{cmd} (Security)")),
+        "hilog -D 0x2D00 -v time" => Cow::Owned(format!("{cmd} (DFX)")),
+        _ => Cow::Borrowed(cmd),
+    }
 }
 
 /// Built-in commands for a transport, in dropdown order. Used for the default
@@ -368,7 +383,6 @@ pub struct Session {
     /// reader adopt the epoch of a replacement file or device session.
     epoch: Arc<AtomicU64>,
     paused: Arc<std::sync::atomic::AtomicBool>,
-    reader_thread: Option<thread::Thread>,
     reader_handle: Option<thread::JoinHandle<()>>,
     stderr_handle: Option<thread::JoinHandle<()>>,
     /// Stop forwarding lines while asynchronous cleanup waits for pipe closure.
@@ -714,7 +728,6 @@ impl Session {
                     }
                 }
             })?;
-        let reader_thread = handle.thread().clone();
 
         // Drain stderr on its own thread into a shared buffer.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
@@ -761,7 +774,6 @@ impl Session {
             child: Some(child.take()),
             epoch,
             paused,
-            reader_thread: Some(reader_thread),
             reader_handle: Some(handle),
             stderr_handle,
             stop_requested,
@@ -798,13 +810,10 @@ impl Session {
     }
 
     pub fn set_paused(&self, p: bool) {
+        // Pausing stops *recording*, not *reading*: the reader thread never
+        // parks, it keeps draining the pipe so the device's logd does not
+        // rotate logs away while we hold them back from disk.
         self.paused.store(p, std::sync::atomic::Ordering::Relaxed);
-        if !p {
-            // Wake the reader thread; if it was parked, it resumes reading.
-            if let Some(t) = &self.reader_thread {
-                t.unpark();
-            }
-        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -819,7 +828,6 @@ impl Session {
         let _ = child.kill();
         let reader = self.reader_handle.take();
         let stderr = self.stderr_handle.take();
-        self.reader_thread = None;
         // Neither process exit nor pipe closure is guaranteed to be immediate.
         // In particular, descendants may retain stdout/stderr after the direct
         // child dies. Stop, Restart, file-open and Drop must never join on the UI.
@@ -933,7 +941,6 @@ impl Session {
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
-        self.reader_thread = None;
         let Some(stderr) = self.stderr_handle.take() else {
             return;
         };
@@ -1134,6 +1141,26 @@ mod tests {
             device_command_args(Transport::Adb, "logcat -v threadtime").unwrap(),
             ["logcat", "-v", "threadtime"]
         );
+    }
+
+    #[test]
+    fn display_command_annotates_opaque_domain_presets() {
+        // The two `-D` presets select subsystems by numeric domain id only;
+        // the UI label must say which one (names from the OpenHarmony hilog
+        // domain table). Unknown and custom commands render verbatim.
+        assert_eq!(
+            display_command("hilog -D 0x2F00 -v time").as_ref(),
+            "hilog -D 0x2F00 -v time (Security)"
+        );
+        assert_eq!(
+            display_command("hilog -D 0x2D00 -v time").as_ref(),
+            "hilog -D 0x2D00 -v time (DFX)"
+        );
+        assert_eq!(
+            display_command("logcat -v threadtime").as_ref(),
+            "logcat -v threadtime"
+        );
+        assert_eq!(display_command("hilog").as_ref(), "hilog");
     }
 
     #[test]
@@ -1479,7 +1506,6 @@ mod tests {
         assert!(session.child.is_none());
         assert!(session.reader_handle.is_none());
         assert!(session.stderr_handle.is_none());
-        assert!(session.reader_thread.is_none());
     }
 
     #[test]

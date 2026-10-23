@@ -4122,11 +4122,15 @@ impl App {
                 let cmds = self.cfg.device.commands(self.transport).to_vec();
                 ui.label(tr!("cmd"));
                 egui::ComboBox::from_id_salt("cmd")
-                    .selected_text(&self.selected_cmd)
-                    .width(220.0)
+                    .selected_text(transport::display_command(&self.selected_cmd).as_ref())
+                    .width(260.0)
                     .show_ui(ui, |ui| {
                         for c in &cmds {
-                            ui.selectable_value(&mut self.selected_cmd, c.clone(), c);
+                            ui.selectable_value(
+                                &mut self.selected_cmd,
+                                c.clone(),
+                                transport::display_command(c).into_owned(),
+                            );
                         }
                     });
                 ui.label(tr!("device"));
