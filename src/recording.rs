@@ -240,6 +240,11 @@ fn copy_raw<R: Read, W: Write>(
     // failing, exactly when free space is worth watching.
     let mut last_space_check = Instant::now();
     let mut bytes_since_space_check = SPACE_CHECK_BYTES as usize;
+    // Reads may split a log line anywhere. Track both the discarded stream's
+    // boundary and the saved prefix without buffering arbitrarily long lines.
+    let mut skip_partial = false;
+    let mut saved_line_open = false;
+    let mut paused_bytes = false;
     let read_result = (|| {
         loop {
             if state.stop.load(Ordering::Acquire) {
@@ -272,26 +277,52 @@ fn copy_raw<R: Read, W: Write>(
                 break;
             }
             if state.paused.load(Ordering::Acquire) {
+                paused_bytes = true;
+                skip_partial = buf[n - 1] != b'\n';
                 continue;
             }
-            let mut offset = 0;
-            while offset < n {
-                match writer.write(&buf[offset..n]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "recording write returned zero",
-                        ))
+            let start = if skip_partial {
+                let Some(newline) = buf[..n].iter().position(|&b| b == b'\n') else {
+                    continue;
+                };
+                skip_partial = false;
+                newline + 1
+            } else {
+                0
+            };
+            if start == n {
+                continue;
+            }
+            // A partial prefix was already published to the preview, so it
+            // cannot be retracted safely. Terminate it before saving a new line;
+            // do not insert anything if pause discarded no bytes or at EOF.
+            let separator: &[u8] = if paused_bytes && saved_line_open {
+                b"\n"
+            } else {
+                b""
+            };
+            for bytes in [separator, &buf[start..n]] {
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    match writer.write(&bytes[offset..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "recording write returned zero",
+                            ))
+                        }
+                        Ok(count) => {
+                            offset += count;
+                            state.written.fetch_add(count as u64, Ordering::Release);
+                            bytes_since_space_check += count;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
                     }
-                    Ok(count) => {
-                        offset += count;
-                        state.written.fetch_add(count as u64, Ordering::Release);
-                        bytes_since_space_check += count;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
                 }
             }
+            saved_line_open = buf[n - 1] != b'\n';
+            paused_bytes = false;
             if last_sync.elapsed() >= Duration::from_secs(1) {
                 writer.flush()?;
                 sync(writer)?;
@@ -678,6 +709,118 @@ mod tests {
         assert!(state.finished.load(Ordering::Acquire));
         assert!(state.error.lock_recover().is_none());
         cleanup(&state);
+    }
+
+    struct PauseReader<'a> {
+        state: Arc<Recording>,
+        steps: &'a [(bool, &'a [u8])],
+        step: usize,
+    }
+
+    impl Read for PauseReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(&(paused, bytes)) = self.steps.get(self.step) else {
+                return Ok(0);
+            };
+            self.step += 1;
+            assert!(bytes.len() <= buf.len());
+            self.state.paused.store(paused, Ordering::Release);
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    fn assert_pause_output(steps: &[(bool, &[u8])], expected: &[u8]) {
+        let writer = writer();
+        let state = writer.state.clone();
+        writer.record(PauseReader {
+            state: state.clone(),
+            steps,
+            step: 0,
+        });
+        assert_eq!(std::fs::read(&state.path).unwrap(), expected);
+        assert_eq!(state.written.load(Ordering::Acquire), expected.len() as u64);
+        assert!(state.finished.load(Ordering::Acquire));
+        assert!(state.error.lock_recover().is_none());
+        cleanup(&state);
+    }
+
+    #[test]
+    fn pause_does_not_join_a_saved_prefix_to_the_next_log_line() {
+        assert_pause_output(
+            &[
+                (false, b"before"),
+                (true, b" paused\n"),
+                (false, b"after\n"),
+            ],
+            b"before\nafter\n",
+        );
+    }
+
+    #[test]
+    fn resume_skips_a_paused_line_across_multiple_reads() {
+        assert_pause_output(
+            &[
+                (false, b"before"),
+                (true, b" discarded\npaused"),
+                (false, b" line"),
+                (false, b" tail\n"),
+                (false, b"after\n"),
+            ],
+            b"before\nafter\n",
+        );
+    }
+
+    #[test]
+    fn pause_at_line_boundaries_preserves_bytes_without_extra_newlines() {
+        assert_pause_output(
+            &[
+                (false, b"\xef\xbb\xbffirst\r\n"),
+                (true, b"discarded\r\n"),
+                (false, b"\xff\x00\r\nlast"),
+            ],
+            b"\xef\xbb\xbffirst\r\n\xff\x00\r\nlast",
+        );
+    }
+
+    #[test]
+    fn resume_skips_a_partial_line_even_when_nothing_was_saved_before_pause() {
+        assert_pause_output(&[(true, b"paused"), (false, b" tail\nnext\n")], b"next\n");
+    }
+
+    #[test]
+    fn repeated_pauses_keep_saved_prefixes_separate() {
+        assert_pause_output(
+            &[
+                (false, b"first"),
+                (true, b" tail\n"),
+                (false, b"second"),
+                (true, b" tail\nthird"),
+                (false, b" tail\nfourth\n"),
+            ],
+            b"first\nsecond\nfourth\n",
+        );
+    }
+
+    #[test]
+    fn pause_followed_by_eof_does_not_modify_the_saved_prefix() {
+        assert_pause_output(&[(false, b"before"), (true, b" tail\n")], b"before");
+        assert_pause_output(
+            &[(false, b"before"), (true, b" tail"), (false, b"more")],
+            b"before",
+        );
+    }
+
+    #[test]
+    fn unpaused_split_lines_are_recorded_verbatim() {
+        assert_pause_output(
+            &[
+                (false, b"first"),
+                (false, b" tail\nsecond"),
+                (false, b" tail\n"),
+            ],
+            b"first tail\nsecond tail\n",
+        );
     }
 
     /// A reader that hands out `remaining` newline bytes and counts the reads it

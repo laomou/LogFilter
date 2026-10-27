@@ -33,8 +33,11 @@ and current full file path.
 
 The reader writes original stdout bytes to disk before the preview reads them.
 Rendering and filtering do not hold up the writer. Pause keeps draining the
-device pipe but does not save logs received during the pause. Clear starts
-the preview at the current recording position and preserves the entire file.
+device pipe but does not save logs received during the pause. On resume, the
+remainder of a line received during pause is skipped; a saved partial line is
+terminated with a newline before the next saved line, so the two cannot merge.
+Clear starts the preview at the current recording position and preserves the
+entire file.
 Older preview rows (and their in-memory bookmarks) are evicted at the cache budget.
 The disk backlog is displayed when the preview is behind. Lines larger than 1 MiB
 are retained in the raw file but omitted from the preview with a visible count.
