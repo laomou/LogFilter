@@ -3306,6 +3306,21 @@ fn page_row(
     })
 }
 
+/// Surface changed diagnostics once, including the first snapshot and updates
+/// to a partial line. Show the latest line, not the first warning forever.
+fn next_stderr_notice(err: &str, notified: &mut String) -> Option<String> {
+    if err.is_empty() || err == notified.as_str() {
+        return None;
+    }
+    let line = err.lines().rev().find(|line| !line.trim().is_empty())?;
+    let mut notice: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        notice.push('…');
+    }
+    *notified = err.to_owned();
+    Some(notice)
+}
+
 /// Build a LayoutJob rendering `text` with highlight tokens as background spans
 /// and find tokens as thin-underlined spans. All tokens are matched case-insensitively.
 fn build_highlighted(
@@ -3649,12 +3664,7 @@ impl eframe::App for App {
         if !session_done {
             if let Some(session) = self.session.as_ref() {
                 let err = session.stderr_text();
-                if !err.is_empty() && !err.starts_with(&self.session_stderr_notified) {
-                    let mut notice = err.lines().next().unwrap_or_default().to_string();
-                    if notice.chars().count() > 200 {
-                        notice = notice.chars().take(200).collect::<String>() + "…";
-                    }
-                    self.session_stderr_notified = err;
+                if let Some(notice) = next_stderr_notice(&err, &mut self.session_stderr_notified) {
                     self.status = tr!("status_dev_notice", { e: &notice });
                 }
             }
@@ -5064,6 +5074,59 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn stderr_notices_report_first_and_appended_diagnostics_once() {
+        let mut notified = String::new();
+        assert_eq!(next_stderr_notice("", &mut notified), None);
+        assert_eq!(
+            next_stderr_notice("fallback warning", &mut notified).as_deref(),
+            Some("fallback warning")
+        );
+        assert_eq!(next_stderr_notice("fallback warning", &mut notified), None);
+        assert_eq!(
+            next_stderr_notice("fallback warning\ndevice offline", &mut notified).as_deref(),
+            Some("device offline")
+        );
+        assert_eq!(
+            next_stderr_notice("fallback warning\ndevice offline", &mut notified),
+            None
+        );
+    }
+
+    #[test]
+    fn stderr_notices_update_partial_lines_and_handle_replaced_snapshots() {
+        let mut notified = String::new();
+        assert_eq!(
+            next_stderr_notice("device", &mut notified).as_deref(),
+            Some("device")
+        );
+        assert_eq!(
+            next_stderr_notice("device offline", &mut notified).as_deref(),
+            Some("device offline")
+        );
+        assert_eq!(
+            next_stderr_notice("new warning\n\n", &mut notified).as_deref(),
+            Some("new warning")
+        );
+        notified.clear();
+        assert_eq!(
+            next_stderr_notice("new warning\n\n", &mut notified).as_deref(),
+            Some("new warning")
+        );
+    }
+
+    #[test]
+    fn stderr_notices_truncate_unicode_without_repeating_the_notice() {
+        let err = "警".repeat(201);
+        let mut notified = String::new();
+        assert_eq!(
+            next_stderr_notice(&err, &mut notified),
+            Some("警".repeat(200) + "…")
+        );
+        assert_eq!(notified, err);
+        assert_eq!(next_stderr_notice(&err, &mut notified), None);
+    }
 
     /// Append `n` rows tagged `tag`, so each row's text is exactly `<tag>-NNNNN`.
     fn append_rows(model: &mut Model, n: u32, tag: &str) {
